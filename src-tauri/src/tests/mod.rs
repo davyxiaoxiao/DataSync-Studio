@@ -6,8 +6,7 @@ pub mod live;
 use std::collections::HashMap;
 
 use crate::data::{
-    build_delete_statements, build_insert_statements, build_update_statements, compare_rows,
-    ColumnPair, CompareInput,
+    build_delete_statements, build_insert_statements, build_update_statements, ColumnPair,
 };
 use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
@@ -579,53 +578,66 @@ fn numeric_canonicalisation_matches_across_kinds() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn compare_rows_finds_inserts_updates_and_deletes() {
-    let columns = vec!["id".to_string(), "name".to_string()];
-    let kinds = vec![ColumnKind::Int, ColumnKind::Str];
-    let pairs = vec![
-        ColumnPair {
-            source: "id".into(),
-            target: "id".into(),
-        },
-        ColumnPair {
-            source: "name".into(),
-            target: "name".into(),
-        },
-    ];
-    let keys = vec![ColumnPair {
-        source: "id".into(),
-        target: "id".into(),
-    }];
+fn key_ordering_matches_byte_order_for_text() {
+    use crate::data::stream::compare_keys;
+    use std::cmp::Ordering;
 
-    let source_rows = vec![
-        vec![Value::Int(1), Value::Str("updated".into())],
-        vec![Value::Int(2), Value::Str("new".into())],
-        vec![Value::Int(3), Value::Str("same".into())],
-    ];
-    let target_rows = vec![
-        vec![Value::Int(1), Value::Str("original".into())],
-        vec![Value::Int(3), Value::Str("same".into())],
-        vec![Value::Int(4), Value::Str("orphan".into())],
-    ];
+    // The databases are asked to order text byte-wise, so uppercase letters
+    // must sort before lowercase ones regardless of any column collation.
+    assert_eq!(
+        compare_keys(&Value::Str("Apple".into()), &Value::Str("apple".into())),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_keys(&Value::Str("Banana".into()), &Value::Str("apple".into())),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_keys(&Value::Str("same".into()), &Value::Str("same".into())),
+        Ordering::Equal
+    );
+}
 
-    let outcome = compare_rows(CompareInput {
-        source_rows,
-        target_rows,
-        source_columns: &columns,
-        target_columns: &columns,
-        column_pairs: &pairs,
-        key_pairs: &keys,
-        target_kinds: &kinds,
-    })
-    .unwrap();
+#[test]
+fn key_ordering_is_numeric_not_lexicographic() {
+    use crate::data::stream::compare_key_tuples;
+    use std::cmp::Ordering;
 
-    assert_eq!(outcome.inserts.len(), 1);
-    assert_eq!(outcome.updates.len(), 1);
-    assert_eq!(outcome.deletes.len(), 1);
-    assert_eq!(outcome.unchanged, 1);
-    assert_eq!(outcome.inserts[0][0], Value::Int(2));
-    assert_eq!(outcome.updates[0].1[0].0, 1);
-    assert_eq!(outcome.deletes[0][0], Value::Int(4));
+    assert_eq!(
+        compare_key_tuples(&[Value::Int(9)], &[Value::Int(10)]),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_key_tuples(
+            &[Value::Decimal("1.50".into())],
+            &[Value::Decimal("1.5".into())]
+        ),
+        Ordering::Equal
+    );
+    // Composite keys compare left to right.
+    assert_eq!(
+        compare_key_tuples(&[Value::Int(1), Value::Int(2)], &[Value::Int(1), Value::Int(3)]),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_key_tuples(&[Value::Int(2), Value::Int(1)], &[Value::Int(1), Value::Int(9)]),
+        Ordering::Greater
+    );
+}
+
+#[test]
+fn key_ordering_places_nulls_first() {
+    use crate::data::stream::compare_keys;
+    use std::cmp::Ordering;
+
+    assert_eq!(
+        compare_keys(&Value::Null, &Value::Int(1)),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare_keys(&Value::Null, &Value::Null),
+        Ordering::Equal
+    );
 }
 
 // ---------------------------------------------------------------------------

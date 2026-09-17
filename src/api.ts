@@ -97,7 +97,7 @@ export const api = {
     target: TableEndpoint;
     keyColumns?: ColumnPair[];
     columnMap?: ColumnPair[];
-    rowLimit?: number;
+    /** Page size for streaming comparison and rows per INSERT statement. */
     batchSize?: number;
   }) => invoke<DataDiffResult>("compare_data", { request }),
 

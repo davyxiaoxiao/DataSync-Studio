@@ -5,14 +5,16 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use std::cmp::Ordering;
+
+use crate::data::stream::{compare_key_tuples, StreamPlan, TableStream};
 use crate::data::{
     build_delete_statements, build_insert_statements, build_read_plan, build_update_statements,
-    column_index, compare_rows, preview_deletes, preview_inserts, preview_updates,
-    read_rows, ColumnPair, CompareInput, DataDiffResult, DataDiffSummary, TableEndpoint,
-    SQL_PREVIEW_LIMIT,
+    column_index, preview_deletes, preview_inserts, preview_updates, read_rows, ColumnPair,
+    DataDiffResult, DataDiffSummary, RowChange, TableEndpoint, PREVIEW_ROWS, SQL_PREVIEW_LIMIT,
 };
 use crate::data::plan::DataPlan;
-use crate::db::value::ColumnMeta;
+use crate::db::value::{ColumnMeta, Value};
 use crate::db::{open_pool, Pool, StatementOutcome};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
@@ -23,7 +25,6 @@ use crate::schema::model::{NamespaceInfo, TableStructure, TableSummary};
 use crate::state::{AppState, SchemaCompare};
 use crate::store::ConnectionConfig;
 
-const DEFAULT_ROW_LIMIT: u64 = 200_000;
 const DEFAULT_BATCH_SIZE: usize = 200;
 
 // ---------------------------------------------------------------------------
@@ -537,8 +538,6 @@ pub struct CompareDataRequest {
     #[serde(default)]
     pub column_map: Vec<ColumnPair>,
     #[serde(default)]
-    pub row_limit: Option<u64>,
-    #[serde(default)]
     pub batch_size: Option<usize>,
 }
 
@@ -586,8 +585,11 @@ fn auto_key_pairs(
 }
 
 #[tauri::command]
-/// Engine-agnostic core of a data comparison. Returns the UI payload plus the
-/// ready-to-run statement plan.
+/// Engine-agnostic core of a data comparison.
+///
+/// Both tables are read in key order with keyset pagination and merged, so
+/// memory is bounded by the page size plus the number of *differences* — never
+/// by the row count of either table.
 pub(crate) async fn compare_data_core(
     source_pool: &Pool,
     source: &TableEndpoint,
@@ -595,20 +597,16 @@ pub(crate) async fn compare_data_core(
     target: &TableEndpoint,
     requested_keys: &[ColumnPair],
     requested_map: &[ColumnPair],
-    row_limit: u64,
     batch_size: usize,
-) -> AppResult<(DataDiffResult, DataPlan)> {
+) -> AppResult<(DataDiffResult, DataPlan, Vec<String>)> {
     ensure_same_engine(source_pool, target_pool)?;
-    let source_dialect = source_pool.dialect();
-    let target_dialect = target_pool.dialect();
+    let dialect = source_pool.dialect();
 
     let mut warnings = Vec::new();
     let source_structure =
-        introspect::load_table(source_pool, &source.namespace, &source.table)
-            .await?;
+        introspect::load_table(source_pool, &source.namespace, &source.table).await?;
     let target_structure =
-        introspect::load_table(target_pool, &target.namespace, &target.table)
-            .await?;
+        introspect::load_table(target_pool, &target.namespace, &target.table).await?;
 
     let key_pairs = auto_key_pairs(&source_structure, &target_structure, requested_keys)?;
     let column_pairs = if requested_map.is_empty() {
@@ -616,6 +614,7 @@ pub(crate) async fn compare_data_core(
     } else {
         requested_map.to_vec()
     };
+
     // Drop any mapping that targets a generated (computed) column.
     let mut skipped_generated: Vec<String> = Vec::new();
     let column_pairs: Vec<ColumnPair> = column_pairs
@@ -639,136 +638,206 @@ pub(crate) async fn compare_data_core(
             "源表与目标表没有可写入的同名字段，请手动配置字段映射",
         ));
     }
-    let source_order: Vec<String> = key_pairs.iter().map(|p| p.source.clone()).collect();
-    let target_order: Vec<String> = key_pairs.iter().map(|p| p.target.clone()).collect();
 
-    let source_plan = build_read_plan(
-        source_dialect,
+    let batch = batch_size.clamp(1, 20_000);
+    let source_keys: Vec<String> = key_pairs.iter().map(|p| p.source.clone()).collect();
+    let target_keys: Vec<String> = key_pairs.iter().map(|p| p.target.clone()).collect();
+
+    let source_plan = StreamPlan::build(dialect, &source_structure, &source_keys)?;
+    let target_plan = StreamPlan::build(dialect, &target_structure, &target_keys)?;
+
+    let source_columns = source_plan.column_names();
+    let target_columns = target_plan.column_names();
+    let target_kinds = target_plan.kinds();
+
+    let index_in = |columns: &[String], name: &str| -> AppResult<usize> {
+        column_index(columns, name)
+            .ok_or_else(|| AppError::msg(format!("表结构中缺少字段 {name}")))
+    };
+    let source_pair_indexes: Vec<usize> = column_pairs
+        .iter()
+        .map(|pair| index_in(&source_columns, &pair.source))
+        .collect::<AppResult<_>>()?;
+    let target_pair_indexes: Vec<usize> = column_pairs
+        .iter()
+        .map(|pair| index_in(&target_columns, &pair.target))
+        .collect::<AppResult<_>>()?;
+
+    let mut source_stream = TableStream::new(
+        source_pool,
+        dialect,
         &source.namespace,
         &source.table,
-        &source_structure,
-        &source_order,
-        Some(row_limit + 1),
-        None,
+        source_plan,
+        batch,
     );
-    let target_plan = build_read_plan(
-        target_dialect,
+    let mut target_stream = TableStream::new(
+        target_pool,
+        dialect,
         &target.namespace,
         &target.table,
-        &target_structure,
-        &target_order,
-        Some(row_limit + 1),
-        None,
+        target_plan,
+        batch,
     );
 
-    let source_rows = read_rows(source_pool, &source_plan).await?;
-    let target_rows = read_rows(target_pool, &target_plan).await?;
-    let mut truncated = false;
-    let mut source_rows = source_rows;
-    let mut target_rows = target_rows;
-    if source_rows.len() as u64 > row_limit {
-        source_rows.truncate(row_limit as usize);
-        truncated = true;
+    let mut summary = DataDiffSummary::default();
+    let mut insert_rows: Vec<Vec<Value>> = Vec::new();
+    let mut insert_sql: Vec<String> = Vec::new();
+    let mut update_sql: Vec<String> = Vec::new();
+    let mut delete_sql: Vec<String> = Vec::new();
+    let mut insert_preview: Vec<RowChange> = Vec::new();
+    let mut update_preview: Vec<RowChange> = Vec::new();
+    let mut delete_preview: Vec<RowChange> = Vec::new();
+
+    loop {
+        let source_key = source_stream.peek_key().await?;
+        let target_key = target_stream.peek_key().await?;
+
+        let ordering = match (&source_key, &target_key) {
+            (None, None) => break,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(a), Some(b)) => compare_key_tuples(a, b),
+        };
+
+        match ordering {
+            // Present only in the source: insert it.
+            Ordering::Less => {
+                let row = source_stream
+                    .next_row()
+                    .await?
+                    .expect("peek_key returned a row");
+                summary.inserts += 1;
+                if insert_preview.len() < PREVIEW_ROWS {
+                    insert_preview.extend(preview_inserts(
+                        &source_columns,
+                        &column_pairs,
+                        &key_pairs,
+                        std::slice::from_ref(&row),
+                    ));
+                }
+                insert_rows.push(row);
+                if insert_rows.len() >= batch {
+                    insert_sql.extend(build_insert_statements(
+                        dialect,
+                        &target.namespace,
+                        &target.table,
+                        &source_columns,
+                        &target_columns,
+                        &target_kinds,
+                        &column_pairs,
+                        &insert_rows,
+                        insert_rows.len(),
+                    ));
+                    insert_rows.clear();
+                }
+            }
+            // Present only in the target: delete it.
+            Ordering::Greater => {
+                let row = target_stream
+                    .next_row()
+                    .await?
+                    .expect("peek_key returned a row");
+                summary.deletes += 1;
+                if delete_preview.len() < PREVIEW_ROWS {
+                    delete_preview.extend(preview_deletes(
+                        &target_columns,
+                        &column_pairs,
+                        &key_pairs,
+                        std::slice::from_ref(&row),
+                    ));
+                }
+                delete_sql.extend(build_delete_statements(
+                    dialect,
+                    &target.namespace,
+                    &target.table,
+                    &target_columns,
+                    &target_kinds,
+                    &key_pairs,
+                    std::slice::from_ref(&row),
+                ));
+            }
+            // Present on both sides: update when any mapped value differs.
+            Ordering::Equal => {
+                let source_row = source_stream
+                    .next_row()
+                    .await?
+                    .expect("peek_key returned a row");
+                let target_row = target_stream
+                    .next_row()
+                    .await?
+                    .expect("peek_key returned a row");
+
+                let mut changes: Vec<(usize, Value)> = Vec::new();
+                for (position, pair) in column_pairs.iter().enumerate() {
+                    let _ = pair;
+                    let source_value = source_row
+                        .get(source_pair_indexes[position])
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let target_value = target_row
+                        .get(target_pair_indexes[position])
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if source_value.canonical() != target_value.canonical() {
+                        changes.push((target_pair_indexes[position], source_value));
+                    }
+                }
+
+                if changes.is_empty() {
+                    summary.unchanged += 1;
+                } else {
+                    summary.updates += 1;
+                    if update_preview.len() < PREVIEW_ROWS {
+                        update_preview.extend(preview_updates(
+                            &target_columns,
+                            &key_pairs,
+                            &[(target_row.clone(), changes.clone())],
+                        ));
+                    }
+                    update_sql.extend(build_update_statements(
+                        dialect,
+                        &target.namespace,
+                        &target.table,
+                        &target_columns,
+                        &target_kinds,
+                        &key_pairs,
+                        &[(target_row, changes)],
+                    ));
+                }
+            }
+        }
     }
-    if target_rows.len() as u64 > row_limit {
-        target_rows.truncate(row_limit as usize);
-        truncated = true;
-    }
-    if truncated {
-        warnings.push(format!(
-            "数据量超过 {row_limit} 行，仅比较了前 {row_limit} 行（按主键排序）"
+
+    if !insert_rows.is_empty() {
+        insert_sql.extend(build_insert_statements(
+            dialect,
+            &target.namespace,
+            &target.table,
+            &source_columns,
+            &target_columns,
+            &target_kinds,
+            &column_pairs,
+            &insert_rows,
+            insert_rows.len(),
         ));
+        insert_rows.clear();
     }
 
-    let target_kinds: Vec<crate::db::value::ColumnKind> =
-        target_structure.columns.iter().map(|c| c.kind()).collect();
+    summary.source_rows = source_stream.scanned as usize;
+    summary.target_rows = target_stream.scanned as usize;
 
-    let result = compare_rows(CompareInput {
-        source_rows: source_rows.clone(),
-        target_rows: target_rows.clone(),
-        source_columns: &source_plan.columns,
-        target_columns: &target_plan.columns,
-        column_pairs: &column_pairs,
-        key_pairs: &key_pairs,
-        target_kinds: &target_kinds,
-    })?;
-
-    let target_columns: Vec<String> = target_structure
-        .columns
+    let sql_preview: Vec<String> = delete_sql
         .iter()
-        .map(|c| c.name.clone())
+        .chain(update_sql.iter())
+        .chain(insert_sql.iter())
+        .take(SQL_PREVIEW_LIMIT)
+        .cloned()
         .collect();
 
-    let insert_sql = build_insert_statements(
-        target_dialect,
-        &target.namespace,
-        &target.table,
-        &source_plan.columns,
-        &target_columns,
-        &target_kinds,
-        &column_pairs,
-        &result.inserts,
-        batch_size,
-    );
-    let update_sql = build_update_statements(
-        target_dialect,
-        &target.namespace,
-        &target.table,
-        &target_columns,
-        &target_kinds,
-        &key_pairs,
-        &result.updates,
-    );
-    let delete_sql = build_delete_statements(
-        target_dialect,
-        &target.namespace,
-        &target.table,
-        &target_columns,
-        &target_kinds,
-        &key_pairs,
-        &result.deletes,
-    );
-
-    let mut sql_preview: Vec<String> = Vec::new();
-    for statement in delete_sql.iter().chain(update_sql.iter()).chain(insert_sql.iter()) {
-        if sql_preview.len() >= SQL_PREVIEW_LIMIT {
-            break;
-        }
-        sql_preview.push(statement.clone());
-    }
-
-    let summary = DataDiffSummary {
-        source_rows: source_rows.len(),
-        target_rows: target_rows.len(),
-        inserts: result.inserts.len(),
-        updates: result.updates.len(),
-        deletes: result.deletes.len(),
-        unchanged: result.unchanged,
-    };
-
-    let insert_preview = preview_inserts(
-        &source_plan.columns,
-        &column_pairs,
-        &key_pairs,
-        &result.inserts,
-    );
-    let update_preview = preview_updates(&target_columns, &key_pairs, &result.updates);
-    let delete_preview = preview_deletes(
-        &target_columns,
-        &column_pairs,
-        &key_pairs,
-        &result.deletes,
-    );
     let preview_truncated = summary.inserts > insert_preview.len()
         || summary.updates > update_preview.len()
         || summary.deletes > delete_preview.len();
-
-    // Sanity check that every mapped source column exists on the source side.
-    for pair in &column_pairs {
-        if column_index(&source_plan.columns, &pair.source).is_none() {
-            warnings.push(format!("源表缺少字段 {}", pair.source));
-        }
-    }
 
     let plan = DataPlan {
         insert: insert_sql,
@@ -777,18 +846,22 @@ pub(crate) async fn compare_data_core(
         created_at: Instant::now(),
     };
 
-    Ok((DataDiffResult {
-        plan_id: String::new(),
-        columns: column_pairs,
-        key_columns: key_pairs,
-        summary,
-        insert_preview,
-        update_preview,
-        delete_preview,
-        preview_truncated,
-        sql_preview,
-        warnings,
-    }, plan))
+    Ok((
+        DataDiffResult {
+            plan_id: String::new(),
+            columns: column_pairs,
+            key_columns: key_pairs,
+            summary,
+            insert_preview,
+            update_preview,
+            delete_preview,
+            preview_truncated,
+            sql_preview,
+            warnings,
+        },
+        plan,
+        Vec::new(),
+    ))
 }
 
 #[tauri::command]
@@ -798,15 +871,17 @@ pub async fn compare_data(
 ) -> AppResult<DataDiffResult> {
     let source_pool = pool_for(&state, &request.source.connection_id).await?;
     let target_pool = pool_for(&state, &request.target.connection_id).await?;
-    let (mut result, plan) = compare_data_core(
+    let (mut result, plan, _) = compare_data_core(
         &source_pool,
         &request.source,
         &target_pool,
         &request.target,
         &request.key_columns,
         &request.column_map,
-        request.row_limit.unwrap_or(DEFAULT_ROW_LIMIT),
-        request.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).clamp(1, 1000),
+        request
+            .batch_size
+            .unwrap_or(DEFAULT_BATCH_SIZE)
+            .clamp(1, 20_000),
     )
     .await?;
     result.plan_id = state.plans.put(plan);

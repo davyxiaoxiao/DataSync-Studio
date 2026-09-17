@@ -15,7 +15,6 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
     initial ?? { connectionId: "", namespace: "", table: "" },
   );
   const [target, setTarget] = useState<EndpointValue>({ connectionId: "", namespace: "", table: "" });
-  const [rowLimit, setRowLimit] = useState(200000);
   const [batchSize, setBatchSize] = useState(200);
 
   // The source engine anchors the pair: only same-engine targets are offered.
@@ -75,7 +74,6 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
         },
         keyColumns: [],
         columnMap: [],
-        rowLimit,
         batchSize,
       });
       setResult(outcome);
@@ -171,27 +169,19 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
 
         <div className="row" style={{ marginTop: 12 }}>
           <div className="field">
-            <label>单表最大比较行数</label>
-            <input
-              type="number"
-              min={100}
-              step={1000}
-              value={rowLimit}
-              onChange={(event) => setRowLimit(Number(event.target.value) || 200000)}
-              style={{ width: 130 }}
-            />
-          </div>
-          <div className="field">
-            <label>INSERT 批量行数</label>
+            <label>分页 / 批量大小</label>
             <input
               type="number"
               min={1}
-              max={1000}
+              max={20000}
               value={batchSize}
               onChange={(event) => setBatchSize(Number(event.target.value) || 200)}
               style={{ width: 110 }}
             />
           </div>
+          <span className="faint">
+            按主键流式分页读取并归并，内存占用与表大小无关，不再限制比较行数
+          </span>
           <div className="grow" />
           <button className="btn primary" onClick={() => void runCompare()} disabled={!ready || comparing}>
             {comparing ? "对比中…" : "开始对比"}

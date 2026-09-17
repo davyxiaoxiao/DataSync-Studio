@@ -1,13 +1,12 @@
 pub mod plan;
-
-use std::collections::HashMap;
+pub mod stream;
 
 use serde::{Deserialize, Serialize};
 
 use crate::db::value::{Cell, ColumnKind, Value};
 use crate::db::Pool;
 use crate::dialect::Dialect;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::schema::model::TableStructure;
 
 /// Column mapping between the source and target table.
@@ -81,7 +80,6 @@ pub const SQL_PREVIEW_LIMIT: usize = 300;
 /// A resolved read plan for one table.
 pub struct ReadPlan {
     pub select_sql: String,
-    pub columns: Vec<String>,
     pub kinds: Vec<ColumnKind>,
 }
 
@@ -132,7 +130,6 @@ pub fn build_read_plan(
 
     ReadPlan {
         select_sql: sql,
-        columns: structure.columns.iter().map(|c| c.name.clone()).collect(),
         kinds: structure.columns.iter().map(|c| c.kind()).collect(),
     }
 }
@@ -144,147 +141,6 @@ pub async fn read_rows(pool: &Pool, plan: &ReadPlan) -> AppResult<Vec<Vec<Value>
 /// Index of a column name inside a row vector.
 pub fn column_index(columns: &[String], name: &str) -> Option<usize> {
     columns.iter().position(|c| c == name)
-}
-
-fn row_key(cells: &[&Value]) -> String {
-    cells
-        .iter()
-        .map(|v| v.canonical())
-        .collect::<Vec<_>>()
-        .join("\u{1}")
-}
-
-pub struct CompareInput<'a> {
-    pub source_rows: Vec<Vec<Value>>,
-    pub target_rows: Vec<Vec<Value>>,
-    pub source_columns: &'a [String],
-    pub target_columns: &'a [String],
-    pub column_pairs: &'a [ColumnPair],
-    pub key_pairs: &'a [ColumnPair],
-    pub target_kinds: &'a [ColumnKind],
-}
-
-pub struct CompareOutput {
-    pub inserts: Vec<Vec<Value>>,
-    pub updates: Vec<(Vec<Value>, Vec<(usize, Value)>)>,
-    pub deletes: Vec<Vec<Value>>,
-    pub unchanged: usize,
-}
-
-/// Compute the row level differences, keyed on the selected key columns.
-pub fn compare_rows(input: CompareInput<'_>) -> AppResult<CompareOutput> {
-    let CompareInput {
-        source_rows,
-        target_rows,
-        source_columns,
-        target_columns,
-        column_pairs,
-        key_pairs,
-        target_kinds,
-        ..
-    } = input;
-
-    let source_index: Vec<usize> = column_pairs
-        .iter()
-        .map(|p| {
-            column_index(source_columns, &p.source)
-                .ok_or_else(|| AppError::msg(format!("源表缺少字段 {}", p.source)))
-        })
-        .collect::<AppResult<_>>()?;
-    let target_index: Vec<usize> = column_pairs
-        .iter()
-        .map(|p| {
-            column_index(target_columns, &p.target)
-                .ok_or_else(|| AppError::msg(format!("目标表缺少字段 {}", p.target)))
-        })
-        .collect::<AppResult<_>>()?;
-
-    let source_key_index: Vec<usize> = key_pairs
-        .iter()
-        .map(|p| {
-            column_index(source_columns, &p.source)
-                .ok_or_else(|| AppError::msg(format!("源表缺少主键字段 {}", p.source)))
-        })
-        .collect::<AppResult<_>>()?;
-    let target_key_index: Vec<usize> = key_pairs
-        .iter()
-        .map(|p| {
-            column_index(target_columns, &p.target)
-                .ok_or_else(|| AppError::msg(format!("目标表缺少主键字段 {}", p.target)))
-        })
-        .collect::<AppResult<_>>()?;
-
-    // Columns that cannot be written back: generated columns are not detected
-    // here, but auto-increment keys are still writable so they stay included.
-    let writable: Vec<usize> = (0..target_columns.len())
-        .filter(|i| !matches!(target_kinds.get(*i), Some(ColumnKind::Text)))
-        .collect();
-    let _ = writable;
-
-    let mut target_map: HashMap<String, usize> = HashMap::with_capacity(target_rows.len());
-    for (idx, row) in target_rows.iter().enumerate() {
-        let keys: Vec<&Value> = target_key_index
-            .iter()
-            .filter_map(|i| row.get(*i))
-            .collect();
-        if keys.len() != target_key_index.len() {
-            continue;
-        }
-        target_map.insert(row_key(&keys), idx);
-    }
-
-    let mut inserts = Vec::new();
-    let mut updates = Vec::new();
-    let mut unchanged = 0usize;
-    let mut matched_targets: Vec<bool> = vec![false; target_rows.len()];
-
-    for row in &source_rows {
-        let keys: Vec<&Value> = source_key_index
-            .iter()
-            .filter_map(|i| row.get(*i))
-            .collect();
-        if keys.len() != source_key_index.len() {
-            continue;
-        }
-        let key = row_key(&keys);
-        match target_map.get(&key) {
-            None => inserts.push(row.clone()),
-            Some(&target_row_idx) => {
-                matched_targets[target_row_idx] = true;
-                let target_row = &target_rows[target_row_idx];
-                let mut changed: Vec<(usize, Value)> = Vec::new();
-                for (pair_idx, pair) in column_pairs.iter().enumerate() {
-                    let sidx = source_index[pair_idx];
-                    let tidx = target_index[pair_idx];
-                    let source_value = row.get(sidx).cloned().unwrap_or(Value::Null);
-                    let target_value = target_row.get(tidx).cloned().unwrap_or(Value::Null);
-                    if source_value.canonical() != target_value.canonical() {
-                        changed.push((tidx, source_value));
-                    }
-                    let _ = pair;
-                }
-                if changed.is_empty() {
-                    unchanged += 1;
-                } else {
-                    updates.push((target_row.clone(), changed));
-                }
-            }
-        }
-    }
-
-    let mut deletes = Vec::new();
-    for (idx, row) in target_rows.iter().enumerate() {
-        if !matched_targets[idx] {
-            deletes.push(row.clone());
-        }
-    }
-
-    Ok(CompareOutput {
-        inserts,
-        updates,
-        deletes,
-        unchanged,
-    })
 }
 
 /// Build the DML statements for one action.

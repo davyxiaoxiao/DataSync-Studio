@@ -417,16 +417,7 @@ async fn roundtrip(
         table: "users".into(),
     };
 
-    let (result, plan) = compare_data_core(
-        source_pool,
-        &source_ep,
-        target_pool,
-        &target_ep,
-        &[],
-        &[],
-        10_000,
-        100,
-    )
+    let (result, plan, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
     .await
     .expect("compare users data");
     assert_eq!(result.summary.inserts, 3, "{tag}: users 期望 3 行待插入");
@@ -435,9 +426,7 @@ async fn roundtrip(
 
     run_plan(target_pool, plan.select(true, true, true)).await;
 
-    let (settled, _) = compare_data_core(
-        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 10_000, 100,
-    )
+    let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
     .await
     .expect("re-compare users data");
     assert_eq!(
@@ -454,9 +443,7 @@ async fn roundtrip(
     // ---- 6. update + delete on the source, then re-sync -----------------
     exec_all(source_pool, &drift_data_ddl(source_dialect, source_ns)).await;
 
-    let (changed, plan) = compare_data_core(
-        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 10_000, 100,
-    )
+    let (changed, plan, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
     .await
     .expect("compare changed users data");
     assert_eq!(changed.summary.updates, 1, "{tag}: 期望 1 行待更新");
@@ -464,9 +451,7 @@ async fn roundtrip(
 
     run_plan(target_pool, plan.select(true, true, true)).await;
 
-    let (settled, _) = compare_data_core(
-        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 10_000, 100,
-    )
+    let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
     .await
     .expect("re-compare changed users data");
     assert_eq!(
@@ -487,32 +472,14 @@ async fn roundtrip(
         namespace: target_ns.into(),
         table: "orders".into(),
     };
-    let (orders, plan) = compare_data_core(
-        source_pool,
-        &source_orders,
-        target_pool,
-        &target_orders,
-        &[],
-        &[],
-        10_000,
-        100,
-    )
+    let (orders, plan, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100)
     .await
     .expect("compare orders data");
     assert_eq!(orders.summary.inserts, 2, "{tag}: orders 期望 2 行待插入 (源已删除 1 行)");
     assert_eq!(orders.summary.deletes, 0, "{tag}: 目标为空, 不应有删除");
     run_plan(target_pool, plan.select(true, true, true)).await;
 
-    let (orders_settled, _) = compare_data_core(
-        source_pool,
-        &source_orders,
-        target_pool,
-        &target_orders,
-        &[],
-        &[],
-        10_000,
-        100,
-    )
+    let (orders_settled, _, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100)
     .await
     .expect("re-compare orders data");
     assert_eq!(
@@ -598,6 +565,214 @@ async fn live_postgres_to_postgres_roundtrip() {
     drop_namespace(&pool, Dialect::Postgres, dst).await;
 }
 
+/// Streaming comparison: many keyset pages, a textual primary key whose
+/// ordering is collation dependent, and (on MySQL) two sides with *different*
+/// collations. Without an explicit byte-order collation the two orderings would
+/// disagree and the merge would produce phantom inserts and deletes.
+async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str, tag: &str) {
+    drop_namespace(pool, dialect, src).await;
+    drop_namespace(pool, dialect, dst).await;
+    create_namespace(pool, dialect, src).await;
+    create_namespace(pool, dialect, dst).await;
+
+    let source_table = dialect.qualified(Some(src), "page_test");
+    let target_table = dialect.qualified(Some(dst), "page_test");
+    let k = dialect.quote("k");
+    let n = dialect.quote("n");
+    let payload = dialect.quote("payload");
+
+    let create = |table: &str, collation: &str| match dialect {
+        Dialect::Mysql => format!(
+            "CREATE TABLE {table} (
+                {k} VARCHAR(32) NOT NULL,
+                {n} INT NOT NULL,
+                {payload} VARCHAR(64) DEFAULT NULL,
+                PRIMARY KEY ({k})
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE={collation}"
+        ),
+        Dialect::Postgres => format!(
+            "CREATE TABLE {table} (
+                {k} character varying(32) NOT NULL,
+                {n} integer NOT NULL,
+                {payload} character varying(64),
+                CONSTRAINT \"page_test_pkey\" PRIMARY KEY ({k})
+             )"
+        ),
+    };
+    // The two sides deliberately use collations that order ASCII letters
+    // differently: case-insensitive versus byte order.
+    let source_collation = "utf8mb4_general_ci";
+    let target_collation = "utf8mb4_bin";
+    exec(pool, &create(&source_table, source_collation)).await;
+    exec(pool, &create(&target_table, target_collation)).await;
+
+    // Keys whose byte order and case-insensitive order genuinely differ.
+    let letters = ["A", "a", "B", "b", "Z", "z"];
+    let row_count = 1_500_usize;
+    let keys: Vec<String> = (0..row_count)
+        .map(|i| format!("{}{:05}", letters[i % letters.len()], i))
+        .collect();
+
+    for (chunk_index, chunk) in keys.chunks(500).enumerate() {
+        let values: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(offset, key)| {
+                let value = chunk_index * 500 + offset;
+                format!("('{key}', {value}, 'seed-{value}')")
+            })
+            .collect();
+        exec(
+            pool,
+            &format!(
+                "INSERT INTO {source_table} ({k}, {n}, {payload}) VALUES {}",
+                values.join(", ")
+            ),
+        )
+        .await;
+    }
+
+    let source_ep = TableEndpoint {
+        connection_id: "src".into(),
+        namespace: src.into(),
+        table: "page_test".into(),
+    };
+    let target_ep = TableEndpoint {
+        connection_id: "dst".into(),
+        namespace: dst.into(),
+        table: "page_test".into(),
+    };
+    // A deliberately small page size: 1500 rows read in pages of 150, so the
+    // keyset pagination and the scattered updates both cross page boundaries.
+    let batch = 150;
+
+    let (result, plan, _) =
+        compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+            .await
+            .expect("compare paginated data");
+    assert_eq!(
+        result.summary.inserts, row_count,
+        "{tag}: 期望 {row_count} 行待插入, 实际 {:?}",
+        result.summary
+    );
+    assert_eq!(result.summary.deletes, 0, "{tag}: 空目标不应有删除");
+    assert_eq!(result.summary.updates, 0, "{tag}: 空目标不应有更新");
+
+    run_plan(pool, plan.select(true, true, true)).await;
+
+    let (settled, _, _) = compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+        .await
+        .expect("re-compare paginated data");
+    assert_eq!(
+        (
+            settled.summary.inserts,
+            settled.summary.updates,
+            settled.summary.deletes
+        ),
+        (0, 0, 0),
+        "{tag}: 分页同步后应完全一致, 实际 {:?}",
+        settled.summary
+    );
+
+    // Scattered updates and deletes, again crossing page boundaries. A row that
+    // is deleted on the source can no longer be updated, so the two sets are
+    // kept disjoint.
+    let remove: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % 11 == 3)
+        .map(|(_, key)| key.clone())
+        .collect();
+    let removed: std::collections::HashSet<&str> =
+        remove.iter().map(|key| key.as_str()).collect();
+    let update_keys: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .filter(|(index, key)| index % 7 == 0 && !removed.contains(key.as_str()))
+        .map(|(_, key)| key.clone())
+        .collect();
+    let touched = update_keys.len();
+
+    let quoted: Vec<String> = update_keys.iter().map(|key| format!("'{key}'")).collect();
+    for chunk in quoted.chunks(200) {
+        exec(
+            pool,
+            &format!(
+                "UPDATE {source_table} SET {n} = {n} + 1000 WHERE {k} IN ({})",
+                chunk.join(", ")
+            ),
+        )
+        .await;
+    }
+    let quoted: Vec<String> = remove.iter().map(|key| format!("'{key}'")).collect();
+    for chunk in quoted.chunks(200) {
+        exec(
+            pool,
+            &format!("DELETE FROM {source_table} WHERE {k} IN ({})", chunk.join(", ")),
+        )
+        .await;
+    }
+
+    let (changed, plan, _) = compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+        .await
+        .expect("compare changed paginated data");
+    assert_eq!(changed.summary.updates, touched, "{tag}: 更新数不符");
+    assert_eq!(changed.summary.deletes, remove.len(), "{tag}: 删除数不符");
+
+    run_plan(pool, plan.select(true, true, true)).await;
+
+    let (final_pass, _, _) = compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+        .await
+        .expect("final re-compare");
+    assert_eq!(
+        (
+            final_pass.summary.inserts,
+            final_pass.summary.updates,
+            final_pass.summary.deletes
+        ),
+        (0, 0, 0),
+        "{tag}: 增量同步后应完全一致, 实际 {:?}",
+        final_pass.summary
+    );
+
+    drop_namespace(pool, dialect, src).await;
+    drop_namespace(pool, dialect, dst).await;
+}
+
+#[tokio::test]
+async fn live_mysql_streaming_pagination() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    pagination_scenario(
+        &pool,
+        Dialect::Mysql,
+        "datasync_live_page_src",
+        "datasync_live_page_dst",
+        "mysql 分页",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn live_postgres_streaming_pagination() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    pagination_scenario(
+        &pool,
+        Dialect::Postgres,
+        "datasync_live_page_src",
+        "datasync_live_page_dst",
+        "pg 分页",
+    )
+    .await;
+}
+
 /// Cross-engine synchronisation is deliberately refused, and the refusal must
 /// happen before any database work.
 #[tokio::test]
@@ -635,7 +810,7 @@ async fn live_cross_engine_sync_is_rejected() {
         namespace: "datasync_probe_dst".into(),
         table: "t".into(),
     };
-    let data_error = compare_data_core(&mysql, &source, &pg, &target, &[], &[], 1000, 100)
+    let data_error = compare_data_core(&mysql, &source, &pg, &target, &[], &[], 100)
         .await
         .err()
         .expect("MySQL → PostgreSQL 的数据对比必须被拒绝");
