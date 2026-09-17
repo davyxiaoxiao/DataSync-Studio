@@ -1531,3 +1531,188 @@ fn an_unrepresentable_type_warns_instead_of_guessing() {
         "{warnings:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Dropping tables that are still referenced
+// ---------------------------------------------------------------------------
+
+fn table_with_fk(name: &str, fk_name: &str, ref_table: &str) -> TableStructure {
+    let mut structure = table(
+        name,
+        vec![
+            {
+                let mut c = col("id", "INT", "integer");
+                c.nullable = false;
+                c
+            },
+            col("parent_id", "INT", "integer"),
+        ],
+        &["id"],
+    );
+    structure.foreign_keys.push(ForeignKeyInfo {
+        name: fk_name.into(),
+        columns: vec!["parent_id".into()],
+        ref_schema: None,
+        ref_table: ref_table.into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    structure
+}
+
+fn plain_table(name: &str) -> TableStructure {
+    let mut c = col("id", "INT", "integer");
+    c.nullable = false;
+    table(name, vec![c], &["id"])
+}
+
+/// Dropping a table removes the constraints that reference it, including ones
+/// the user never selected.
+#[test]
+fn references_to_a_dropped_table_are_released() {
+    // `parent` exists only on the target; `child` exists on both sides but the
+    // target additionally carries a foreign key pointing at `parent`.
+    let source = vec![table_with_fk("child", "fk_child_parent", "parent")];
+    let target = vec![
+        table_with_fk("child", "fk_child_parent", "parent"),
+        plain_table("parent"),
+    ];
+    let diff = compare_everything(
+        &source,
+        &target,
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+
+    // Select only the table drop, leaving `child`'s foreign-key change unchecked.
+    let selection = SyncSelection {
+        types: Vec::new(),
+        views: Vec::new(),
+        tables: vec![TableSelection {
+            name: "parent".into(),
+            whole_table: true,
+            columns: Vec::new(),
+            primary_key: false,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }],
+    };
+    let mut warnings = Vec::new();
+    let plan = generate(&diff, &HashMap::new(), Some(&selection), Some("dst"), &mut warnings);
+
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert_eq!(
+        categories,
+        vec!["drop_foreign_key", "drop_table"],
+        "必须先解除引用再删表: {categories:?}"
+    );
+    assert!(
+        plan[0]
+            .sql
+            .contains("ALTER TABLE \"dst\".\"child\" DROP CONSTRAINT \"fk_child_parent\";"),
+        "{}",
+        plan[0].sql
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("已自动加入删除列表")),
+        "{warnings:?}"
+    );
+}
+
+/// Two tables referencing each other must both be droppable.
+#[test]
+fn mutually_referencing_tables_can_both_be_dropped() {
+    let source: Vec<TableStructure> = Vec::new();
+    let mut a = plain_table("a");
+    a.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_a_b".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "b".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let mut b = plain_table("b");
+    b.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_b_a".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "a".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let diff = compare_everything(
+        &source,
+        &[a, b],
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
+
+    let fk_drops = plan.iter().filter(|s| s.category == "drop_foreign_key").count();
+    let table_drops = plan.iter().filter(|s| s.category == "drop_table").count();
+    assert_eq!(fk_drops, 2, "两个方向的外键都要解除");
+    assert_eq!(table_drops, 2);
+    // Every constraint removal precedes every table removal.
+    let last_fk = plan
+        .iter()
+        .rposition(|s| s.category == "drop_foreign_key")
+        .expect("有外键删除");
+    let first_table = plan
+        .iter()
+        .position(|s| s.category == "drop_table")
+        .expect("有表删除");
+    assert!(last_fk < first_table, "外键删除必须全部先于表删除");
+}
+
+#[test]
+fn a_self_reference_disappears_with_its_own_table() {
+    let mut a = plain_table("a");
+    a.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_a_self".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "a".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let diff = compare_everything(
+        &[],
+        &[a],
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
+    // The self-reference is reported as a missing key and dropped on its own
+    // right; the scan must not add a second, redundant statement.
+    let drops = plan
+        .iter()
+        .filter(|s| s.category == "drop_foreign_key")
+        .count();
+    assert_eq!(drops, 1, "{:?}", plan.iter().map(|s| &s.sql).collect::<Vec<_>>());
+}

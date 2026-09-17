@@ -914,8 +914,8 @@ fn alter_column_statements(
                 if let Some(value) = placeholder {
                     // The placeholder exists only to backfill existing rows.
                     warnings.push(format!(
-                        "表 {}：为把非空列 {} 加到已有数据的表上，先用占位默认值 {value} 回填了现有行，随后已删除该默认值；请按需用数据同步修正这些值",
-                        table.name, column.name
+                        "表 {}：为把非空列 {} 加到已有数据的表上，已用占位值 {value} 回填现有行并随后删除该默认值；如需真实值，请接着对表 {} 执行一次数据同步",
+                        table.name, column.name, table.name
                     ));
                     out.push(DdlStatement {
                         table: table.name.clone(),
@@ -1103,6 +1103,11 @@ pub fn generate(
 
     let mut drop_fks: Vec<DdlStatement> = Vec::new();
     let mut drop_tables: Vec<DdlStatement> = Vec::new();
+    // (table, constraint) pairs already scheduled for removal, and the tables
+    // that are going away entirely.
+    let mut planned_fk_drops: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    let mut dropped_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut create_tables: Vec<DdlStatement> = Vec::new();
     let mut body: Vec<DdlStatement> = Vec::new();
     let mut add_indexes: Vec<DdlStatement> = Vec::new();
@@ -1138,6 +1143,24 @@ pub fn generate(
             }
             ChangeKind::Missing => {
                 if sel.map(|s| s.whole_table).unwrap_or(true) {
+                    // Release the table's own constraints first: MySQL refuses to
+                    // drop a table that participates in a foreign key, including
+                    // one of its own.
+                    for fk in &table.foreign_keys {
+                        if let Some(existing) = fk.target.as_ref() {
+                            planned_fk_drops.insert((table.name.clone(), fk.name.clone()));
+                            drop_fks.push(DdlStatement {
+                                table: table.name.clone(),
+                                category: "drop_foreign_key".into(),
+                                object: fk.name.clone(),
+                                sql: format!(
+                                    "{};",
+                                    drop_fk_ddl(existing, &table.name, target, target_schema)
+                                ),
+                            });
+                        }
+                    }
+                    dropped_tables.insert(table.name.clone());
                     drop_tables.push(DdlStatement {
                         table: table.name.clone(),
                         category: "drop_table".into(),
@@ -1167,6 +1190,8 @@ pub fn generate(
                     match diff_fk.kind {
                         ChangeKind::Missing | ChangeKind::Changed => {
                             if let Some(fk) = diff_fk.target.as_ref() {
+                                planned_fk_drops
+                                    .insert((table.name.clone(), diff_fk.name.clone()));
                                 drop_fks.push(DdlStatement {
                                     table: table.name.clone(),
                                     category: "drop_foreign_key".into(),
@@ -1345,6 +1370,44 @@ pub fn generate(
                         sql: format!("COMMENT ON TABLE {tref} IS {value};"),
                     });
                 }
+            }
+        }
+    }
+
+    // A table cannot be dropped while any foreign key still points at it. That
+    // includes constraints on tables whose own changes the user did not select —
+    // for example a target-only table referenced by an otherwise unchanged
+    // table. Those references are released here regardless of the selection,
+    // because the alternative is a plan that cannot execute.
+    if !dropped_tables.is_empty() {
+        for table in &diff.tables {
+            for fk in &table.foreign_keys {
+                let Some(existing) = fk.target.as_ref() else {
+                    continue;
+                };
+                if existing.ref_table == table.name {
+                    // A self-reference disappears with the table itself.
+                    continue;
+                }
+                if !dropped_tables.contains(&existing.ref_table) {
+                    continue;
+                }
+                if !planned_fk_drops.insert((table.name.clone(), fk.name.clone())) {
+                    continue;
+                }
+                warnings.push(format!(
+                    "表 {} 的外键 {} 指向即将删除的表 {}，已自动加入删除列表",
+                    table.name, fk.name, existing.ref_table
+                ));
+                drop_fks.push(DdlStatement {
+                    table: table.name.clone(),
+                    category: "drop_foreign_key".into(),
+                    object: fk.name.clone(),
+                    sql: format!(
+                        "{};",
+                        drop_fk_ddl(existing, &table.name, target, target_schema)
+                    ),
+                });
             }
         }
     }

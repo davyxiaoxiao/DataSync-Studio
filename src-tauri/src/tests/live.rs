@@ -265,9 +265,16 @@ fn late_column_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
         Dialect::Mysql => "VARCHAR(32)",
         Dialect::Postgres => "character varying(32)",
     };
+    // The existing rows get real values, so that a following data sync has
+    // something to backfill (the target will hold the placeholder instead).
+    let fill = match dialect {
+        Dialect::Mysql => format!("UPDATE {users} SET {column} = CONCAT('web-', `id`)"),
+        Dialect::Postgres => format!("UPDATE {users} SET {column} = 'web-' || \"id\""),
+    };
     vec![
         format!("ALTER TABLE {users} ADD COLUMN {column} {type_name} NOT NULL DEFAULT ''"),
         format!("ALTER TABLE {users} ALTER COLUMN {column} DROP DEFAULT"),
+        fill,
     ]
 }
 
@@ -852,6 +859,44 @@ async fn roundtrip(
     // Existing rows were backfilled so the column could be made NOT NULL.
     let filled = scalar_text(target_pool, target_ns, "users", "channel", target_dialect).await;
     assert_eq!(filled, "", "{tag}: 现有行应被回填为空串占位值");
+
+    // ---- 10. a data sync then fills the new column with real values --------
+    // Structure sync only guarantees the column exists; the values come from a
+    // data sync, which is exactly the composition the tool offers.
+    let (pending, fill_plan, _) = compare_data_core(
+        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 200,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("compare data for the new column");
+    assert!(
+        pending.summary.updates > 0,
+        "{tag}: 新增列的真实值应被识别为待更新, 实际 {:?}",
+        pending.summary
+    );
+    let updated = pending.summary.updates;
+    apply_data(target_pool, target_ns, fill_plan.select(true, true, true)).await;
+
+    let (filled_pass, _, _) = compare_data_core(
+        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 200,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("re-compare after backfill");
+    assert_eq!(
+        (
+            filled_pass.summary.inserts,
+            filled_pass.summary.updates,
+            filled_pass.summary.deletes
+        ),
+        (0, 0, 0),
+        "{tag}: 回填后 users 应完全一致"
+    );
+    let backfilled = scalar_text(target_pool, target_ns, "users", "channel", target_dialect).await;
+    assert_eq!(
+        backfilled, "web-1",
+        "{tag}: 回填 {updated} 行后 channel 应为源端真实值"
+    );
 }
 
 #[tokio::test]
@@ -1375,6 +1420,150 @@ async fn live_postgres_table_browsing() {
     };
     let pool = connect(&target, Dialect::Postgres).await;
     browse_scenario(&pool, Dialect::Postgres, "datasync_live_browse", "pg 浏览").await;
+}
+
+/// Dropping tables that are still referenced.
+///
+/// Covers two shapes that a naive "drop the constraints I was told about, then
+/// drop the tables" plan gets wrong: a reference cycle between two tables, and a
+/// target-only table referenced by a table whose own changes were not selected.
+async fn fk_drop_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str, tag: &str) {
+    drop_namespace(pool, dialect, src).await;
+    drop_namespace(pool, dialect, dst).await;
+    create_namespace(pool, dialect, src).await;
+    create_namespace(pool, dialect, dst).await;
+
+    // Everything goes into the target namespace.
+    let q = |name: &str| dialect.qualified(Some(dst), name);
+    let col = |name: &str| dialect.quote(name);
+    let engine = match dialect {
+        Dialect::Mysql => " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        Dialect::Postgres => "",
+    };
+    let int = match dialect {
+        Dialect::Mysql => "INT",
+        Dialect::Postgres => "integer",
+    };
+
+    // The target holds a reference cycle plus a table that is referenced by a
+    // table the source also has.
+    let target_setup = vec![
+        format!("CREATE TABLE {} ({c} {int} NOT NULL, {b} {int}, PRIMARY KEY ({c})){engine}", q("node_a"), c = col("id"), b = col("b_id")),
+        format!("CREATE TABLE {} ({c} {int} NOT NULL, {a} {int}, PRIMARY KEY ({c})){engine}", q("node_b"), c = col("id"), a = col("a_id")),
+        format!("ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({b}) REFERENCES {} ({c})",
+            q("node_a"), col("fk_a_b"), q("node_b"), c = col("id"), b = col("b_id")),
+        format!("ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({a}) REFERENCES {} ({c})",
+            q("node_b"), col("fk_b_a"), q("node_a"), c = col("id"), a = col("a_id")),
+        format!("CREATE TABLE {} ({c} {int} NOT NULL, PRIMARY KEY ({c})){engine}", q("leftover"), c = col("id")),
+        format!("CREATE TABLE {} ({c} {int} NOT NULL, {l} {int}, PRIMARY KEY ({c})){engine}",
+            q("keeper"), c = col("id"), l = col("leftover_id")),
+        format!("ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({l}) REFERENCES {} ({c})",
+            q("keeper"), col("fk_keeper_leftover"), q("leftover"), c = col("id"), l = col("leftover_id")),
+    ];
+    exec_all(pool, &target_setup).await;
+
+    // The source has only `keeper`, and without the foreign key.
+    exec_all(
+        pool,
+        &[format!(
+            "CREATE TABLE {} ({c} {int} NOT NULL, {l} {int}, PRIMARY KEY ({c})){engine}",
+            dialect.qualified(Some(src), "keeper"),
+            c = col("id"),
+            l = col("leftover_id")
+        )],
+    )
+    .await;
+
+    let (diff, sources, _) = compare_schema_core(
+        pool,
+        src,
+        pool,
+        dst,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("compare");
+    let _ = sources;
+    assert_eq!(
+        diff.summary.missing_tables, 3,
+        "{tag}: node_a / node_b / leftover 都应被识别为待删除, 实际 {:?}",
+        diff.summary
+    );
+
+    let mut warnings = Vec::new();
+    let mut plan = generate(&diff, &HashMap::new(), None, Some(dst), &mut warnings);
+    let fk_drops = plan.iter().filter(|s| s.category == "drop_foreign_key").count();
+    let table_drops = plan.iter().filter(|s| s.category == "drop_table").count();
+    assert_eq!(table_drops, 3, "{tag}: 应删除 3 张表");
+    assert_eq!(fk_drops, 3, "{tag}: 三个外键都要先解除");
+    let last_fk = plan
+        .iter()
+        .rposition(|s| s.category == "drop_foreign_key")
+        .expect("有外键删除");
+    let first_table = plan
+        .iter()
+        .position(|s| s.category == "drop_table")
+        .expect("有表删除");
+    assert!(
+        last_fk < first_table,
+        "{tag}: 外键删除必须全部先于表删除: {:?}",
+        plan.iter().map(|s| (&s.category, &s.sql)).collect::<Vec<_>>()
+    );
+
+    // Executing the plan must actually succeed, which is the whole point.
+    run_plan(pool, plan.drain(..).map(|s| s.sql).collect()).await;
+
+    let (after, _, _) = compare_schema_core(
+        pool,
+        src,
+        pool,
+        dst,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("re-compare");
+    assert_structurally_identical(&after, &format!("{tag} 删表"));
+
+    drop_namespace(pool, dialect, src).await;
+    drop_namespace(pool, dialect, dst).await;
+}
+
+#[tokio::test]
+async fn live_mysql_dropping_referenced_tables() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    fk_drop_scenario(
+        &pool,
+        Dialect::Mysql,
+        "datasync_live_fk_src",
+        "datasync_live_fk_dst",
+        "mysql 删表",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn live_postgres_dropping_referenced_tables() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    fk_drop_scenario(
+        &pool,
+        Dialect::Postgres,
+        "datasync_live_fk_src",
+        "datasync_live_fk_dst",
+        "pg 删表",
+    )
+    .await;
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must

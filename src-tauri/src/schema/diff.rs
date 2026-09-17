@@ -569,8 +569,25 @@ fn diff_table(
         foreign_keys: Vec::new(),
     };
 
-    // Wholesale creation / removal does not need per-object detail.
-    if matches!(kind, ChangeKind::New | ChangeKind::Missing) {
+    // Wholesale creation needs no per-object detail.
+    if kind == ChangeKind::New {
+        return diff;
+    }
+    // A table that is about to be dropped still has to have its inbound foreign
+    // keys released, and those constraints only exist on the target. They are
+    // reported as `Missing` so the planner can drop them first.
+    if kind == ChangeKind::Missing {
+        if let Some(existing) = target {
+            for fk in &existing.foreign_keys {
+                diff.foreign_keys.push(ForeignKeyDiff {
+                    name: fk.name.clone(),
+                    kind: ChangeKind::Missing,
+                    source: None,
+                    target: Some(fk.clone()),
+                    differences: Vec::new(),
+                });
+            }
+        }
         return diff;
     }
 
