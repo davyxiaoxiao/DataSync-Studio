@@ -1,10 +1,14 @@
 # DataSync Studio
 
-一个仿 Navicat 的 macOS 数据库同步工具，支持 **MySQL** 与 **PostgreSQL**：
+一个仿 Navicat 的 macOS 数据库同步工具，支持 **MySQL** 与 **PostgreSQL**。
+
+> **只支持同类型同步**：MySQL → MySQL、PostgreSQL → PostgreSQL。
+> 跨类型（MySQL → PostgreSQL 或反向）会被明确拒绝——两者的类型、生成表达式、
+> 视图 SQL 都不同，机械转换无法保证正确。界面上目标连接会按源连接的类型自动过滤。
 
 - **连接管理**：保存 / 编辑 / 测试 / 删除连接，密码加密存储
 - **库表浏览**：模式（数据库）→ 表树、表数据分页浏览
-- **结构同步**：对比两个库的表 / 列 / 索引 / 外键 / 主键差异，勾选后生成 DDL 并执行（支持跨数据库类型 Type Mapping）
+- **结构同步**：对比两个库的表 / 列 / 索引 / 外键 / 主键差异，勾选后生成 DDL 并执行
 - **数据同步**：按主键匹配，计算新增 / 修改 / 删除行，批量生成 DML 并事务化执行
 
 技术栈：**Tauri 2 + React 19 + TypeScript + Rust (sqlx)**。Rust 侧负责全部数据库通信与 SQL 生成，前端只做展示与选择。
@@ -65,7 +69,7 @@ pnpm tauri build --bundles dmg
 | 类别 | 支持 |
 | --- | --- |
 | 表 | 新建表、删除表 |
-| 列 | 新增、删除、修改（类型 / 可空 / 默认值 / 自增 / 注释 / 字符集） |
+| 列 | 新增、删除、修改（类型 / 可空 / 默认值 / 自增 / 注释 / 字符集 / 生成列表达式） |
 | 主键 | 新增、删除、修改 |
 | 索引 | 新增、删除、修改（含唯一性） |
 | 外键 | 新增、删除、修改（含 ON DELETE / ON UPDATE） |
@@ -102,7 +106,7 @@ src-tauri/                 Rust 后端
   src/db/value.rs          跨驱动单元格解码（Value / Cell / ColumnKind）
   src/schema/introspect.rs MySQL / PostgreSQL 结构内省
   src/schema/diff.rs       结构对比引擎
-  src/schema/ddl.rs        跨方言类型映射 + DDL 生成
+  src/schema/ddl.rs        DDL 生成与列定义渲染
   src/data/mod.rs          数据读取计划、行差异计算、DML 生成
   src/commands.rs          Tauri 命令层
   src/tests/               纯逻辑单元测试
@@ -111,12 +115,12 @@ src-tauri/                 Rust 后端
 ### 关键设计
 
 **归一化结构模型**：MySQL 的 `information_schema` 与 PostgreSQL 的 `pg_catalog` 各自被读取为
-统一的 `TableStructure`（列 / 主键 / 索引 / 外键），对比引擎只处理这一种模型，因此
-「MySQL ↔ PostgreSQL 跨类型对比」不需要单独的代码路径。
+统一的 `TableStructure`（列 / 主键 / 索引 / 外键），对比与 DDL 生成只处理这一种模型，
+两个引擎共用同一套代码路径。
 
-**类型映射**：跨方言对比时先把源类型映射到目标方言再比较，因此 `int(11)` 与 `integer`
-不会被视为差异，而 `varchar(64)` 与 `varchar(128)` 会。内置常见类型的双向映射（见
-`ddl.rs::map_type`），未知类型退化为 `text` / `longtext`。
+**生成列保真**：MySQL 的 `STORED` / `VIRTUAL GENERATED` 与 PostgreSQL 的
+`GENERATED ALWAYS AS (...) STORED` 会被识别并原样重建。数据同步把这些列排除在
+INSERT / UPDATE 之外（值由目标端自己计算），因此既不会被降级成普通列，也不会被服务端拒绝。
 
 **值解码**：不依赖驱动的结果集类型推断，而是使用内省得到的列类型决定如何解码；
 PostgreSQL 上驱动无法原生解码的类型（`uuid`、`inet`、数组、枚举、域等）会自动以
@@ -154,19 +158,22 @@ cp .env.live.example .env.live    # 填入 host / port / user / password
 测试会走完应用使用的同一条代码路径（内省 → 对比 → 生成 DDL/DML → 执行），
 并在服务器上创建再删除名为 `datasync_live_*` 的临时库 / 模式：
 
-1. 在源端建两张带主键、唯一键、索引、外键、JSON、BLOB、布尔、DECIMAL、DATETIME 的表
+1. 在源端建两张表，覆盖主键、唯一键、索引、外键、JSON、BLOB、布尔、DECIMAL、
+   DATETIME 以及 STORED 生成列
 2. 空目标端对比 → 生成 DDL → 执行 → 再对比，断言「已完全一致」
 3. 源端制造结构漂移（加列 / 加宽列 / 删列 / 改类型 / 加索引 / 改默认值）→ 同步 → 再断言一致
 4. 源端插入数据 → 数据同步 → 再对比断言 0 新增 / 0 修改 / 0 删除
 5. 源端 UPDATE + DELETE → 再同步 → 再断言一致
+6. 断言目标端的生成列被真正重算（`amount * 2`），而不是被拷贝或留空
 
-只配置 MySQL 或只配置 PostgreSQL 时跑单引擎流程；两者都配置时会额外跑
-**MySQL → PostgreSQL 跨库迁移**，覆盖类型映射与跨引擎取值比较。
+只配置 MySQL 或只配置 PostgreSQL 时跑单引擎流程；两者都配置时会额外验证
+**跨类型同步被正确拒绝**。
 
 未配置 `.env.live` 时这些测试会自动跳过，`cargo test` 仍然全绿。
 
-**当前状态**：MySQL→MySQL、PostgreSQL→PostgreSQL、MySQL→PostgreSQL 三条链路均已在
-真实服务器上跑通（结构新建、结构漂移同步、数据新增/更新/删除同步、外键与索引）。
+**当前状态**：MySQL→MySQL 与 PostgreSQL→PostgreSQL 两条链路均已在真实服务器上跑通
+（结构新建、结构漂移同步、生成列保真与目标端重算、数据新增/更新/删除同步、外键与索引），
+跨类型请求被拒绝也有真库测试覆盖。
 
 ---
 
@@ -175,6 +182,6 @@ cp .env.live.example .env.live    # 填入 host / port / user / password
 - 只支持 MySQL 与 PostgreSQL；视图 / 物化视图 / 外部表会被跳过并提示
 - 数据同步为**全量对比**（按主键排序后读入内存），默认上限 20 万行；超大表需要分批策略
 - 结构同步不做数据搬迁（例如给已有表加非空列且无默认值时，目标表已有数据会失败）
-- 不支持自定义类型（PostgreSQL enum/domain、MySQL SET 语义）的等价映射，统一退化为文本
+- 不支持跨类型同步（见开头说明），两端必须是同一引擎
 - 分区表按普通表处理
 - `pnpm tauri build` 默认只产出 `.app`；DMG 需要 Finder 自动化权限，故未列为默认目标
