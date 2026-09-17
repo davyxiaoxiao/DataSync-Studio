@@ -1190,3 +1190,39 @@ table.grid thead th.rowno {
   color: var(--text-muted);
   font-family: var(--mono);
 }
+
+/* ------------------------------------------------------- table designer */
+
+table.grid.designer td {
+  padding: 2px 6px;
+  height: 32px;
+}
+
+table.grid.designer input[type="text"] {
+  height: 24px;
+  border-color: transparent;
+  background: transparent;
+}
+
+table.grid.designer input[type="text"]:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: #fff;
+}
+
+table.grid.designer input[type="text"]:focus {
+  border-color: var(--accent);
+  background: #fff;
+}
+
+table.grid.designer input[type="text"]:disabled {
+  background: transparent;
+  color: var(--text-faint);
+}
+
+table.grid.designer tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+table.grid.designer .icon-btn:disabled {
+  opacity: 0.25;
+}

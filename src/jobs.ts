@@ -1,19 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-
-/** Mirrors `jobs::ProgressUpdate` on the Rust side. */
-export interface ProgressUpdate {
-  jobId: string;
-  stage: string;
-  label: string;
-  processed: number;
-  total?: number | null;
-  detail: string;
-  finished: boolean;
-  cancelled: boolean;
-}
+import type { ProgressUpdate } from "./types";
 
 const PROGRESS_EVENT = "sync://progress";
+
+export type { ProgressUpdate };
 
 function newJobId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {

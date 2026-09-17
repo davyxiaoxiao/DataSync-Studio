@@ -61,6 +61,20 @@ export const IconFolder = svg(
 );
 
 export const IconChevronRight = svg(<path d="M6 3.6 10.4 8 6 12.4" />);
+
+export const IconArrowUp = svg(
+  <>
+    <path d="M8 13V3.4" />
+    <path d="M3.8 7.6 8 3.4l4.2 4.2" />
+  </>,
+);
+
+export const IconArrowDown = svg(
+  <>
+    <path d="M8 3v9.6" />
+    <path d="M3.8 8.4 8 12.6l4.2-4.2" />
+  </>,
+);
 export const IconChevronDown = svg(<path d="M3.6 6 8 10.4 12.4 6" />);
 
 export const IconPlus = svg(<path d="M8 3v10M3 8h10" />);

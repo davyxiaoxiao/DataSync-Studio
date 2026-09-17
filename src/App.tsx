@@ -1,8 +1,11 @@
 import { useCallback, useMemo, useState } from "react";
 import { api, errorMessage } from "./api";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
+import { DropTablesDialog } from "./components/DropTablesDialog";
 import { LogPanel } from "./components/LogPanel";
-import { Sidebar } from "./components/Sidebar";
+import { Sidebar, type TableRef } from "./components/Sidebar";
+import { TableDesignerDialog } from "./components/TableDesignerDialog";
 import { TabBar } from "./components/TabBar";
 import { Toolbar } from "./components/Toolbar";
 import { StoreProvider, useStore } from "./store";
@@ -17,6 +20,85 @@ interface DialogState {
   config: ConnectionConfig | null;
 }
 
+/// One place for every table-level dialog, so only one can be open at a time.
+type TableAction =
+  | { kind: "designer"; ref: TableRef }
+  | { kind: "rename"; ref: TableRef }
+  | { kind: "drop"; refs: TableRef[] }
+  | { kind: "deleteConnection"; config: ConnectionConfig };
+
+function RenameTableDialog({
+  target,
+  onClose,
+  onDone,
+  onLog,
+}: {
+  target: TableRef;
+  onClose: () => void;
+  onDone: () => void;
+  onLog: (level: "info" | "ok" | "warn" | "err", message: string) => void;
+}) {
+  const [name, setName] = useState(target.table);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const outcome = await api.renameTable({
+        connectionId: target.connectionId,
+        namespace: target.namespace,
+        table: target.table,
+        newName: name.trim(),
+      });
+      if (outcome.failed > 0) {
+        setError(outcome.failures[0]?.error ?? outcome.message);
+        onLog("err", outcome.message);
+      } else {
+        onLog("ok", `已将 ${target.table} 重命名为 ${name.trim()}`);
+        onDone();
+      }
+    } catch (err) {
+      setError(errorMessage(err));
+      onLog("err", `重命名失败: ${errorMessage(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ConfirmDialog
+      title="重命名表"
+      busy={busy}
+      error={error}
+      confirmLabel="重命名"
+      onClose={onClose}
+      onConfirm={() => {
+        if (name.trim() && name.trim() !== target.table) void submit();
+      }}
+      message={
+        <div className="field">
+          <label>
+            将 <span className="mono">{target.namespace}.{target.table}</span> 重命名为
+          </label>
+          <input
+            type="text"
+            value={name}
+            autoFocus
+            onChange={(event) => setName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && name.trim() && name.trim() !== target.table) {
+                void submit();
+              }
+            }}
+          />
+        </div>
+      }
+    />
+  );
+}
+
 function Shell() {
   const {
     connections,
@@ -27,6 +109,7 @@ function Shell() {
     reloadConnections,
     connect,
     closeTabsForConnection,
+    closeTab,
   } = useStore();
 
   const [dialog, setDialog] = useState<DialogState>({ open: false, config: null });
@@ -45,22 +128,12 @@ function Shell() {
     [],
   );
 
+  const [tableAction, setTableAction] = useState<TableAction | null>(null);
+
   const removeConnection = useCallback(
-    async (config: ConnectionConfig) => {
-      const confirmed = window.confirm(
-        `确定要删除连接「${config.name}」吗？该操作会同时删除已保存的密码。`,
-      );
-      if (!confirmed) return;
-      try {
-        await api.deleteConnection(config.id);
-        closeTabsForConnection(config.id);
-        await reloadConnections();
-        log("ok", `已删除连接 ${config.name}`);
-      } catch (error) {
-        log("err", `删除连接失败: ${errorMessage(error)}`);
-      }
-    },
-    [closeTabsForConnection, log, reloadConnections],
+    (config: ConnectionConfig) =>
+      setTableAction({ kind: "deleteConnection", config }),
+    [],
   );
 
   return (
@@ -75,7 +148,10 @@ function Shell() {
         <Sidebar
           onNewConnection={openNew}
           onEditConnection={openEdit}
-          onDeleteConnection={(config) => void removeConnection(config)}
+          onDeleteConnection={removeConnection}
+          onEditTable={(ref) => setTableAction({ kind: "designer", ref })}
+          onRenameTable={(ref) => setTableAction({ kind: "rename", ref })}
+          onDropTables={(refs) => setTableAction({ kind: "drop", refs })}
         />
 
         <div className="main-area">
@@ -117,6 +193,96 @@ function Shell() {
           <LogPanel />
         </div>
       </div>
+
+      {tableAction?.kind === "deleteConnection" && (
+        <ConfirmDialog
+          title="删除连接"
+          danger
+          confirmLabel="删除"
+          message={
+            <div>
+              确定要删除连接「{tableAction.config.name}」吗？
+              <div className="faint" style={{ marginTop: 6 }}>
+                该操作会同时删除已保存的密码，且不可恢复。
+              </div>
+            </div>
+          }
+          onClose={() => setTableAction(null)}
+          onConfirm={async () => {
+            const config = tableAction.config;
+            setTableAction(null);
+            try {
+              await api.deleteConnection(config.id);
+              closeTabsForConnection(config.id);
+              await reloadConnections();
+              log("ok", `已删除连接 ${config.name}`);
+            } catch (error) {
+              log("err", `删除连接失败: ${errorMessage(error)}`);
+            }
+          }}
+        />
+      )}
+
+      {tableAction?.kind === "rename" && (
+        <RenameTableDialog
+          target={tableAction.ref}
+          onClose={() => setTableAction(null)}
+          onDone={() => {
+            const target = tableAction.ref;
+            // The tab still points at the old name.
+            for (const tab of tabs) {
+              if (
+                tab.kind === "table" &&
+                tab.connectionId === target.connectionId &&
+                tab.namespace === target.namespace &&
+                tab.table === target.table
+              ) {
+                closeTab(tab.id);
+              }
+            }
+            setTableAction(null);
+            window.dispatchEvent(new CustomEvent("datasync:refresh-tables"));
+          }}
+          onLog={log}
+        />
+      )}
+
+      {tableAction?.kind === "drop" && (
+        <DropTablesDialog
+          refs={tableAction.refs}
+          onClose={() => setTableAction(null)}
+          onDone={() => {
+            for (const ref of tableAction.refs) {
+              for (const tab of tabs) {
+                if (
+                  tab.kind === "table" &&
+                  tab.connectionId === ref.connectionId &&
+                  tab.namespace === ref.namespace &&
+                  tab.table === ref.table
+                ) {
+                  closeTab(tab.id);
+                }
+              }
+            }
+            setTableAction(null);
+            window.dispatchEvent(new CustomEvent("datasync:refresh-tables"));
+          }}
+          onLog={log}
+        />
+      )}
+
+      {tableAction?.kind === "designer" && (
+        <TableDesignerDialog
+          connectionId={tableAction.ref.connectionId}
+          namespace={tableAction.ref.namespace}
+          table={tableAction.ref.table}
+          onClose={() => setTableAction(null)}
+          onSaved={() => {
+            window.dispatchEvent(new CustomEvent("datasync:refresh-tables"));
+          }}
+          onLog={log}
+        />
+      )}
 
       {dialog.open && (
         <ConnectionDialog

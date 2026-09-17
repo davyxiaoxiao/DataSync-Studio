@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ColumnInfo,
   ColumnPair,
   CompareSchemaResult,
   ConnectionConfig,
@@ -7,6 +8,7 @@ import type {
   DataDiffResult,
   NamespaceInfo,
   SchemaDiff,
+  DropTablesPreview,
   SchemaSqlPreview,
   SyncRunResult,
   SyncSelection,
@@ -129,7 +131,55 @@ export const api = {
 
   /** Ask a running job to stop; returns false when it already finished. */
   cancelJob: (jobId: string) => invoke<boolean>("cancel_job", { jobId }),
+
+  previewDropTables: (connectionId: string, namespace: string, tables: string[]) =>
+    invoke<DropTablesPreview>("preview_drop_tables", { connectionId, namespace, tables }),
+
+  applyDropTables: (request: {
+    connectionId: string;
+    namespace: string;
+    tables: string[];
+    jobId?: string;
+  }) => invoke<SyncRunResult>("apply_drop_tables", { request }),
+
+  renameTable: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    newName: string;
+    jobId?: string;
+  }) => invoke<SyncRunResult>("rename_table", { request }),
+
+  previewAlterTable: (
+    connectionId: string,
+    namespace: string,
+    table: string,
+    columns: ColumnInfo[],
+    renames: ColumnRename[] = [],
+  ) =>
+    invoke<SchemaSqlPreview>("preview_alter_table", {
+      connectionId,
+      namespace,
+      table,
+      columns,
+      renames,
+    }),
+
+  applyAlterTable: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    columns: ColumnInfo[];
+    renames?: ColumnRename[];
+    jobId?: string;
+  }) => invoke<SyncRunResult>("apply_alter_table", { request }),
 };
+
+/** A column whose name was edited in the table designer. */
+export interface ColumnRename {
+  from: string;
+  to: string;
+}
 
 export interface StorageInfo {
   dir: string;

@@ -54,10 +54,17 @@ export interface ColumnInfo {
   default?: string | null;
   isAutoIncrement: boolean;
   autoKind?: string | null;
+  /** A computed column: derived on write, never writable. */
+  isGenerated: boolean;
+  generationExpression?: string | null;
+  /** "stored" | "virtual" */
+  generationKind?: string | null;
   isUnsigned: boolean;
   comment?: string | null;
   charset?: string | null;
   collation?: string | null;
+  /** Set for a user-defined type (PostgreSQL enum/domain). */
+  udtName?: string | null;
 }
 
 export interface IndexInfo {
@@ -249,6 +256,25 @@ export interface SyncRunResult {
 
 export interface SchemaSqlPreview {
   statements: DdlStatement[];
+  warnings: string[];
+}
+
+/** Mirrors `jobs::ProgressUpdate`; delivered on the `sync://progress` event. */
+export interface ProgressUpdate {
+  jobId: string;
+  stage: string;
+  label: string;
+  processed: number;
+  total?: number | null;
+  detail: string;
+  finished: boolean;
+  cancelled: boolean;
+}
+
+export interface DropTablesPreview {
+  statements: DdlStatement[];
+  /** Views reading from the tables being dropped; they are not removed for you. */
+  dependentViews: string[];
   warnings: string[];
 }
 

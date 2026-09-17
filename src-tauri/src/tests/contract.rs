@@ -14,7 +14,7 @@ use crate::db::value::{Cell, ColumnKind, ColumnMeta, Value};
 use crate::db::{ScriptRun, StatementOutcome};
 use crate::dialect::Dialect;
 use crate::jobs::ProgressUpdate;
-use crate::schema::ddl::{DdlStatement, SyncSelection};
+use crate::schema::ddl::{DdlStatement, SyncSelection, TableSelection};
 use crate::schema::diff::{
     ChangeKind, ColumnDiff, DiffSummary, FieldChange, ForeignKeyDiff, IndexDiff, PrimaryKeyDiff,
     SchemaDiff, TableDiff, TypeDiff, ViewDiff,
@@ -817,4 +817,300 @@ fn data_plan_selection_orders_deletes_before_inserts() {
     );
     assert_eq!(plan.select(true, false, false), vec!["INSERT"]);
     assert!(plan.select(false, false, false).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The TypeScript mirror
+// ---------------------------------------------------------------------------
+
+/// Extract the field names of an `export interface X { ... }` block from
+/// `src/types.ts`. Optional markers and comments are ignored.
+fn ts_interface_fields(source: &str, name: &str) -> Vec<String> {
+    let header = format!("export interface {name} {{");
+    let start = source
+        .find(&header)
+        .unwrap_or_else(|| panic!("src/types.ts 缺少 interface {name}"));
+    let body_start = start + header.len();
+    let body_end = source[body_start..]
+        .find("\n}")
+        .map(|offset| body_start + offset)
+        .unwrap_or_else(|| panic!("interface {name} 没有闭合"));
+    let body = &source[body_start..body_end];
+
+    let mut fields = Vec::new();
+    let mut depth = 0i32;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        // Only top-level members; nested object literals are indented deeper.
+        let opens = trimmed.matches('{').count() as i32;
+        let closes = trimmed.matches('}').count() as i32;
+        if depth == 0 {
+            if let Some((key, _)) = trimmed.split_once(':') {
+                let key = key.trim().trim_end_matches('?').trim();
+                if !key.is_empty()
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !key.contains(' ')
+                {
+                    fields.push(key.to_string());
+                }
+            }
+        }
+        depth += opens - closes;
+    }
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+fn rust_json_fields<T: serde::Serialize>(value: &T) -> Vec<String> {
+    let json = to_json(value);
+    let mut keys: Vec<String> = json
+        .as_object()
+        .unwrap_or_else(|| panic!("expected an object, got {json}"))
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn assert_ts_matches<T: serde::Serialize>(source: &str, name: &str, value: &T) {
+    let expected = rust_json_fields(&to_json(value));
+    let actual = ts_interface_fields(source, name);
+    let missing: Vec<&String> = expected.iter().filter(|k| !actual.contains(k)).collect();
+    let extra: Vec<&String> = actual.iter().filter(|k| !expected.contains(k)).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "Rust 与 src/types.ts 的接口 {name} 不一致\n  TS 缺少: {missing:?}\n  TS 多出: {extra:?}"
+    );
+}
+
+/// The TypeScript types are a hand-written mirror of the Rust DTOs, so this
+/// test reads `src/types.ts` and compares field names both ways. Adding a field
+/// on one side without the other fails here instead of producing `undefined`
+/// somewhere in the webview.
+#[test]
+fn typescript_interfaces_match_the_rust_dtos() {
+    // The mirror lives across a few frontend files, so all of them are searched.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src");
+    let mut source = String::new();
+    for file in ["types.ts", "jobs.ts", "api.ts"] {
+        let path = root.join(file);
+        source.push_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("无法读取 {}: {e}", path.display())),
+        );
+        source.push('\n');
+    }
+
+    assert_ts_matches(&source, "ConnectionConfig", &sample_connection());
+    assert_ts_matches(
+        &source,
+        "ColumnInfo",
+        &ColumnInfo {
+            name: "c".into(),
+            ordinal: 1,
+            data_type: "INT".into(),
+            full_type: "int".into(),
+            nullable: false,
+            default: None,
+            is_auto_increment: false,
+            auto_kind: None,
+            is_generated: true,
+            generation_expression: Some("a + b".into()),
+            generation_kind: Some("stored".into()),
+            is_unsigned: false,
+            comment: None,
+            charset: None,
+            collation: None,
+            udt_name: Some("mood".into()),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "TableStructure",
+        &TableStructure {
+            name: "t".into(),
+            comment: None,
+            engine: None,
+            charset: None,
+            collation: None,
+            primary_key: Vec::new(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "IndexInfo",
+        &IndexInfo {
+            name: "i".into(),
+            columns: Vec::new(),
+            is_unique: false,
+            index_type: None,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "ForeignKeyInfo",
+        &ForeignKeyInfo {
+            name: "f".into(),
+            columns: Vec::new(),
+            ref_schema: None,
+            ref_table: "t".into(),
+            ref_columns: Vec::new(),
+            on_update: "NO ACTION".into(),
+            on_delete: "NO ACTION".into(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "ViewStructure",
+        &ViewStructure {
+            name: "v".into(),
+            kind: "view".into(),
+            definition: "select 1".into(),
+            comment: None,
+            dependencies: Vec::new(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "CustomType",
+        &CustomType {
+            name: "mood".into(),
+            kind: "enum".into(),
+            labels: Vec::new(),
+            base_type: None,
+            domain_nullable: true,
+            domain_default: None,
+            constraints: Vec::new(),
+            comment: None,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "StatementOutcome",
+        &StatementOutcome {
+            sql: "SELECT 1".into(),
+            ok: true,
+            rows_affected: 0,
+            error: None,
+            elapsed_ms: 1,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "NamespaceInfo",
+        &NamespaceInfo {
+            name: "n".into(),
+            charset: None,
+            collation: None,
+            is_system: false,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "TableSummary",
+        &TableSummary {
+            name: "t".into(),
+            table_type: "BASE TABLE".into(),
+            comment: None,
+            rows: None,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "ColumnMeta",
+        &ColumnMeta {
+            name: "c".into(),
+            data_type: "int".into(),
+            kind: ColumnKind::Int,
+            nullable: false,
+            primary_key: true,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "ProgressUpdate",
+        &ProgressUpdate {
+            job_id: "j".into(),
+            stage: "s".into(),
+            label: "l".into(),
+            processed: 0,
+            total: None,
+            detail: String::new(),
+            finished: false,
+            cancelled: false,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "SchemaSqlPreview",
+        &crate::commands::SchemaSqlPreview {
+            statements: Vec::new(),
+            warnings: Vec::new(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "DropTablesPreview",
+        &crate::commands::DropTablesPreview {
+            statements: Vec::new(),
+            dependent_views: Vec::new(),
+            warnings: Vec::new(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "StorageInfo",
+        &crate::commands::StorageInfo {
+            dir: "/tmp".into(),
+            warning: None,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "TestConnectionResult",
+        &crate::commands::TestConnectionResult {
+            ok: true,
+            server_version: None,
+            elapsed_ms: 0,
+            error: None,
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "ConnectionInfo",
+        &crate::commands::ConnectionInfo {
+            server_version: "1".into(),
+            dialect: Dialect::Mysql,
+            namespaces: Vec::new(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "TableSelection",
+        &TableSelection {
+            name: "t".into(),
+            whole_table: true,
+            columns: Vec::new(),
+            primary_key: false,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        },
+    );
+    assert_ts_matches(
+        &source,
+        "SyncSelection",
+        &SyncSelection {
+            tables: Vec::new(),
+            views: Vec::new(),
+            types: Vec::new(),
+        },
+    );
 }

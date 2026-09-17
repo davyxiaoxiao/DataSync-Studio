@@ -817,3 +817,39 @@ pub async fn list_custom_types(pool: &Pool, namespace: &str) -> AppResult<Vec<Cu
     all.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(all)
 }
+
+/// Every `(child, parent)` foreign-key edge in a namespace.
+///
+/// Used before dropping tables: a table can only be dropped once the
+/// constraints pointing at it are gone, and those live on other tables.
+pub async fn list_foreign_key_edges(
+    pool: &Pool,
+    namespace: &str,
+) -> AppResult<Vec<(String, String)>> {
+    let rows = match pool {
+        Pool::MySql(_) => {
+            let sql = "SELECT TABLE_NAME, REFERENCED_TABLE_NAME \
+                       FROM information_schema.KEY_COLUMN_USAGE \
+                       WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+                       GROUP BY TABLE_NAME, REFERENCED_TABLE_NAME";
+            query(pool, sql, &[namespace], &[S, S]).await?
+        }
+        Pool::Postgres(_) => {
+            let sql = "SELECT DISTINCT cl.relname, ref.relname \
+                       FROM pg_catalog.pg_constraint con \
+                       JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
+                       JOIN pg_catalog.pg_namespace n ON n.oid = cl.relnamespace \
+                       JOIN pg_catalog.pg_class ref ON ref.oid = con.confrelid \
+                       WHERE con.contype = 'f' AND n.nspname = $1";
+            query(pool, sql, &[namespace], &[S, S]).await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let child = row.first()?.clone();
+            let parent = row.get(1)?.clone();
+            (!child.is_empty() && !parent.is_empty()).then_some((child, parent))
+        })
+        .collect())
+}

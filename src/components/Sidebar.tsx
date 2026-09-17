@@ -1,4 +1,4 @@
-import { useMemo, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useStore, dialectLabel } from "../store";
 import type { ConnectionConfig } from "../types";
 import {
@@ -15,11 +15,24 @@ import {
   IconView,
 } from "./Icons";
 
+export interface TableRef {
+  connectionId: string;
+  namespace: string;
+  table: string;
+}
+
 interface Props {
   onNewConnection: () => void;
   onEditConnection: (config: ConnectionConfig) => void;
   onDeleteConnection: (config: ConnectionConfig) => void;
+  onEditTable: (ref: TableRef) => void;
+  onRenameTable: (ref: TableRef) => void;
+  onDropTables: (refs: TableRef[]) => void;
 }
+
+const refKey = (ref: TableRef) => `${ref.connectionId}::${ref.namespace}::${ref.table}`;
+const sameScope = (ref: TableRef, other: TableRef) =>
+  ref.connectionId === other.connectionId && ref.namespace === other.namespace;
 
 interface MenuState {
   x: number;
@@ -27,7 +40,14 @@ interface MenuState {
   items: { label: string; danger?: boolean; disabled?: boolean; run: () => void }[];
 }
 
-export function Sidebar({ onNewConnection, onEditConnection, onDeleteConnection }: Props) {
+export function Sidebar({
+  onNewConnection,
+  onEditConnection,
+  onDeleteConnection,
+  onEditTable,
+  onRenameTable,
+  onDropTables,
+}: Props) {
   const {
     connections,
     sessions,
@@ -43,6 +63,10 @@ export function Sidebar({ onNewConnection, onEditConnection, onDeleteConnection 
   } = useStore();
   const [filter, setFilter] = useState("");
   const [menu, setMenu] = useState<MenuState | null>(null);
+  // Tables are selected within one connection+namespace, which is what a batch
+  // operation can act on.
+  const [selectedTables, setSelectedTables] = useState<TableRef[]>([]);
+  const lastClicked = useRef<string | null>(null);
 
   const visible = useMemo(() => {
     const keyword = filter.trim().toLowerCase();
@@ -57,6 +81,22 @@ export function Sidebar({ onNewConnection, onEditConnection, onDeleteConnection 
     });
   }, [connections, filter, sessions]);
 
+  // A rename or drop elsewhere in the app invalidates the cached table list, so
+  // every namespace that is already loaded is refreshed.
+  useEffect(() => {
+    const onRefresh = () => {
+      for (const config of connections) {
+        const session = sessions[config.id];
+        if (!session) continue;
+        for (const ns of session.namespaces) {
+          if (ns.loaded) void refreshTables(config.id, ns.name);
+        }
+      }
+    };
+    window.addEventListener("datasync:refresh-tables", onRefresh);
+    return () => window.removeEventListener("datasync:refresh-tables", onRefresh);
+  }, [connections, sessions, refreshTables]);
+
   const openMenu = (
     event: MouseEvent,
     items: MenuState["items"],
@@ -64,6 +104,95 @@ export function Sidebar({ onNewConnection, onEditConnection, onDeleteConnection 
     event.preventDefault();
     event.stopPropagation();
     setMenu({ x: event.clientX, y: event.clientY, items });
+  };
+
+  /** Visible tables of a namespace, in tree order — the basis for range select. */
+  const visibleTablesOf = (connectionId: string, namespace: string): TableRef[] => {
+    const session = sessions[connectionId];
+    const node = session?.namespaces.find((ns) => ns.name === namespace);
+    if (!node) return [];
+    const keyword = filter.trim().toLowerCase();
+    return node.tables
+      .filter((table) => !keyword || table.name.toLowerCase().includes(keyword))
+      .filter((table) => !table.tableType.toUpperCase().includes("VIEW"))
+      .map((table) => ({ connectionId, namespace, table: table.name }));
+  };
+
+  const handleTableClick = (ref: TableRef, event: MouseEvent) => {
+    const key = refKey(ref);
+    if (event.metaKey || event.ctrlKey) {
+      setSelectedTables((prev) => {
+        const scope = prev.filter((entry) => sameScope(entry, ref));
+        return scope.some((entry) => refKey(entry) === key)
+          ? scope.filter((entry) => refKey(entry) !== key)
+          : [...scope, ref];
+      });
+    } else if (event.shiftKey && lastClicked.current) {
+      const ordered = visibleTablesOf(ref.connectionId, ref.namespace);
+      const from = ordered.findIndex((entry) => refKey(entry) === lastClicked.current);
+      const to = ordered.findIndex((entry) => refKey(entry) === key);
+      if (from >= 0 && to >= 0) {
+        const [start, end] = from <= to ? [from, to] : [to, from];
+        setSelectedTables(ordered.slice(start, end + 1));
+        return;
+      }
+      setSelectedTables([ref]);
+    } else {
+      setSelectedTables([ref]);
+      // Preserve the long-standing behaviour: a plain click also opens the data.
+      openTab({
+        kind: "table",
+        title: ref.table,
+        connectionId: ref.connectionId,
+        namespace: ref.namespace,
+        table: ref.table,
+      });
+    }
+    lastClicked.current = key;
+  };
+
+  /** The tables a context-menu action applies to. */
+  const actionTargets = (ref: TableRef): TableRef[] => {
+    const key = refKey(ref);
+    const inSelection = selectedTables.some((entry) => refKey(entry) === key);
+    return inSelection && selectedTables.length > 1 ? selectedTables : [ref];
+  };
+
+  const tableMenu = (ref: TableRef) => {
+    const targets = actionTargets(ref);
+    const many = targets.length > 1;
+    return [
+      {
+        label: "浏览数据",
+        run: () =>
+          openTab({
+            kind: "table",
+            title: ref.table,
+            connectionId: ref.connectionId,
+            namespace: ref.namespace,
+            table: ref.table,
+          }),
+      },
+      { label: "编辑字段…", disabled: many, run: () => onEditTable(ref) },
+      { label: "重命名…", disabled: many, run: () => onRenameTable(ref) },
+      {
+        label: many ? `删除选中的 ${targets.length} 张表` : "删除表",
+        danger: true,
+        run: () => onDropTables(targets),
+      },
+      {
+        label: "作为数据同步源…",
+        disabled: many,
+        run: () =>
+          openTab({
+            kind: "data",
+            title: "数据同步",
+            connectionId: ref.connectionId,
+            namespace: ref.namespace,
+            table: ref.table,
+          }),
+      },
+    ];
   };
 
   const connectionMenu = (config: ConnectionConfig) => {
@@ -255,47 +384,57 @@ export function Sidebar({ onNewConnection, onEditConnection, onDeleteConnection 
                             return (
                               <div
                                 key={table.name}
-                                className="tnode"
+                                className={`tnode ${
+                                  !isView &&
+                                  selectedTables.some(
+                                    (entry) =>
+                                      entry.connectionId === config.id &&
+                                      entry.namespace === ns.name &&
+                                      entry.table === table.name,
+                                  )
+                                    ? "selected"
+                                    : ""
+                                }`}
                                 style={{ paddingLeft: 42 }}
-                                title={table.comment ?? table.name}
-                                onClick={() => {
+                                title={
+                                  isView
+                                    ? (table.comment ?? table.name)
+                                    : `${table.comment ?? table.name}\n单击=浏览数据，⌘/Ctrl+单击=多选，Shift+单击=范围选择，右键=更多操作`
+                                }
+                                onClick={(event) => {
                                   if (isView) {
-                                    log("warn", "视图暂不支持数据浏览");
+                                    log(
+                                      "info",
+                                      `视图 ${ns.name}.${table.name} 暂不支持数据浏览`,
+                                    );
                                     return;
                                   }
-                                  openTab({
-                                    kind: "table",
-                                    title: table.name,
-                                    connectionId: config.id,
-                                    namespace: ns.name,
-                                    table: table.name,
-                                  });
+                                  handleTableClick(
+                                    {
+                                      connectionId: config.id,
+                                      namespace: ns.name,
+                                      table: table.name,
+                                    },
+                                    event,
+                                  );
                                 }}
                                 onContextMenu={(event) =>
-                                  openMenu(event, [
-                                    {
-                                      label: "浏览数据",
-                                      run: () =>
-                                        openTab({
-                                          kind: "table",
-                                          title: table.name,
+                                  isView
+                                    ? openMenu(event, [
+                                        {
+                                          label: "视图暂不支持编辑",
+                                          disabled: true,
+                                          run: () => undefined,
+                                        },
+                                      ])
+                                    : openMenu(
+                                        event,
+                                        tableMenu({
                                           connectionId: config.id,
                                           namespace: ns.name,
                                           table: table.name,
                                         }),
-                                    },
-                                    {
-                                      label: "作为数据同步源…",
-                                      run: () =>
-                                        openTab({
-                                          kind: "data",
-                                          title: "数据同步",
-                                          connectionId: config.id,
-                                          namespace: ns.name,
-                                          table: table.name,
-                                        }),
-                                    },
-                                  ])
+                                      )
                                 }
                               >
                                 <span className="twisty leaf" />
@@ -322,7 +461,13 @@ export function Sidebar({ onNewConnection, onEditConnection, onDeleteConnection 
       </div>
 
       <div className="statusbar" style={{ borderTop: "1px solid var(--border)" }}>
-        <span>{connections.length} 个连接</span>
+        {selectedTables.length > 1 ? (
+          <span className="badge accent" title="右键可批量删除">
+            已选中 {selectedTables.length} 张表
+          </span>
+        ) : (
+          <span>{connections.length} 个连接</span>
+        )}
         <div className="spacer" />
         <button
           className="icon-btn"

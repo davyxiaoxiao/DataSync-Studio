@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    apply_data_plan, compare_data_core, compare_schema_core, preview_table_data_core,
+    apply_data_plan, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
+    preview_table_data_core, ColumnRename,
 };
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
@@ -1792,6 +1793,231 @@ async fn live_mysql_reports_that_ddl_cannot_be_rolled_back() {
     // MySQL commits every DDL statement implicitly, so the tool must say so
     // rather than implying a rollback it cannot perform.
     assert!(!pool.supports_transactional_ddl());
+}
+
+/// Table level operations: edit columns, rename a table, drop a table that is
+/// still referenced. These are the actions offered by the tree context menu.
+async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
+    drop_namespace(pool, dialect, ns).await;
+    create_namespace(pool, dialect, ns).await;
+
+    let q = |name: &str| dialect.qualified(Some(ns), name);
+    let c = |name: &str| dialect.quote(name);
+    let engine = match dialect {
+        Dialect::Mysql => " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        Dialect::Postgres => "",
+    };
+    let int = match dialect {
+        Dialect::Mysql => "INT",
+        Dialect::Postgres => "integer",
+    };
+    let text = match dialect {
+        Dialect::Mysql => "VARCHAR(32)",
+        Dialect::Postgres => "character varying(32)",
+    };
+
+    exec_all(
+        pool,
+        &[
+            format!(
+                "CREATE TABLE {} ({id} {int} NOT NULL, {name} {text}, PRIMARY KEY ({id})){engine}",
+                q("parent"),
+                id = c("id"),
+                name = c("name")
+            ),
+            format!(
+                "CREATE TABLE {} ({id} {int} NOT NULL, {pid} {int}, {note} {text}, PRIMARY KEY ({id})){engine}",
+                q("child"),
+                id = c("id"),
+                pid = c("parent_id"),
+                note = c("note")
+            ),
+            format!(
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({pid}) REFERENCES {} ({id})",
+                q("child"),
+                c("fk_child_parent"),
+                q("parent"),
+                pid = c("parent_id"),
+                id = c("id")
+            ),
+            format!("INSERT INTO {} VALUES (1, 'p1')", q("parent")),
+            format!(
+                "INSERT INTO {} VALUES (10, 1, 'keep-me'), (11, 1, 'keep-me-too')",
+                q("child")
+            ),
+        ],
+    )
+    .await;
+
+    // ---- 1. edit columns: add one, rename another --------------------------
+    let current = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("load child");
+    let mut desired: Vec<crate::schema::model::ColumnInfo> = current
+        .columns
+        .iter()
+        .map(|column| {
+            let mut copy = column.clone();
+            if copy.name == "note" {
+                copy.name = "remark".into();
+            }
+            copy
+        })
+        .collect();
+    let mut extra = crate::schema::model::ColumnInfo {
+        name: "extra".into(),
+        ordinal: desired.len() as i64 + 1,
+        data_type: "VARCHAR".into(),
+        full_type: text.into(),
+        nullable: true,
+        default: None,
+        is_auto_increment: false,
+        auto_kind: None,
+        is_generated: false,
+        generation_expression: None,
+        generation_kind: None,
+        is_unsigned: false,
+        comment: None,
+        charset: None,
+        collation: None,
+        udt_name: None,
+    };
+    desired.push(extra.clone());
+    extra.name = "extra".into();
+
+    let (statements, _) = plan_alter_table(
+        pool,
+        ns,
+        "child",
+        &desired,
+        &[ColumnRename {
+            from: "note".into(),
+            to: "remark".into(),
+        }],
+    )
+    .await
+    .expect("plan alter");
+
+    let rename_count = statements
+        .iter()
+        .filter(|s| s.category == "rename_column")
+        .count();
+    assert_eq!(rename_count, 1, "{tag}: 改名应产生一条重命名语句");
+    assert!(
+        !statements.iter().any(|s| s.category == "create_table"
+            || s.category == "drop_table"),
+        "{tag}: 字段编辑器绝不能创建或删除表"
+    );
+    // A rename must not be expressed as drop + add.
+    let dropped: Vec<&str> = statements
+        .iter()
+        .filter(|s| s.category == "drop_column")
+        .map(|s| s.object.as_str())
+        .collect();
+    assert!(dropped.is_empty(), "{tag}: 改名不应表现为删除字段: {dropped:?}");
+
+    run_plan(pool, statements.into_iter().map(|s| s.sql).collect()).await;
+
+    let after = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload child");
+    let names: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"remark"), "{tag}: 应有重命名后的列: {names:?}");
+    assert!(names.contains(&"extra"), "{tag}: 应有新增列: {names:?}");
+    assert!(!names.contains(&"note"), "{tag}: 旧列名应消失: {names:?}");
+
+    // The decisive check: renaming kept the data.
+    let kept = scalar_text(pool, ns, "child", "remark", dialect).await;
+    assert_eq!(kept, "keep-me", "{tag}: 重命名必须保留数据");
+
+    // ---- 2. rename the table ----------------------------------------------
+    let sql = vec![crate::schema::ddl::rename_table_ddl(
+        "child",
+        "child_renamed",
+        dialect,
+        Some(ns),
+    )];
+    let run = pool
+        .run_ddl(&sql, true, &ProgressReporter::inert())
+        .await
+        .expect("rename table");
+    assert_eq!(run.outcomes.iter().filter(|o| !o.ok).count(), 0);
+    let tables: Vec<String> = crate::schema::introspect::list_tables(pool, ns)
+        .await
+        .expect("list tables")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(tables.contains(&"child_renamed".to_string()), "{tables:?}");
+    assert!(!tables.contains(&"child".to_string()), "{tables:?}");
+    let kept = scalar_text(pool, ns, "child_renamed", "remark", dialect).await;
+    assert_eq!(kept, "keep-me", "{tag}: 重命名表必须保留数据");
+
+    // ---- 3. drop a table that is still referenced -------------------------
+    let (statements, dependent_views, _) = plan_drop_scope(
+        pool,
+        ns,
+        &["parent".to_string()],
+    )
+    .await
+    .expect("plan drop");
+    assert!(dependent_views.is_empty(), "{dependent_views:?}");
+    let fk_drops = statements
+        .iter()
+        .filter(|s| s.category == "drop_foreign_key")
+        .count();
+    assert_eq!(
+        fk_drops, 1,
+        "{tag}: 删表前必须解除 child_renamed 上的外键: {:?}",
+        statements.iter().map(|s| (&s.category, &s.sql)).collect::<Vec<_>>()
+    );
+    run_plan(pool, statements.into_iter().map(|s| s.sql).collect()).await;
+
+    let tables: Vec<String> = crate::schema::introspect::list_tables(pool, ns)
+        .await
+        .expect("list tables")
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert!(!tables.contains(&"parent".to_string()), "{tag}: parent 应已删除");
+    assert!(
+        tables.contains(&"child_renamed".to_string()),
+        "{tag}: 未被选中的表必须保留: {tables:?}"
+    );
+    // Its data survived the foreign key being dropped.
+    assert_eq!(
+        crate::schema::introspect::load_table(pool, ns, "child_renamed")
+            .await
+            .expect("reload")
+            .foreign_keys
+            .len(),
+        0,
+        "{tag}: 外键应已被解除"
+    );
+    let rows = scalar_count(pool, ns, "child_renamed", dialect).await;
+    assert_eq!(rows, 2, "{tag}: 删除父表不应影响子表数据");
+
+    drop_namespace(pool, dialect, ns).await;
+}
+
+#[tokio::test]
+async fn live_mysql_table_operations() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    table_ops_scenario(&pool, Dialect::Mysql, "datasync_live_ops", "mysql 表操作").await;
+}
+
+#[tokio::test]
+async fn live_postgres_table_operations() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    table_ops_scenario(&pool, Dialect::Postgres, "datasync_live_ops", "pg 表操作").await;
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must

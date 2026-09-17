@@ -19,10 +19,13 @@ use crate::db::{open_pool, DdlRun, Pool, StatementOutcome};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::jobs::ProgressReporter;
-use crate::schema::ddl::{generate, DdlStatement, SyncSelection};
+use crate::schema::ddl::{
+    generate, normalize_designed_columns, plan_drop_tables, rename_column_ddl,
+    rename_table_ddl, DdlStatement, SyncSelection,
+};
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
-use crate::schema::model::{NamespaceInfo, TableStructure, TableSummary};
+use crate::schema::model::{ColumnInfo, NamespaceInfo, TableStructure, TableSummary};
 use crate::state::{AppState, SchemaCompare};
 use crate::store::ConnectionConfig;
 
@@ -1244,6 +1247,349 @@ pub async fn apply_data_sync(
 }
 
 // ---------------------------------------------------------------------------
+// Table level operations
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropTablesRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub tables: Vec<String>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropTablesPreview {
+    pub statements: Vec<DdlStatement>,
+    /// Views that read from the tables being dropped. They are *not* removed
+    /// automatically — the server would either refuse the drop or, with
+    /// CASCADE, quietly discard them — so they are surfaced for the user.
+    pub dependent_views: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Build the drop plan for a set of tables.
+///
+/// Only the tables being dropped and the tables referencing them are loaded,
+/// which keeps this cheap on a large schema while still letting the planner
+/// release inbound foreign keys.
+pub(crate) async fn plan_drop_scope(
+    pool: &Pool,
+    namespace: &str,
+    tables: &[String],
+) -> AppResult<(Vec<DdlStatement>, Vec<String>, Vec<String>)> {
+    let dialect = pool.dialect();
+    let edges = introspect::list_foreign_key_edges(pool, namespace).await?;
+    let referencing: Vec<String> = edges
+        .iter()
+        .filter(|(_, parent)| tables.iter().any(|name| name == parent))
+        .map(|(child, _)| child.clone())
+        .filter(|child| !tables.iter().any(|name| name == child))
+        .collect();
+
+    let views = introspect::list_views(pool, namespace).await?;
+    let dependent_views: Vec<String> = views
+        .iter()
+        .filter(|view| {
+            view.dependencies
+                .iter()
+                .any(|dependency| tables.iter().any(|name| name == dependency))
+        })
+        .map(|view| view.name.clone())
+        .collect();
+
+    let mut structures = Vec::new();
+    for name in tables.iter().chain(referencing.iter()) {
+        structures.push(introspect::load_table(pool, namespace, name).await?);
+    }
+
+    let mut warnings = Vec::new();
+    if !dependent_views.is_empty() {
+        warnings.push(format!(
+            "以下视图依赖这些表，删除会失败或被级联删除，请先处理：{}",
+            dependent_views.join(", ")
+        ));
+    }
+    let statements = plan_drop_tables(
+        &structures,
+        tables,
+        dialect,
+        Some(namespace),
+        &mut warnings,
+    );
+    Ok((statements, dependent_views, warnings))
+}
+
+#[tauri::command]
+pub async fn preview_drop_tables(
+    state: State<'_, AppState>,
+    connection_id: String,
+    namespace: String,
+    tables: Vec<String>,
+) -> AppResult<DropTablesPreview> {
+    if tables.is_empty() {
+        return Err(AppError::msg("请先选择要删除的表"));
+    }
+    let pool = pool_for(&state, &connection_id).await?;
+    let (statements, dependent_views, warnings) =
+        plan_drop_scope(&pool, &namespace, &tables).await?;
+    Ok(DropTablesPreview {
+        statements,
+        dependent_views,
+        warnings,
+    })
+}
+
+#[tauri::command]
+pub async fn apply_drop_tables(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: DropTablesRequest,
+) -> AppResult<SyncRunResult> {
+    if request.tables.is_empty() {
+        return Err(AppError::msg("请先选择要删除的表"));
+    }
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let (statements, _, warnings) =
+        plan_drop_scope(&pool, &request.namespace, &request.tables).await?;
+    let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
+    let started = Instant::now();
+    let run = pool.run_ddl(&sql, true, &reporter).await;
+    end_job(&state, job);
+    reporter.finish("done", "删除完成", "删除结束");
+    Ok(summarize_ddl(
+        run?,
+        started.elapsed().as_millis() as u64,
+        warnings,
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameTableRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub new_name: String,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn rename_table(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: RenameTableRequest,
+) -> AppResult<SyncRunResult> {
+    let new_name = request.new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(AppError::msg("新表名不能为空"));
+    }
+    if new_name == request.table {
+        return Err(AppError::msg("新表名与原表名相同"));
+    }
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    // Fail clearly rather than letting the server produce a duplicate-object
+    // error that reads like a tool bug.
+    let existing = introspect::list_tables(&pool, &request.namespace).await?;
+    if existing
+        .iter()
+        .any(|table| table.name.eq_ignore_ascii_case(&new_name))
+    {
+        end_job(&state, job);
+        return Err(AppError::msg(format!("表 {new_name} 已存在")));
+    }
+    let sql = vec![rename_table_ddl(
+        &request.table,
+        &new_name,
+        pool.dialect(),
+        Some(&request.namespace),
+    )];
+    let started = Instant::now();
+    let run = pool.run_ddl(&sql, true, &reporter).await;
+    end_job(&state, job);
+    reporter.finish("done", "重命名完成", "重命名结束");
+    Ok(summarize_ddl(run?, started.elapsed().as_millis() as u64, Vec::new()))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlterTableRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub table: String,
+    /// The complete desired column list, in the desired order.
+    pub columns: Vec<ColumnInfo>,
+    /// Columns whose name was edited. Sent explicitly so a rename becomes
+    /// `RENAME COLUMN` instead of a drop followed by an add, which would throw
+    /// the data away.
+    #[serde(default)]
+    pub renames: Vec<ColumnRename>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnRename {
+    pub from: String,
+    pub to: String,
+}
+
+/// Compare the desired columns against the live table and produce the column
+/// changes only.
+///
+/// The table editor can never create or drop a table: whatever the comparison
+/// concludes, only column-level statements are kept.
+pub(crate) async fn plan_alter_table(
+    pool: &Pool,
+    namespace: &str,
+    table: &str,
+    columns: &[ColumnInfo],
+    renames: &[ColumnRename],
+) -> AppResult<(Vec<DdlStatement>, Vec<String>)> {
+    let target = pool.dialect();
+    let current = introspect::load_table(pool, namespace, table).await?;
+    let desired_columns = normalize_designed_columns(target, columns)?;
+    if desired_columns.is_empty() {
+        return Err(AppError::msg("表至少需要一个字段"));
+    }
+
+    let mut desired = current.clone();
+    desired.columns = desired_columns;
+
+    // Renames are applied to the *current* view first, so the comparison does
+    // not mistake them for a drop plus an add.
+    let mut rename_statements: Vec<DdlStatement> = Vec::new();
+    let mut current_for_diff = current.clone();
+    for rename in renames {
+        let from = rename.from.trim();
+        let to = rename.to.trim();
+        if from.is_empty() || to.is_empty() || from == to {
+            continue;
+        }
+        let definition = desired
+            .column(to)
+            .or_else(|| current.column(from))
+            .cloned()
+            .ok_or_else(|| AppError::msg(format!("找不到要重命名的字段 {from}")))?;
+        if current.column(from).is_none() {
+            continue;
+        }
+        for column in &mut current_for_diff.columns {
+            if column.name == from {
+                column.name = to.to_string();
+            }
+        }
+        rename_statements.push(DdlStatement {
+            table: table.to_string(),
+            category: "rename_column".into(),
+            object: to.to_string(),
+            sql: rename_column_ddl(
+                table,
+                from,
+                to,
+                &definition,
+                target,
+                Some(namespace),
+                namespace,
+            ),
+        });
+    }
+
+    // Comments are editable here, so they must take part in the comparison.
+    let options = CompareOptions {
+        ignore_comments: false,
+        ignore_case: false,
+        compare_charset: false,
+    };
+    let diff = compare_everything(
+        &[desired],
+        &[current_for_diff],
+        &[],
+        &[],
+        &[],
+        &[],
+        target,
+        target,
+        namespace,
+        namespace,
+        options,
+    );
+
+    // Only column work is allowed out of the table editor.
+    let allowed = [
+        "add_column",
+        "drop_column",
+        "modify_column",
+        "column_comment",
+        // A column being added with a placeholder default is dropped right after
+        "drop_column_default",
+    ];
+    let mut warnings = Vec::new();
+    let sources: HashMap<String, TableStructure> = HashMap::new();
+    let plan = generate(&diff, &sources, None, Some(namespace), &mut warnings);
+    let mut statements: Vec<DdlStatement> = rename_statements;
+    statements.extend(
+        plan.into_iter()
+            .filter(|statement| allowed.contains(&statement.category.as_str())),
+    );
+    Ok((statements, warnings))
+}
+
+#[tauri::command]
+pub async fn preview_alter_table(
+    state: State<'_, AppState>,
+    connection_id: String,
+    namespace: String,
+    table: String,
+    columns: Vec<ColumnInfo>,
+    renames: Option<Vec<ColumnRename>>,
+) -> AppResult<SchemaSqlPreview> {
+    let pool = pool_for(&state, &connection_id).await?;
+    let (statements, warnings) =
+        plan_alter_table(&pool, &namespace, &table, &columns, &renames.unwrap_or_default()).await?;
+    Ok(SchemaSqlPreview {
+        statements,
+        warnings,
+    })
+}
+
+#[tauri::command]
+pub async fn apply_alter_table(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: AlterTableRequest,
+) -> AppResult<SyncRunResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let outcome = plan_alter_table(
+        &pool,
+        &request.namespace,
+        &request.table,
+        &request.columns,
+        &request.renames,
+    )
+    .await;
+    let (statements, warnings) = outcome?;
+    let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
+    let started = Instant::now();
+    let run = pool.run_ddl(&sql, true, &reporter).await;
+    end_job(&state, job);
+    reporter.finish("done", "字段修改完成", "字段修改结束");
+    Ok(summarize_ddl(
+        run?,
+        started.elapsed().as_millis() as u64,
+        warnings,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
 
@@ -1411,6 +1757,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         app_storage_dir,
         clear_caches,
         cancel_job,
+        preview_drop_tables,
+        apply_drop_tables,
+        rename_table,
+        preview_alter_table,
+        apply_alter_table,
     ]
 }
 

@@ -11,7 +11,10 @@ use crate::data::{
 };
 use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
-use crate::schema::ddl::{generate, SyncSelection, TableSelection};
+use crate::schema::ddl::{
+    family_from_declared_type, generate, normalize_designed_columns, plan_drop_tables,
+    rename_column_ddl, rename_table_ddl, SyncSelection, TableSelection,
+};
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions};
 use crate::schema::model::{
     ColumnInfo, CustomType, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
@@ -1320,6 +1323,39 @@ fn user_defined_column_types_are_schema_qualified() {
     );
 }
 
+/// A one-column table, used by the drop/rename tests.
+fn plain_table(name: &str) -> TableStructure {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    table(name, vec![id], &["id"])
+}
+
+/// A two-column table carrying one foreign key.
+fn table_with_fk(name: &str, fk_name: &str, ref_table: &str) -> TableStructure {
+    let mut structure = table(
+        name,
+        vec![
+            {
+                let mut c = col("id", "INT", "integer");
+                c.nullable = false;
+                c
+            },
+            col("parent_id", "INT", "integer"),
+        ],
+        &["id"],
+    );
+    structure.foreign_keys.push(ForeignKeyInfo {
+        name: fk_name.into(),
+        columns: vec!["parent_id".into()],
+        ref_schema: None,
+        ref_table: ref_table.into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    structure
+}
+
 // ---------------------------------------------------------------------------
 // Structure sync never writes row data
 // ---------------------------------------------------------------------------
@@ -1414,5 +1450,334 @@ fn a_not_null_column_with_its_own_default_is_unremarkable() {
     assert!(
         warnings.is_empty(),
         "自带默认值就不需要提示: {warnings:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Table level operations (drop / rename / edit columns)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn declared_types_map_to_their_family() {
+    let cases = [
+        (Dialect::Mysql, "varchar(64)", "VARCHAR"),
+        (Dialect::Mysql, "INT", "INT"),
+        (Dialect::Mysql, "bigint unsigned", "BIGINT UNSIGNED"),
+        (Dialect::Mysql, "decimal(10,2)", "DECIMAL"),
+        (Dialect::Mysql, "tinyint(1)", "TINYINT"),
+        (Dialect::Postgres, "character varying(64)", "VARCHAR"),
+        (Dialect::Postgres, "integer", "INT"),
+        (Dialect::Postgres, "numeric(10,2)", "DECIMAL"),
+        (Dialect::Postgres, "timestamp without time zone", "TIMESTAMP"),
+        (Dialect::Postgres, "timestamp with time zone", "TIMESTAMPTZ"),
+        (Dialect::Postgres, "boolean", "BOOLEAN"),
+    ];
+    for (dialect, declared, expected) in cases {
+        assert_eq!(
+            family_from_declared_type(dialect, declared),
+            expected,
+            "{dialect:?} {declared}"
+        );
+    }
+}
+
+#[test]
+fn designed_columns_are_normalised_and_validated() {
+    let mut first = col("  id ", "INT", " integer ");
+    first.ordinal = 99;
+    let second = col("name", "VARCHAR", "character varying(64)");
+
+    let normalized = normalize_designed_columns(Dialect::Postgres, &[first, second]).unwrap();
+    assert_eq!(normalized[0].name, "id", "名称应去掉空白");
+    assert_eq!(normalized[0].full_type, "integer", "类型应去掉空白");
+    assert_eq!(normalized[0].ordinal, 1);
+    assert_eq!(normalized[0].data_type, "INT", "应从声明类型推导类型族");
+    assert_eq!(normalized[1].ordinal, 2);
+
+    // Missing pieces are rejected up front rather than reaching the server.
+    let mut nameless = col("", "INT", "integer");
+    nameless.name = "   ".into();
+    assert!(normalize_designed_columns(Dialect::Mysql, &[nameless]).is_err());
+    let mut typeless = col("a", "INT", "integer");
+    typeless.full_type = "  ".into();
+    assert!(normalize_designed_columns(Dialect::Mysql, &[typeless]).is_err());
+    let duplicated = vec![col("a", "INT", "integer"), col("A", "INT", "integer")];
+    assert!(
+        normalize_designed_columns(Dialect::Mysql, &duplicated).is_err(),
+        "字段名重复应被拒绝（忽略大小写）"
+    );
+
+    // Empty defaults and comments are dropped, not stored as "".
+    let mut blank = col("a", "VARCHAR", "varchar(8)");
+    blank.default = Some("   ".into());
+    blank.comment = Some(String::new());
+    let normalized = normalize_designed_columns(Dialect::Mysql, &[blank]).unwrap();
+    assert!(normalized[0].default.is_none());
+    assert!(normalized[0].comment.is_none());
+}
+
+#[test]
+fn dropping_tables_releases_the_constraints_that_point_at_them() {
+    // `keeper` stays, but carries a foreign key onto the table being dropped.
+    let mut keeper = plain_table("keeper");
+    keeper.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_keeper_leftover".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "leftover".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let all = vec![keeper, plain_table("leftover"), plain_table("other")];
+
+    let mut warnings = Vec::new();
+    let plan = plan_drop_tables(
+        &all,
+        &["leftover".to_string()],
+        Dialect::Postgres,
+        Some("app"),
+        &mut warnings,
+    );
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert_eq!(categories, vec!["drop_foreign_key", "drop_table"]);
+    assert!(
+        plan[0]
+            .sql
+            .contains("ALTER TABLE \"app\".\"keeper\" DROP CONSTRAINT \"fk_keeper_leftover\";"),
+        "{}",
+        plan[0].sql
+    );
+    assert!(plan[1].sql.contains("DROP TABLE IF EXISTS \"app\".\"leftover\";"));
+    // The editor must never create anything.
+    assert!(!plan.iter().any(|s| s.category.starts_with("create")));
+}
+
+#[test]
+fn dropping_several_tables_keeps_unselected_ones() {
+    let all = vec![
+        plain_table("a"),
+        plain_table("b"),
+        plain_table("keep_me"),
+    ];
+    let plan = plan_drop_tables(
+        &all,
+        &["a".to_string(), "b".to_string()],
+        Dialect::Mysql,
+        Some("app"),
+        &mut Vec::new(),
+    );
+    let dropped: Vec<&str> = plan
+        .iter()
+        .filter(|s| s.category == "drop_table")
+        .map(|s| s.object.as_str())
+        .collect();
+    assert_eq!(dropped, vec!["a", "b"]);
+    assert!(
+        !plan.iter().any(|s| s.sql.contains("keep_me")),
+        "未选中的表不能被牵连"
+    );
+    assert!(!plan.iter().any(|s| s.sql.contains("CREATE")));
+}
+
+#[test]
+fn rename_uses_the_right_syntax_per_engine() {
+    assert_eq!(
+        // MySQL resolves an unqualified target against the default database,
+        // which the app never sets, so both sides are qualified.
+        rename_table_ddl("old", "new", Dialect::Mysql, Some("app")),
+        "RENAME TABLE `app`.`old` TO `app`.`new`;"
+    );
+    assert_eq!(
+        rename_table_ddl("old", "new", Dialect::Postgres, Some("public")),
+        "ALTER TABLE \"public\".\"old\" RENAME TO \"new\";"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dropping tables that are still referenced (structure sync)
+// ---------------------------------------------------------------------------
+
+/// Dropping a table removes the constraints that reference it, including ones
+/// the user never selected.
+#[test]
+fn references_to_a_dropped_table_are_released() {
+    // `parent` exists only on the target; `child` exists on both sides and
+    // carries a foreign key pointing at `parent`.
+    let source = vec![table_with_fk("child", "fk_child_parent", "parent")];
+    let target = vec![
+        table_with_fk("child", "fk_child_parent", "parent"),
+        plain_table("parent"),
+    ];
+    let diff = compare_everything(
+        &source,
+        &target,
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+
+    // Select only the table drop, leaving `child`'s foreign key unchecked.
+    let selection = SyncSelection {
+        types: Vec::new(),
+        views: Vec::new(),
+        tables: vec![TableSelection {
+            name: "parent".into(),
+            whole_table: true,
+            columns: Vec::new(),
+            primary_key: false,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }],
+    };
+    let mut warnings = Vec::new();
+    let plan = generate(&diff, &HashMap::new(), Some(&selection), Some("dst"), &mut warnings);
+
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert_eq!(
+        categories,
+        vec!["drop_foreign_key", "drop_table"],
+        "必须先解除引用再删表: {categories:?}"
+    );
+    assert!(
+        plan[0]
+            .sql
+            .contains("ALTER TABLE \"dst\".\"child\" DROP CONSTRAINT \"fk_child_parent\";"),
+        "{}",
+        plan[0].sql
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("已自动加入删除列表")),
+        "{warnings:?}"
+    );
+}
+
+/// Two tables referencing each other must both be droppable.
+#[test]
+fn mutually_referencing_tables_can_both_be_dropped() {
+    let mut a = plain_table("a");
+    a.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_a_b".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "b".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let mut b = plain_table("b");
+    b.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_b_a".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "a".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let diff = compare_everything(
+        &[],
+        &[a, b],
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
+
+    let fk_drops = plan.iter().filter(|s| s.category == "drop_foreign_key").count();
+    let table_drops = plan.iter().filter(|s| s.category == "drop_table").count();
+    assert_eq!(fk_drops, 2, "两个方向的外键都要解除");
+    assert_eq!(table_drops, 2);
+    let last_fk = plan
+        .iter()
+        .rposition(|s| s.category == "drop_foreign_key")
+        .expect("有外键删除");
+    let first_table = plan
+        .iter()
+        .position(|s| s.category == "drop_table")
+        .expect("有表删除");
+    assert!(last_fk < first_table, "外键删除必须全部先于表删除");
+}
+
+#[test]
+fn a_self_reference_disappears_with_its_own_table() {
+    let mut a = plain_table("a");
+    a.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_a_self".into(),
+        columns: vec!["id".into()],
+        ref_schema: None,
+        ref_table: "a".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    let diff = compare_everything(
+        &[],
+        &[a],
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
+    let drops = plan
+        .iter()
+        .filter(|s| s.category == "drop_foreign_key")
+        .count();
+    assert_eq!(
+        drops,
+        1,
+        "自引用只应解除一次: {:?}",
+        plan.iter().map(|s| &s.sql).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn column_rename_uses_a_data_preserving_statement() {
+    let column = col("remark", "VARCHAR", "character varying(32)");
+    // PostgreSQL has a dedicated rename.
+    assert_eq!(
+        rename_column_ddl(
+            "child",
+            "note",
+            "remark",
+            &column,
+            Dialect::Postgres,
+            Some("public"),
+            "public",
+        ),
+        "ALTER TABLE \"public\".\"child\" RENAME COLUMN \"note\" TO \"remark\";"
+    );
+    // MySQL's RENAME COLUMN only exists from 8.0, so CHANGE is used instead; it
+    // carries the full definition and keeps the values.
+    let mysql_column = col("remark", "VARCHAR", "varchar(32)");
+    assert_eq!(
+        rename_column_ddl(
+            "child",
+            "note",
+            "remark",
+            &mysql_column,
+            Dialect::Mysql,
+            Some("app"),
+            "app",
+        ),
+        "ALTER TABLE `app`.`child` CHANGE `note` `remark` varchar(32);"
     );
 }

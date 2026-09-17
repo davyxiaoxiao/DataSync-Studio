@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
+use crate::error::{AppError, AppResult};
 use crate::schema::diff::{ChangeKind, SchemaDiff, TableDiff, TypeDiff};
 use crate::schema::model::{
     ColumnInfo, CustomType, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
@@ -1572,4 +1573,181 @@ fn diff_has_comment_change(table: &TableDiff) -> bool {
     let source = table.source_comment.as_deref().unwrap_or("");
     let target = table.target_comment.as_deref().unwrap_or("");
     source != target
+}
+
+// ---------------------------------------------------------------------------
+// Ad-hoc table operations (drop / rename / edit columns)
+// ---------------------------------------------------------------------------
+
+/// Derive the type family from a declared type, so that incoming column
+/// definitions from the UI behave exactly like introspected ones (the family
+/// drives default rendering and value decoding).
+pub fn family_from_declared_type(dialect: Dialect, declared: &str) -> String {
+    let lower = declared.trim().to_lowercase();
+    // PostgreSQL spells several types with spaces, so they are collapsed before
+    // the leading word is taken. Order matters: the longer forms come first.
+    let collapsed = lower
+        .replace("character varying", "varchar")
+        .replace("timestamp with time zone", "timestamptz")
+        .replace("timestamp without time zone", "timestamp")
+        .replace("time with time zone", "timetz")
+        .replace("time without time zone", "time")
+        .replace("double precision", "double")
+        .replace("bit varying", "varbit")
+        .replace("character", "char");
+    let head = collapsed.split(['(', ' ']).next().unwrap_or("").to_string();
+
+    let family = match head.as_str() {
+        "varchar" => "VARCHAR",
+        "char" => "CHAR",
+        "int" | "int4" | "integer" | "mediumint" => "INT",
+        "int2" | "smallint" => "SMALLINT",
+        "int8" | "bigint" => "BIGINT",
+        "bool" => "BOOLEAN",
+        "numeric" | "decimal" | "dec" | "fixed" => "DECIMAL",
+        "float4" | "real" => "FLOAT",
+        "float8" | "double" => "DOUBLE",
+        other => return other.to_ascii_uppercase(),
+    };
+    // MySQL carries signedness as a modifier on the declared type.
+    if dialect == Dialect::Mysql && lower.contains("unsigned") && family != "BOOLEAN" {
+        return format!("{family} UNSIGNED");
+    }
+    family.to_string()
+}
+
+/// Normalise columns submitted by the table designer: position, trimmed text
+/// and a derived type family. The declared type is what the DDL uses.
+pub fn normalize_designed_columns(
+    dialect: Dialect,
+    columns: &[ColumnInfo],
+) -> AppResult<Vec<ColumnInfo>> {
+    let mut out = Vec::with_capacity(columns.len());
+    for (index, column) in columns.iter().enumerate() {
+        let name = column.name.trim().to_string();
+        if name.is_empty() {
+            return Err(AppError::msg(format!(
+                "第 {} 个字段缺少名称",
+                index + 1
+            )));
+        }
+        if out.iter().any(|c: &ColumnInfo| c.name.eq_ignore_ascii_case(&name)) {
+            return Err(AppError::msg(format!("字段名 {name} 重复")));
+        }
+        let full_type = column.full_type.trim().to_string();
+        if full_type.is_empty() {
+            return Err(AppError::msg(format!("字段 {name} 缺少类型")));
+        }
+        let mut normalized = column.clone();
+        normalized.name = name;
+        normalized.data_type = family_from_declared_type(dialect, &full_type);
+        normalized.full_type = full_type;
+        normalized.ordinal = index as i64 + 1;
+        normalized.default = normalized
+            .default
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        normalized.comment = normalized
+            .comment
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        out.push(normalized);
+    }
+    Ok(out)
+}
+
+/// DDL for dropping tables, in an order that releases every reference first.
+///
+/// A synthetic comparison is used so the ordinary planner does the work: the
+/// tables to keep form the "source" (and therefore look identical), the tables
+/// to drop are absent from it (and therefore look like removals). That way the
+/// same foreign-key handling as a full structure sync applies — including
+/// constraints living on tables the user did not touch.
+pub fn plan_drop_tables(
+    all: &[TableStructure],
+    to_drop: &[String],
+    target: Dialect,
+    schema: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Vec<DdlStatement> {
+    let kept: Vec<TableStructure> = all
+        .iter()
+        .filter(|table| !to_drop.iter().any(|name| name == &table.name))
+        .cloned()
+        .collect();
+    let diff = crate::schema::diff::compare_everything(
+        &kept,
+        all,
+        &[],
+        &[],
+        &[],
+        &[],
+        target,
+        target,
+        schema.unwrap_or(""),
+        schema.unwrap_or(""),
+        crate::schema::diff::CompareOptions::default(),
+    );
+    let selection = SyncSelection {
+        tables: to_drop
+            .iter()
+            .map(|name| TableSelection {
+                name: name.clone(),
+                whole_table: true,
+                ..TableSelection::default()
+            })
+            .collect(),
+        views: Vec::new(),
+        types: Vec::new(),
+    };
+    let sources: HashMap<String, TableStructure> = HashMap::new();
+    generate(&diff, &sources, Some(&selection), schema, warnings)
+}
+
+/// DDL for renaming a column, preserving its data.
+///
+/// MySQL's `RENAME COLUMN` only exists from 8.0, so `CHANGE` is used there —
+/// it is accepted by every supported version and keeps the values.
+pub fn rename_column_ddl(
+    table: &str,
+    from: &str,
+    to: &str,
+    definition: &ColumnInfo,
+    target: Dialect,
+    schema: Option<&str>,
+    source_schema: &str,
+) -> String {
+    let tref = target.qualified(schema, table);
+    match target {
+        Dialect::Mysql => {
+            let rendered = column_definition(definition, target, schema, source_schema);
+            format!(
+                "ALTER TABLE {tref} CHANGE {} {};",
+                target.quote(from),
+                rendered.sql
+            )
+        }
+        Dialect::Postgres => format!(
+            "ALTER TABLE {tref} RENAME COLUMN {} TO {};",
+            target.quote(from),
+            target.quote(to)
+        ),
+    }
+}
+
+/// DDL for renaming a table.
+pub fn rename_table_ddl(table: &str, new_name: &str, target: Dialect, schema: Option<&str>) -> String {
+    let from = target.qualified(schema, table);
+    match target {
+        // MySQL takes a table reference on both sides; an unqualified target
+        // would be resolved against the session's default database, which the
+        // app does not set.
+        Dialect::Mysql => format!(
+            "RENAME TABLE {from} TO {};",
+            target.qualified(schema, new_name)
+        ),
+        // PostgreSQL renames within the same schema and rejects a qualified
+        // new name.
+        Dialect::Postgres => format!("ALTER TABLE {from} RENAME TO {};", target.quote(new_name)),
+    }
 }
