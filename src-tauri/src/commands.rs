@@ -18,6 +18,7 @@ use crate::db::value::{ColumnMeta, Value};
 use crate::db::{open_pool, Pool, StatementOutcome};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
+use crate::jobs::ProgressReporter;
 use crate::schema::ddl::{generate, DdlStatement, SyncSelection};
 use crate::schema::diff::{compare, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
@@ -273,6 +274,9 @@ pub struct CompareSchemaRequest {
     /// Restrict the comparison to a subset of tables.
     #[serde(default)]
     pub tables: Option<Vec<String>>,
+    /// Frontend-supplied id used for progress events and cancellation.
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,6 +285,37 @@ pub struct CompareSchemaResult {
     pub compare_id: String,
     pub diff: SchemaDiff,
     pub warnings: Vec<String>,
+}
+
+/// Create the progress reporter for a job id supplied by the frontend. An
+/// absent id yields an inert reporter, so every command also works without the
+/// progress channel.
+fn begin_job(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    job_id: Option<&str>,
+) -> (ProgressReporter, Option<String>) {
+    match job_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let flag = state.jobs.begin(id);
+            (
+                ProgressReporter::new(id.to_string(), Some(app.clone()), flag),
+                Some(id.to_string()),
+            )
+        }
+        None => (ProgressReporter::inert(), None),
+    }
+}
+
+fn end_job(state: &AppState, job: Option<String>) {
+    if let Some(id) = job {
+        state.jobs.finish(&id);
+    }
+}
+
+#[tauri::command]
+pub fn cancel_job(state: State<'_, AppState>, job_id: String) -> bool {
+    state.jobs.cancel(&job_id)
 }
 
 /// Synchronisation is supported between two databases of the *same* engine.
@@ -306,16 +341,30 @@ async fn load_structures(
     pool: &Pool,
     namespace: &str,
     only: Option<&Vec<String>>,
+    role: &str,
+    reporter: &ProgressReporter,
 ) -> AppResult<(Vec<TableStructure>, Vec<String>)> {
     let mut warnings = Vec::new();
     let tables = introspect::list_tables(pool, namespace).await?;
+    let candidates: Vec<&TableSummary> = tables
+        .iter()
+        .filter(|table| match only {
+            Some(filter) => filter.iter().any(|f| f == &table.name),
+            None => true,
+        })
+        .collect();
+    let total = candidates.len() as u64;
+    reporter.force(
+        "introspect",
+        "读取表结构",
+        0,
+        Some(total),
+        format!("{role} {namespace}：共 {total} 张表"),
+    );
+
     let mut structures = Vec::new();
-    for table in &tables {
-        if let Some(filter) = only {
-            if !filter.iter().any(|f| f == &table.name) {
-                continue;
-            }
-        }
+    for (index, table) in candidates.iter().enumerate() {
+        reporter.check_cancelled()?;
         if !introspect::is_syncable(table) {
             warnings.push(format!("已跳过视图/外部表: {}", table.name));
             continue;
@@ -324,6 +373,13 @@ async fn load_structures(
             Ok(structure) => structures.push(structure),
             Err(err) => warnings.push(format!("读取 {} 结构失败: {err}", table.name)),
         }
+        reporter.tick(
+            "introspect",
+            "读取表结构",
+            index as u64 + 1,
+            Some(total),
+            format!("{role}：{}", table.name),
+        );
     }
     Ok((structures, warnings))
 }
@@ -338,13 +394,15 @@ pub(crate) async fn compare_schema_core(
     target_namespace: &str,
     options: CompareOptions,
     tables: Option<&Vec<String>>,
+    reporter: &ProgressReporter,
 ) -> AppResult<(SchemaDiff, HashMap<String, TableStructure>, Vec<String>)> {
     ensure_same_engine(source_pool, target_pool)?;
     let (source_structures, mut warnings) =
-        load_structures(source_pool, source_namespace, tables).await?;
+        load_structures(source_pool, source_namespace, tables, "源", reporter).await?;
     let (target_structures, target_warnings) =
-        load_structures(target_pool, target_namespace, None).await?;
+        load_structures(target_pool, target_namespace, None, "目标", reporter).await?;
     warnings.extend(target_warnings);
+    reporter.check_cancelled()?;
 
     let mut diff = compare(
         &source_structures,
@@ -366,9 +424,11 @@ pub(crate) async fn compare_schema_core(
 
 #[tauri::command]
 pub async fn compare_schema(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: CompareSchemaRequest,
 ) -> AppResult<CompareSchemaResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
     let source_pool = pool_for(&state, &request.source_connection_id).await?;
     let target_pool = pool_for(&state, &request.target_connection_id).await?;
 
@@ -377,15 +437,19 @@ pub async fn compare_schema(
         ignore_case: request.ignore_case.unwrap_or(false),
         compare_charset: request.compare_charset.unwrap_or(false),
     };
-    let (diff, structure_map, warnings) = compare_schema_core(
+    let outcome = compare_schema_core(
         &source_pool,
         &request.source_namespace,
         &target_pool,
         &request.target_namespace,
         options,
         request.tables.as_ref(),
+        &reporter,
     )
-    .await?;
+    .await;
+    end_job(&state, job);
+    reporter.finish("done", "对比完成", "结构对比结束");
+    let (diff, structure_map, warnings) = outcome?;
 
     let compare_id = state.compares.put(SchemaCompare {
         diff: diff.clone(),
@@ -446,6 +510,7 @@ pub struct SyncRunResult {
     pub sample: Vec<StatementOutcome>,
     /// Non-fatal notes, e.g. a generated column that had to be downgraded.
     pub warnings: Vec<String>,
+    pub cancelled: bool,
 }
 
 const SAMPLE_LIMIT: usize = 300;
@@ -455,13 +520,16 @@ fn summarize(
     elapsed_ms: u64,
     label: &str,
     warnings: Vec<String>,
+    cancelled: bool,
 ) -> SyncRunResult {
     let total = outcomes.len();
     let failed = outcomes.iter().filter(|o| !o.ok).count();
     let succeeded = total - failed;
     let failures: Vec<StatementOutcome> = outcomes.iter().filter(|o| !o.ok).cloned().collect();
     let sample: Vec<StatementOutcome> = outcomes.into_iter().take(SAMPLE_LIMIT).collect();
-    let message = if failed == 0 {
+    let message = if cancelled {
+        format!("{label}已取消：已执行 {total} 条语句")
+    } else if failed == 0 {
         format!("{label}完成：共执行 {total} 条语句")
     } else {
         format!("{label}结束：成功 {succeeded} 条，失败 {failed} 条")
@@ -475,6 +543,7 @@ fn summarize(
         failures,
         sample,
         warnings,
+        cancelled,
     }
 }
 
@@ -486,13 +555,17 @@ pub struct ApplySchemaRequest {
     pub selection: Option<SyncSelection>,
     #[serde(default)]
     pub stop_on_error: bool,
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 #[tauri::command]
 pub async fn apply_schema_sync(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: ApplySchemaRequest,
 ) -> AppResult<SyncRunResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
     let mut warnings = Vec::new();
     let (statements, target_connection, target_namespace) = state
         .compares
@@ -514,14 +587,24 @@ pub async fn apply_schema_sync(
     let _ = target_namespace;
 
     if statements.is_empty() {
-        return Ok(summarize(Vec::new(), 0, "结构同步", Vec::new()));
+        return Ok(summarize(Vec::new(), 0, "结构同步", Vec::new(), false));
     }
 
     let pool = pool_for(&state, &target_connection).await?;
     let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
     let started = Instant::now();
-    let outcomes = pool.run_script(&sql, request.stop_on_error).await;
-    Ok(summarize(outcomes, started.elapsed().as_millis() as u64, "结构同步", warnings))
+    let run = pool
+        .run_script_reporting(&sql, request.stop_on_error, &reporter)
+        .await;
+    end_job(&state, job);
+    reporter.finish("done", "结构同步完成", "结构同步结束");
+    Ok(summarize(
+        run.outcomes,
+        started.elapsed().as_millis() as u64,
+        "结构同步",
+        warnings,
+        run.cancelled,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +622,8 @@ pub struct CompareDataRequest {
     pub column_map: Vec<ColumnPair>,
     #[serde(default)]
     pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 fn auto_column_pairs(source: &TableStructure, target: &TableStructure) -> Vec<ColumnPair> {
@@ -598,8 +683,10 @@ pub(crate) async fn compare_data_core(
     requested_keys: &[ColumnPair],
     requested_map: &[ColumnPair],
     batch_size: usize,
+    reporter: &ProgressReporter,
 ) -> AppResult<(DataDiffResult, DataPlan, Vec<String>)> {
     ensure_same_engine(source_pool, target_pool)?;
+    reporter.force("compare", "对比数据", 0, None, "正在读取表结构");
     let dialect = source_pool.dialect();
 
     let mut warnings = Vec::new();
@@ -689,7 +776,25 @@ pub(crate) async fn compare_data_core(
     let mut update_preview: Vec<RowChange> = Vec::new();
     let mut delete_preview: Vec<RowChange> = Vec::new();
 
+    let mut processed: u64 = 0;
     loop {
+        processed += 1;
+        if processed % 256 == 0 {
+            reporter.check_cancelled()?;
+            reporter.tick(
+                "compare",
+                "对比数据",
+                summary.source_rows as u64 + summary.target_rows as u64 + summary.unchanged as u64,
+                None,
+                format!(
+                    "已比对 {} 行 · 新增 {} / 修改 {} / 删除 {}",
+                    summary.unchanged + summary.inserts + summary.updates + summary.deletes,
+                    summary.inserts,
+                    summary.updates,
+                    summary.deletes
+                ),
+            );
+        }
         let source_key = source_stream.peek_key().await?;
         let target_key = target_stream.peek_key().await?;
 
@@ -866,12 +971,14 @@ pub(crate) async fn compare_data_core(
 
 #[tauri::command]
 pub async fn compare_data(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: CompareDataRequest,
 ) -> AppResult<DataDiffResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
     let source_pool = pool_for(&state, &request.source.connection_id).await?;
     let target_pool = pool_for(&state, &request.target.connection_id).await?;
-    let (mut result, plan, _) = compare_data_core(
+    let outcome = compare_data_core(
         &source_pool,
         &request.source,
         &target_pool,
@@ -882,8 +989,12 @@ pub async fn compare_data(
             .batch_size
             .unwrap_or(DEFAULT_BATCH_SIZE)
             .clamp(1, 20_000),
+        &reporter,
     )
-    .await?;
+    .await;
+    end_job(&state, job);
+    reporter.finish("done", "数据对比完成", "数据对比结束");
+    let (mut result, plan, _) = outcome?;
     result.plan_id = state.plans.put(plan);
     Ok(result)
 }
@@ -893,6 +1004,8 @@ pub async fn compare_data(
 pub struct ApplyDataRequest {
     pub plan_id: String,
     pub connection_id: String,
+    #[serde(default)]
+    pub job_id: Option<String>,
     #[serde(default = "default_true")]
     pub insert: bool,
     #[serde(default = "default_true")]
@@ -909,9 +1022,11 @@ fn default_true() -> bool {
 
 #[tauri::command]
 pub async fn apply_data_sync(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: ApplyDataRequest,
 ) -> AppResult<SyncRunResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
     let statements = state
         .plans
         .with(&request.plan_id, |plan| {
@@ -920,7 +1035,7 @@ pub async fn apply_data_sync(
         .ok_or_else(|| AppError::msg("对比计划已过期，请重新对比"))?;
 
     if statements.is_empty() {
-        return Ok(summarize(Vec::new(), 0, "数据同步", Vec::new()));
+        return Ok(summarize(Vec::new(), 0, "数据同步", Vec::new(), false));
     }
 
     let pool = pool_for(&state, &request.connection_id).await?;
@@ -928,23 +1043,33 @@ pub async fn apply_data_sync(
 
     if request.use_transaction {
         // MySQL cannot roll back DDL but DML is transactional on both engines.
-        let outcomes = pool.run_in_transaction(&statements).await?;
+        let run = pool
+            .run_in_transaction_reporting(&statements, &reporter)
+            .await?;
         state.plans.remove(&request.plan_id);
+        end_job(&state, job);
+        reporter.finish("done", "数据同步完成", "数据同步结束");
         return Ok(summarize(
-            outcomes,
+            run.outcomes,
             started.elapsed().as_millis() as u64,
             "数据同步",
             Vec::new(),
+            run.cancelled,
         ));
     }
 
-    let outcomes = pool.run_script(&statements, false).await;
+    let run = pool
+        .run_script_reporting(&statements, false, &reporter)
+        .await;
     state.plans.remove(&request.plan_id);
+    end_job(&state, job);
+    reporter.finish("done", "数据同步完成", "数据同步结束");
     Ok(summarize(
-        outcomes,
+        run.outcomes,
         started.elapsed().as_millis() as u64,
         "数据同步",
         Vec::new(),
+        run.cancelled,
     ))
 }
 
@@ -961,8 +1086,17 @@ pub async fn run_query(
     let pool = pool_for(&state, &connection_id).await?;
     let statements: Vec<String> = split_statements(&sql);
     let started = Instant::now();
-    let outcomes = pool.run_script(&statements, false).await;
-    Ok(summarize(outcomes, started.elapsed().as_millis() as u64, "执行", Vec::new()))
+    let reporter = ProgressReporter::inert();
+    let run = pool
+        .run_script_reporting(&statements, false, &reporter)
+        .await;
+    Ok(summarize(
+        run.outcomes,
+        started.elapsed().as_millis() as u64,
+        "执行",
+        Vec::new(),
+        run.cancelled,
+    ))
 }
 
 /// Naive but safe-enough splitter: honours single/double quotes and comments.
@@ -1106,6 +1240,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         export_text_file,
         app_storage_dir,
         clear_caches,
+        cancel_job,
     ]
 }
 

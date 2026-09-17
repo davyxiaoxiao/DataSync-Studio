@@ -11,6 +11,7 @@ use sqlx::{Executor, Row};
 
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
+use crate::jobs::ProgressReporter;
 use crate::store::ConnectionConfig;
 use value::{decode_mysql_row, decode_pg_row, ColumnKind, Value};
 
@@ -88,16 +89,32 @@ impl Pool {
         }
     }
 
-    /// Execute a list of statements, each in its own round trip, reporting a
-    /// per-statement outcome. Statement failures never abort the remaining
-    /// work unless `stop_on_error` is set, because DDL scripts are frequently
-    /// partially valid (e.g. a column that already matches).
-    pub async fn run_script(&self, statements: &[String], stop_on_error: bool) -> Vec<StatementOutcome> {
-        let mut out = Vec::with_capacity(statements.len());
-        for sql in statements {
+    /// Execute a list of statements one round trip at a time, reporting progress
+    /// and honouring cancellation between statements.
+    ///
+    /// Statement failures never abort the remaining work unless `stop_on_error`
+    /// is set: DDL scripts are frequently partially valid (a column that already
+    /// matches, for instance).
+    pub async fn run_script_reporting(
+        &self,
+        statements: &[String],
+        stop_on_error: bool,
+        reporter: &ProgressReporter,
+    ) -> ScriptRun {
+        let total = statements.len() as u64;
+        let mut outcomes = Vec::with_capacity(statements.len());
+        reporter.force("apply", "执行语句", 0, Some(total), format!("共 {total} 条语句"));
+
+        for (index, sql) in statements.iter().enumerate() {
+            if reporter.is_cancelled() {
+                return ScriptRun {
+                    outcomes,
+                    cancelled: true,
+                };
+            }
             let started = Instant::now();
             match self.execute(sql).await {
-                Ok(affected) => out.push(StatementOutcome {
+                Ok(affected) => outcomes.push(StatementOutcome {
                     sql: sql.clone(),
                     ok: true,
                     rows_affected: affected,
@@ -105,7 +122,7 @@ impl Pool {
                     elapsed_ms: started.elapsed().as_millis() as u64,
                 }),
                 Err(err) => {
-                    out.push(StatementOutcome {
+                    outcomes.push(StatementOutcome {
                         sql: sql.clone(),
                         ok: false,
                         rows_affected: 0,
@@ -117,60 +134,87 @@ impl Pool {
                     }
                 }
             }
+            reporter.tick(
+                "apply",
+                "执行语句",
+                index as u64 + 1,
+                Some(total),
+                format!("已执行 {}/{} 条", index + 1, total),
+            );
         }
-        out
+
+        ScriptRun {
+            outcomes,
+            cancelled: false,
+        }
     }
 
-    /// Execute statements inside a single transaction. Returns an error string
-    /// when the transaction is rolled back.
-    pub async fn run_in_transaction(&self, statements: &[String]) -> AppResult<Vec<StatementOutcome>> {
+    /// Execute statements inside a single transaction, reporting progress.
+    /// Cancelling or failing rolls the whole transaction back.
+    pub async fn run_in_transaction_reporting(
+        &self,
+        statements: &[String],
+        reporter: &ProgressReporter,
+    ) -> AppResult<ScriptRun> {
+        let total = statements.len() as u64;
+        reporter.force("apply", "事务执行", 0, Some(total), format!("共 {total} 条语句"));
+        // The two transaction types are distinct, so the body is expanded per
+        // driver by a macro instead of a generic (they do not unify).
+        macro_rules! run_tx {
+            ($pool:expr) => {{
+                let mut tx = $pool.begin().await?;
+                let mut outcomes = Vec::with_capacity(statements.len());
+                for (index, sql) in statements.iter().enumerate() {
+                    if reporter.is_cancelled() {
+                        tx.rollback().await.ok();
+                        return Ok(ScriptRun {
+                            outcomes,
+                            cancelled: true,
+                        });
+                    }
+                    let started = Instant::now();
+                    match tx.execute(sql.as_str()).await {
+                        Ok(res) => outcomes.push(StatementOutcome {
+                            sql: sql.clone(),
+                            ok: true,
+                            rows_affected: res.rows_affected(),
+                            error: None,
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        }),
+                        Err(err) => {
+                            tx.rollback().await.ok();
+                            return Err(AppError::msg(format!(
+                                "执行失败并已回滚: {err}\n语句: {sql}"
+                            )));
+                        }
+                    }
+                    reporter.tick(
+                        "apply",
+                        "事务执行",
+                        index as u64 + 1,
+                        Some(total),
+                        format!("已执行 {}/{} 条", index + 1, total),
+                    );
+                }
+                tx.commit().await?;
+                Ok(ScriptRun {
+                    outcomes,
+                    cancelled: false,
+                })
+            }};
+        }
         match self {
-            Pool::MySql(pool) => {
-                let mut tx = pool.begin().await?;
-                let mut out = Vec::with_capacity(statements.len());
-                for sql in statements {
-                    let started = Instant::now();
-                    match tx.execute(sql.as_str()).await {
-                        Ok(res) => out.push(StatementOutcome {
-                            sql: sql.clone(),
-                            ok: true,
-                            rows_affected: res.rows_affected(),
-                            error: None,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        }),
-                        Err(err) => {
-                            tx.rollback().await.ok();
-                            return Err(AppError::msg(format!("执行失败并已回滚: {err}\n语句: {sql}")));
-                        }
-                    }
-                }
-                tx.commit().await?;
-                Ok(out)
-            }
-            Pool::Postgres(pool) => {
-                let mut tx = pool.begin().await?;
-                let mut out = Vec::with_capacity(statements.len());
-                for sql in statements {
-                    let started = Instant::now();
-                    match tx.execute(sql.as_str()).await {
-                        Ok(res) => out.push(StatementOutcome {
-                            sql: sql.clone(),
-                            ok: true,
-                            rows_affected: res.rows_affected(),
-                            error: None,
-                            elapsed_ms: started.elapsed().as_millis() as u64,
-                        }),
-                        Err(err) => {
-                            tx.rollback().await.ok();
-                            return Err(AppError::msg(format!("执行失败并已回滚: {err}\n语句: {sql}")));
-                        }
-                    }
-                }
-                tx.commit().await?;
-                Ok(out)
-            }
+            Pool::MySql(pool) => run_tx!(pool),
+            Pool::Postgres(pool) => run_tx!(pool),
         }
     }
+}
+
+/// Outcome of executing a statement script.
+#[derive(Debug, Clone, Default)]
+pub struct ScriptRun {
+    pub outcomes: Vec<StatementOutcome>,
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

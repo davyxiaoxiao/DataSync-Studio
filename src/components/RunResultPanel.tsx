@@ -20,6 +20,7 @@ export function RunResultPanel({ result, title }: { result: SyncRunResult; title
           {expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
         </button>
         {title}：{result.message}
+        {result.cancelled && <span className="badge missing">已取消</span>}
         <span className="badge" style={{ marginLeft: 4 }}>
           {result.elapsedMs} ms
         </span>

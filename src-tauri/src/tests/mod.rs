@@ -819,4 +819,44 @@ fn same_generation_expression_with_different_formatting_is_identical() {
     assert_eq!(diff.tables[0].kind, ChangeKind::Identical, "{:#?}", diff.tables[0]);
 }
 
+// ---------------------------------------------------------------------------
+// Job progress and cancellation
+// ---------------------------------------------------------------------------
 
+#[test]
+fn inert_reporter_never_cancels() {
+    let reporter = crate::jobs::ProgressReporter::inert();
+    assert!(!reporter.is_cancelled());
+    assert!(reporter.check_cancelled().is_ok());
+    // Emitting without an AppHandle must be a harmless no-op.
+    reporter.force("apply", "执行语句", 0, Some(3), "开始");
+    reporter.tick("apply", "执行语句", 1, Some(3), "进行中");
+    reporter.finish("done", "完成", "结束");
+}
+
+#[test]
+fn cancelling_an_unknown_job_is_reported_as_not_running() {
+    let registry = crate::jobs::JobRegistry::default();
+    assert!(!registry.cancel("nope"));
+
+    let flag = registry.begin("job-1");
+    assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(registry.cancel("job-1"));
+    assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+
+    registry.finish("job-1");
+    assert!(!registry.cancel("job-1"), "已结束的任务不应再被取消");
+}
+
+#[test]
+fn reporter_observes_the_cancellation_flag() {
+    let registry = crate::jobs::JobRegistry::default();
+    let flag = registry.begin("job-2");
+    let reporter = crate::jobs::ProgressReporter::new("job-2".into(), None, flag);
+    assert!(reporter.check_cancelled().is_ok());
+
+    registry.cancel("job-2");
+    assert!(reporter.is_cancelled());
+    let error = reporter.check_cancelled().expect_err("取消后应返回错误");
+    assert!(error.to_string().contains("已取消"), "{error}");
+}

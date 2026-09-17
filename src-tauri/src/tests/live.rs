@@ -19,6 +19,7 @@ use crate::commands::{compare_data_core, compare_schema_core};
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
 use crate::dialect::Dialect;
+use crate::jobs::ProgressReporter;
 use crate::schema::ddl::generate;
 use crate::schema::diff::{ChangeKind, CompareOptions};
 use crate::store::ConnectionConfig;
@@ -92,7 +93,10 @@ async fn exec_all(pool: &Pool, statements: &[String]) {
 
 /// Run a generated plan and fail loudly on the first error, printing the SQL.
 async fn run_plan(pool: &Pool, statements: Vec<String>) {
-    let outcomes = pool.run_script(&statements, false).await;
+    let run = pool
+        .run_script_reporting(&statements, false, &ProgressReporter::inert())
+        .await;
+    let outcomes = run.outcomes;
     let failures: Vec<String> = outcomes
         .iter()
         .filter(|o| !o.ok)
@@ -333,7 +337,7 @@ async fn roundtrip(
         target_pool,
         target_ns,
         CompareOptions::default(),
-        None,
+        None, &ProgressReporter::inert(),
     )
     .await
     .expect("compare schema");
@@ -354,7 +358,7 @@ async fn roundtrip(
         target_pool,
         target_ns,
         CompareOptions::default(),
-        None,
+        None, &ProgressReporter::inert(),
     )
     .await
     .expect("re-compare schema");
@@ -369,7 +373,7 @@ async fn roundtrip(
         target_pool,
         target_ns,
         CompareOptions::default(),
-        None,
+        None, &ProgressReporter::inert(),
     )
     .await
     .expect("compare drift");
@@ -396,7 +400,7 @@ async fn roundtrip(
         target_pool,
         target_ns,
         CompareOptions::default(),
-        None,
+        None, &ProgressReporter::inert(),
     )
     .await
     .expect("re-compare after drift");
@@ -417,7 +421,7 @@ async fn roundtrip(
         table: "users".into(),
     };
 
-    let (result, plan, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
+    let (result, plan, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100, &ProgressReporter::inert())
     .await
     .expect("compare users data");
     assert_eq!(result.summary.inserts, 3, "{tag}: users 期望 3 行待插入");
@@ -426,7 +430,7 @@ async fn roundtrip(
 
     run_plan(target_pool, plan.select(true, true, true)).await;
 
-    let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
+    let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100, &ProgressReporter::inert())
     .await
     .expect("re-compare users data");
     assert_eq!(
@@ -443,7 +447,7 @@ async fn roundtrip(
     // ---- 6. update + delete on the source, then re-sync -----------------
     exec_all(source_pool, &drift_data_ddl(source_dialect, source_ns)).await;
 
-    let (changed, plan, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
+    let (changed, plan, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100, &ProgressReporter::inert())
     .await
     .expect("compare changed users data");
     assert_eq!(changed.summary.updates, 1, "{tag}: 期望 1 行待更新");
@@ -451,7 +455,7 @@ async fn roundtrip(
 
     run_plan(target_pool, plan.select(true, true, true)).await;
 
-    let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100)
+    let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100, &ProgressReporter::inert())
     .await
     .expect("re-compare changed users data");
     assert_eq!(
@@ -472,14 +476,14 @@ async fn roundtrip(
         namespace: target_ns.into(),
         table: "orders".into(),
     };
-    let (orders, plan, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100)
+    let (orders, plan, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100, &ProgressReporter::inert())
     .await
     .expect("compare orders data");
     assert_eq!(orders.summary.inserts, 2, "{tag}: orders 期望 2 行待插入 (源已删除 1 行)");
     assert_eq!(orders.summary.deletes, 0, "{tag}: 目标为空, 不应有删除");
     run_plan(target_pool, plan.select(true, true, true)).await;
 
-    let (orders_settled, _, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100)
+    let (orders_settled, _, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100, &ProgressReporter::inert())
     .await
     .expect("re-compare orders data");
     assert_eq!(
@@ -647,7 +651,16 @@ async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str
     let batch = 150;
 
     let (result, plan, _) =
-        compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+        compare_data_core(
+            pool,
+            &source_ep,
+            pool,
+            &target_ep,
+            &[],
+            &[],
+            batch,
+            &ProgressReporter::inert(),
+        )
             .await
             .expect("compare paginated data");
     assert_eq!(
@@ -660,7 +673,16 @@ async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str
 
     run_plan(pool, plan.select(true, true, true)).await;
 
-    let (settled, _, _) = compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+    let (settled, _, _) = compare_data_core(
+        pool,
+        &source_ep,
+        pool,
+        &target_ep,
+        &[],
+        &[],
+        batch,
+        &ProgressReporter::inert(),
+    )
         .await
         .expect("re-compare paginated data");
     assert_eq!(
@@ -713,7 +735,16 @@ async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str
         .await;
     }
 
-    let (changed, plan, _) = compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+    let (changed, plan, _) = compare_data_core(
+        pool,
+        &source_ep,
+        pool,
+        &target_ep,
+        &[],
+        &[],
+        batch,
+        &ProgressReporter::inert(),
+    )
         .await
         .expect("compare changed paginated data");
     assert_eq!(changed.summary.updates, touched, "{tag}: 更新数不符");
@@ -721,7 +752,16 @@ async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str
 
     run_plan(pool, plan.select(true, true, true)).await;
 
-    let (final_pass, _, _) = compare_data_core(pool, &source_ep, pool, &target_ep, &[], &[], batch)
+    let (final_pass, _, _) = compare_data_core(
+        pool,
+        &source_ep,
+        pool,
+        &target_ep,
+        &[],
+        &[],
+        batch,
+        &ProgressReporter::inert(),
+    )
         .await
         .expect("final re-compare");
     assert_eq!(
@@ -794,6 +834,7 @@ async fn live_cross_engine_sync_is_rejected() {
         "datasync_probe_dst",
         CompareOptions::default(),
         None,
+        &ProgressReporter::inert(),
     )
     .await
     .expect_err("MySQL → PostgreSQL 的结构对比必须被拒绝");
@@ -810,7 +851,7 @@ async fn live_cross_engine_sync_is_rejected() {
         namespace: "datasync_probe_dst".into(),
         table: "t".into(),
     };
-    let data_error = compare_data_core(&mysql, &source, &pg, &target, &[], &[], 100)
+    let data_error = compare_data_core(&mysql, &source, &pg, &target, &[], &[], 100, &ProgressReporter::inert())
         .await
         .err()
         .expect("MySQL → PostgreSQL 的数据对比必须被拒绝");
@@ -824,6 +865,7 @@ async fn live_cross_engine_sync_is_rejected() {
         "datasync_live_mysql_src",
         CompareOptions::default(),
         None,
+        &ProgressReporter::inert(),
     )
     .await
     .expect("同类型对比应当被接受");

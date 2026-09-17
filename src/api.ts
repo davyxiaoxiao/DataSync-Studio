@@ -81,6 +81,7 @@ export const api = {
     ignoreCase?: boolean;
     compareCharset?: boolean;
     tables?: string[] | null;
+    jobId?: string;
   }) => invoke<CompareSchemaResult>("compare_schema", { request }),
 
   previewSchemaSql: (compareId: string, selection?: SyncSelection | null) =>
@@ -90,6 +91,7 @@ export const api = {
     compareId: string;
     selection?: SyncSelection | null;
     stopOnError?: boolean;
+    jobId?: string;
   }) => invoke<SyncRunResult>("apply_schema_sync", { request }),
 
   compareData: (request: {
@@ -99,6 +101,7 @@ export const api = {
     columnMap?: ColumnPair[];
     /** Page size for streaming comparison and rows per INSERT statement. */
     batchSize?: number;
+    jobId?: string;
   }) => invoke<DataDiffResult>("compare_data", { request }),
 
   applyDataSync: (request: {
@@ -108,6 +111,7 @@ export const api = {
     update?: boolean;
     delete?: boolean;
     useTransaction?: boolean;
+    jobId?: string;
   }) => invoke<SyncRunResult>("apply_data_sync", { request }),
 
   runQuery: (connectionId: string, sql: string) =>
@@ -119,6 +123,9 @@ export const api = {
   appStorageDir: () => invoke<StorageInfo>("app_storage_dir"),
 
   clearCaches: () => invoke<void>("clear_caches"),
+
+  /** Ask a running job to stop; returns false when it already finished. */
+  cancelJob: (jobId: string) => invoke<boolean>("cancel_job", { jobId }),
 };
 
 export interface StorageInfo {

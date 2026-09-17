@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::data::plan::PlanCache;
 use crate::db::Registry;
+use crate::jobs::JobRegistry;
 use crate::schema::diff::SchemaDiff;
 use crate::schema::model::TableStructure;
 use crate::store::Store;
@@ -55,6 +56,7 @@ pub struct AppState {
     pub registry: Registry,
     pub compares: CompareCache,
     pub plans: PlanCache,
+    pub jobs: JobRegistry,
 }
 
 impl AppState {
@@ -64,6 +66,7 @@ impl AppState {
             registry: Registry::default(),
             compares: CompareCache::default(),
             plans: PlanCache::default(),
+            jobs: JobRegistry::default(),
         }
     }
 }

@@ -1132,3 +1132,61 @@ table.grid thead th.rowno {
   overflow-y: auto;
   min-height: 0;
 }
+
+/* --------------------------------------------------------------- progress */
+
+.progress-card {
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  padding: 8px 12px;
+  margin-top: 10px;
+}
+
+.progress-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.progress-head .progress-label {
+  font-weight: 600;
+}
+
+.progress-track {
+  margin-top: 7px;
+  height: 5px;
+  border-radius: 3px;
+  background: #e2e6eb;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.18s ease-out;
+}
+
+.progress-track.indeterminate .progress-fill {
+  width: 34%;
+  position: absolute;
+  animation: progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    left: -34%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+.progress-detail {
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+}

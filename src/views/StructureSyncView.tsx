@@ -1,9 +1,11 @@
 import { useCallback, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { EndpointPicker, type EndpointValue } from "../components/EndpointPicker";
+import { JobProgress } from "../components/JobProgress";
 import { RunResultPanel } from "../components/RunResultPanel";
 import { SqlPreviewModal } from "../components/SqlPreviewModal";
 import { IconChevronDown, IconChevronRight, IconEqual } from "../components/Icons";
+import { useJobProgress } from "../jobs";
 import { useStore } from "../store";
 import type {
   ChangeKind,
@@ -43,6 +45,7 @@ function diffDetail(differences: { field: string; source?: string | null; target
 
 export function StructureSyncView() {
   const { connections, log } = useStore();
+  const job = useJobProgress();
   const [source, setSource] = useState<EndpointValue>({ connectionId: "", namespace: "" });
   const [target, setTarget] = useState<EndpointValue>({ connectionId: "", namespace: "" });
   const [ignoreComments, setIgnoreComments] = useState(true);
@@ -117,6 +120,7 @@ export function StructureSyncView() {
     setPreview(null);
     log("info", `开始对比结构：${source.namespace} → ${target.namespace} …`);
     const started = Date.now();
+    const jobId = job.begin();
     try {
       const result = await api.compareSchema({
         sourceConnectionId: source.connectionId,
@@ -126,6 +130,7 @@ export function StructureSyncView() {
         ignoreComments,
         ignoreCase,
         compareCharset: false,
+        jobId,
       });
       setComparison(result);
       setSelection(buildSelection(result, "safe"));
@@ -139,8 +144,10 @@ export function StructureSyncView() {
       const changed = result.diff.tables.filter((t) => t.kind !== "identical");
       setExpanded(Object.fromEntries(changed.slice(0, 8).map((t) => [t.name, true])));
     } catch (error) {
-      log("err", `结构对比失败: ${errorMessage(error)}`);
+      const message = errorMessage(error);
+      log(message.includes("已取消") ? "warn" : "err", `结构对比失败: ${message}`);
     } finally {
+      job.end();
       setComparing(false);
     }
   };
@@ -200,11 +207,13 @@ export function StructureSyncView() {
     setApplying(true);
     setRunResult(null);
     log("info", "开始执行结构同步…");
+    const jobId = job.begin();
     try {
       const result = await api.applySchemaSync({
         compareId: comparison.compareId,
         selection: selectionPayload,
         stopOnError,
+        jobId,
       });
       setRunResult(result);
       for (const warning of result.warnings ?? []) log("warn", warning);
@@ -219,6 +228,7 @@ export function StructureSyncView() {
     } catch (error) {
       log("err", `结构同步失败: ${errorMessage(error)}`);
     } finally {
+      job.end();
       setApplying(false);
     }
   };
@@ -377,6 +387,15 @@ export function StructureSyncView() {
                 {applying ? "执行中…" : "执行同步"}
               </button>
             </div>
+
+            {(job.active || job.update) && (
+              <JobProgress
+                update={job.update}
+                running={job.active}
+                onDismiss={job.dismiss}
+                onLog={log}
+              />
+            )}
 
             {runResult && <RunResultPanel result={runResult} title="结构同步" />}
 

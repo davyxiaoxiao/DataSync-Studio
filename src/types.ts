@@ -192,6 +192,7 @@ export interface SyncRunResult {
   sample: StatementOutcome[];
   /** Non-fatal notes, e.g. a generated column that had to be downgraded. */
   warnings: string[];
+  cancelled: boolean;
 }
 
 export interface SchemaSqlPreview {

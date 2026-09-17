@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { EndpointPicker, type EndpointValue } from "../components/EndpointPicker";
+import { JobProgress } from "../components/JobProgress";
 import { RunResultPanel } from "../components/RunResultPanel";
 import { SqlPreviewModal } from "../components/SqlPreviewModal";
 import { IconChevronRight, IconCompare } from "../components/Icons";
+import { useJobProgress } from "../jobs";
 import { useStore } from "../store";
 import type { DataDiffResult, RowChange, SyncRunResult } from "../types";
 
@@ -11,6 +13,7 @@ type ChangeTab = "insert" | "update" | "delete";
 
 export function DataSyncView({ initial }: { initial?: EndpointValue }) {
   const { connections, log } = useStore();
+  const job = useJobProgress();
   const [source, setSource] = useState<EndpointValue>(
     initial ?? { connectionId: "", namespace: "", table: "" },
   );
@@ -60,6 +63,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
     setRunResult(null);
     log("info", `开始对比数据：${source.table} → ${target.table} …`);
     const started = Date.now();
+    const jobId = job.begin();
     try {
       const outcome = await api.compareData({
         source: {
@@ -75,6 +79,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
         keyColumns: [],
         columnMap: [],
         batchSize,
+        jobId,
       });
       setResult(outcome);
       for (const warning of outcome.warnings) log("warn", warning);
@@ -86,8 +91,10 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
       );
       setChangeTab(s.inserts > 0 ? "insert" : s.updates > 0 ? "update" : "delete");
     } catch (error) {
-      log("err", `数据对比失败: ${errorMessage(error)}`);
+      const message = errorMessage(error);
+      log(message.includes("已取消") ? "warn" : "err", `数据对比失败: ${message}`);
     } finally {
+      job.end();
       setComparing(false);
     }
   };
@@ -97,6 +104,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
     setApplying(true);
     setRunResult(null);
     log("info", "开始执行数据同步…");
+    const jobId = job.begin();
     try {
       const outcome = await api.applyDataSync({
         planId: result.planId,
@@ -105,6 +113,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
         update: doUpdate,
         delete: doDelete,
         useTransaction,
+        jobId,
       });
       setRunResult(outcome);
       if (outcome.failed > 0) {
@@ -119,6 +128,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
     } catch (error) {
       log("err", `数据同步失败: ${errorMessage(error)}`);
     } finally {
+      job.end();
       setApplying(false);
     }
   };
@@ -278,6 +288,15 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
                 {applying ? "执行中…" : "执行同步"}
               </button>
             </div>
+
+            {(job.active || job.update) && (
+              <JobProgress
+                update={job.update}
+                running={job.active}
+                onDismiss={job.dismiss}
+                onLog={log}
+              />
+            )}
 
             {runResult && <RunResultPanel result={runResult} title="数据同步" />}
           </div>
