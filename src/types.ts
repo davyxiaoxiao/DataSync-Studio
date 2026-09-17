@@ -236,9 +236,15 @@ export interface SyncRunResult {
   message: string;
   failures: StatementOutcome[];
   sample: StatementOutcome[];
-  /** Non-fatal notes, e.g. a generated column that had to be downgraded. */
+  /** Non-fatal notes, e.g. a table that will fail on a non-empty target. */
   warnings: string[];
   cancelled: boolean;
+  /** A transaction was used and rolled back, so the target is unchanged. */
+  rolledBack: boolean;
+  /** Whether the engine could run the plan atomically. */
+  transactional: boolean;
+  /** Statements never attempted because execution stopped at a failure. */
+  skipped: number;
 }
 
 export interface SchemaSqlPreview {

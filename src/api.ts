@@ -90,7 +90,8 @@ export const api = {
   applySchemaSync: (request: {
     compareId: string;
     selection?: SyncSelection | null;
-    stopOnError?: boolean;
+    /** Wrap the whole DDL plan in a transaction (PostgreSQL only). */
+    useTransaction?: boolean;
     jobId?: string;
   }) => invoke<SyncRunResult>("apply_schema_sync", { request }),
 

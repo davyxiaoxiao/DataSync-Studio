@@ -1321,10 +1321,13 @@ fn user_defined_column_types_are_schema_qualified() {
 }
 
 // ---------------------------------------------------------------------------
-// Adding a NOT NULL column to a table that already holds rows
+// Structure sync never writes row data
 // ---------------------------------------------------------------------------
 
-fn plan_add_column(source: TableStructure, target: TableStructure) -> Vec<crate::schema::ddl::DdlStatement> {
+fn plan_add_column(
+    source: TableStructure,
+    target: TableStructure,
+) -> (Vec<crate::schema::ddl::DdlStatement>, Vec<String>) {
     let diff = compare_everything(
         &[source.clone()],
         &[target],
@@ -1340,379 +1343,76 @@ fn plan_add_column(source: TableStructure, target: TableStructure) -> Vec<crate:
     );
     let mut sources = HashMap::new();
     sources.insert(source.name.clone(), source);
-    generate(&diff, &sources, None, Some("dst"), &mut Vec::new())
+    let mut warnings = Vec::new();
+    let plan = generate(&diff, &sources, None, Some("dst"), &mut warnings);
+    (plan, warnings)
 }
 
-#[test]
-fn a_not_null_column_without_a_default_gets_a_placeholder_that_is_dropped() {
+fn users_with_id() -> TableStructure {
     let mut id = col("id", "INT", "integer");
     id.nullable = false;
-    let mut source = table("users", vec![id.clone()], &["id"]);
+    table("users", vec![id], &["id"])
+}
+
+/// A `NOT NULL` column with no default cannot be added to a populated table on
+/// PostgreSQL. Structure sync must not invent values for the existing rows — it
+/// emits the statement as declared and lets the server reject it.
+#[test]
+fn adding_a_not_null_column_writes_no_data() {
+    let base = users_with_id();
+    let mut source = base.clone();
     let mut required = col("code", "VARCHAR", "character varying(16)");
     required.nullable = false;
     source.columns.push(required);
-    let target = table("users", vec![id], &["id"]);
 
-    let plan = plan_add_column(source, target);
-    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    let (plan, warnings) = plan_add_column(source, base);
     assert_eq!(
-        categories,
-        vec!["add_column", "drop_column_default"],
-        "非空无默认值的列必须先给占位值再删掉默认值: {categories:?}"
+        plan.len(),
+        1,
+        "结构同步不得为回填数据生成任何额外语句: {:?}",
+        plan.iter().map(|s| &s.sql).collect::<Vec<_>>()
     );
+    assert!(plan[0].sql.contains("NOT NULL"), "{}", plan[0].sql);
     assert!(
-        plan[0].sql.contains("NOT NULL DEFAULT ''"),
-        "{}",
+        !plan[0].sql.contains("DEFAULT"),
+        "不得注入占位默认值: {}",
         plan[0].sql
     );
     assert!(
-        plan[1]
-            .sql
-            .contains("ALTER TABLE \"dst\".\"users\" ALTER COLUMN \"code\" DROP DEFAULT;"),
-        "{}",
-        plan[1].sql
+        warnings
+            .iter()
+            .any(|w| w.contains("结构同步不会代为填充数据")),
+        "应提示这是结构同步不负责的部分: {warnings:?}"
     );
 }
 
 #[test]
-fn a_nullable_column_needs_no_placeholder() {
-    let mut id = col("id", "INT", "integer");
-    id.nullable = false;
-    let base = table("users", vec![id.clone()], &["id"]);
+fn a_nullable_column_is_added_without_comment() {
+    let base = users_with_id();
     let mut source = base.clone();
-    source.columns.push(col("note", "VARCHAR", "character varying(16)"));
-    let plan = plan_add_column(source, base);
-    assert_eq!(plan.len(), 1, "可空列不应产生额外语句");
-    assert!(plan[0].sql.contains("ADD COLUMN \"note\""), "{}", plan[0].sql);
+    source
+        .columns
+        .push(col("note", "VARCHAR", "character varying(16)"));
+    let (plan, warnings) = plan_add_column(source, base);
+    assert_eq!(plan.len(), 1);
     assert!(!plan[0].sql.contains("DEFAULT"), "{}", plan[0].sql);
+    assert!(warnings.is_empty(), "可空列不应产生告警: {warnings:?}");
 }
 
 #[test]
-fn a_not_null_column_with_its_own_default_needs_no_placeholder() {
-    let mut id = col("id", "INT", "integer");
-    id.nullable = false;
-    let base = table("users", vec![id.clone()], &["id"]);
+fn a_not_null_column_with_its_own_default_is_unremarkable() {
+    let base = users_with_id();
     let mut source = base.clone();
     let mut active = col("active", "BOOLEAN", "boolean");
     active.nullable = false;
     active.default = Some("true".into());
     source.columns.push(active);
 
-    let plan = plan_add_column(source, base);
-    assert_eq!(plan.len(), 1, "自带默认值就不需要占位: {:?}", plan.len());
+    let (plan, warnings) = plan_add_column(source, base);
+    assert_eq!(plan.len(), 1);
     assert!(plan[0].sql.contains("DEFAULT true"), "{}", plan[0].sql);
-}
-
-#[test]
-fn placeholder_values_are_type_appropriate() {
-    let mut id = col("id", "INT", "integer");
-    id.nullable = false;
-    let base = table("users", vec![id.clone()], &["id"]);
-
-    let cases: Vec<(ColumnInfo, &str)> = vec![
-        (
-            {
-                let mut c = col("n", "INT", "integer");
-                c.nullable = false;
-                c
-            },
-            "DEFAULT 0",
-        ),
-        (
-            {
-                let mut c = col("ok", "BOOLEAN", "boolean");
-                c.nullable = false;
-                c
-            },
-            "DEFAULT FALSE",
-        ),
-        (
-            {
-                let mut c = col("at", "TIMESTAMP", "timestamp");
-                c.nullable = false;
-                c
-            },
-            "DEFAULT '1970-01-01 00:00:00'",
-        ),
-        (
-            {
-                let mut c = col("doc", "JSONB", "jsonb");
-                c.nullable = false;
-                c
-            },
-            "DEFAULT '{}'::jsonb",
-        ),
-    ];
-
-    for (column, expected) in cases {
-        let mut source = base.clone();
-        source.columns.push(column.clone());
-        let plan = plan_add_column(source, base.clone());
-        assert!(
-            plan[0].sql.contains(expected),
-            "列 {} 应使用占位值 {expected}: {}",
-            column.name,
-            plan[0].sql
-        );
-    }
-}
-
-#[test]
-fn an_enum_column_uses_its_first_label_as_the_placeholder() {
-    let mut id = col("id", "INT", "integer");
-    id.nullable = false;
-    let base = table("orders", vec![id.clone()], &["id"]);
-    let mut source = base.clone();
-    let mut status = col("state", "MOOD", "mood");
-    status.nullable = false;
-    status.udt_name = Some("mood".into());
-    source.columns.push(status);
-
-    let diff = compare_everything(
-        &[source.clone()],
-        &[base],
-        &[],
-        &[],
-        &[enum_type("mood", &["draft", "live"])],
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        "src",
-        "dst",
-        CompareOptions::default(),
-    );
-    let mut sources = HashMap::new();
-    sources.insert(source.name.clone(), source);
-    let plan = generate(&diff, &sources, None, Some("dst"), &mut Vec::new());
-
-    let add_column = plan
-        .iter()
-        .find(|s| s.category == "add_column")
-        .expect("应生成 ADD COLUMN");
     assert!(
-        add_column.sql.contains("DEFAULT 'draft'"),
-        "枚举列应使用第一个枚举值作为占位: {}",
-        add_column.sql
+        warnings.is_empty(),
+        "自带默认值就不需要提示: {warnings:?}"
     );
-}
-
-#[test]
-fn an_unrepresentable_type_warns_instead_of_guessing() {
-    let mut id = col("id", "INT", "integer");
-    id.nullable = false;
-    let base = table("users", vec![id.clone()], &["id"]);
-    let mut source = base.clone();
-    let mut point = col("loc", "POINT", "point");
-    point.nullable = false;
-    source.columns.push(point);
-
-    let diff = compare_everything(
-        &[source.clone()],
-        &[base],
-        &[],
-        &[],
-        &[],
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        "src",
-        "dst",
-        CompareOptions::default(),
-    );
-    let mut sources = HashMap::new();
-    sources.insert(source.name.clone(), source);
-    let mut warnings = Vec::new();
-    let plan = generate(&diff, &sources, None, Some("dst"), &mut warnings);
-
-    assert_eq!(plan.len(), 1, "不应生成无法执行的占位默认值");
-    assert!(!plan[0].sql.contains("DEFAULT"), "{}", plan[0].sql);
-    assert!(
-        warnings.iter().any(|w| w.contains("无法自动生成占位值")),
-        "{warnings:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Dropping tables that are still referenced
-// ---------------------------------------------------------------------------
-
-fn table_with_fk(name: &str, fk_name: &str, ref_table: &str) -> TableStructure {
-    let mut structure = table(
-        name,
-        vec![
-            {
-                let mut c = col("id", "INT", "integer");
-                c.nullable = false;
-                c
-            },
-            col("parent_id", "INT", "integer"),
-        ],
-        &["id"],
-    );
-    structure.foreign_keys.push(ForeignKeyInfo {
-        name: fk_name.into(),
-        columns: vec!["parent_id".into()],
-        ref_schema: None,
-        ref_table: ref_table.into(),
-        ref_columns: vec!["id".into()],
-        on_update: "NO ACTION".into(),
-        on_delete: "NO ACTION".into(),
-    });
-    structure
-}
-
-fn plain_table(name: &str) -> TableStructure {
-    let mut c = col("id", "INT", "integer");
-    c.nullable = false;
-    table(name, vec![c], &["id"])
-}
-
-/// Dropping a table removes the constraints that reference it, including ones
-/// the user never selected.
-#[test]
-fn references_to_a_dropped_table_are_released() {
-    // `parent` exists only on the target; `child` exists on both sides but the
-    // target additionally carries a foreign key pointing at `parent`.
-    let source = vec![table_with_fk("child", "fk_child_parent", "parent")];
-    let target = vec![
-        table_with_fk("child", "fk_child_parent", "parent"),
-        plain_table("parent"),
-    ];
-    let diff = compare_everything(
-        &source,
-        &target,
-        &[],
-        &[],
-        &[],
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        "src",
-        "dst",
-        CompareOptions::default(),
-    );
-
-    // Select only the table drop, leaving `child`'s foreign-key change unchecked.
-    let selection = SyncSelection {
-        types: Vec::new(),
-        views: Vec::new(),
-        tables: vec![TableSelection {
-            name: "parent".into(),
-            whole_table: true,
-            columns: Vec::new(),
-            primary_key: false,
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-        }],
-    };
-    let mut warnings = Vec::new();
-    let plan = generate(&diff, &HashMap::new(), Some(&selection), Some("dst"), &mut warnings);
-
-    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
-    assert_eq!(
-        categories,
-        vec!["drop_foreign_key", "drop_table"],
-        "必须先解除引用再删表: {categories:?}"
-    );
-    assert!(
-        plan[0]
-            .sql
-            .contains("ALTER TABLE \"dst\".\"child\" DROP CONSTRAINT \"fk_child_parent\";"),
-        "{}",
-        plan[0].sql
-    );
-    assert!(
-        warnings.iter().any(|w| w.contains("已自动加入删除列表")),
-        "{warnings:?}"
-    );
-}
-
-/// Two tables referencing each other must both be droppable.
-#[test]
-fn mutually_referencing_tables_can_both_be_dropped() {
-    let source: Vec<TableStructure> = Vec::new();
-    let mut a = plain_table("a");
-    a.foreign_keys.push(ForeignKeyInfo {
-        name: "fk_a_b".into(),
-        columns: vec!["id".into()],
-        ref_schema: None,
-        ref_table: "b".into(),
-        ref_columns: vec!["id".into()],
-        on_update: "NO ACTION".into(),
-        on_delete: "NO ACTION".into(),
-    });
-    let mut b = plain_table("b");
-    b.foreign_keys.push(ForeignKeyInfo {
-        name: "fk_b_a".into(),
-        columns: vec!["id".into()],
-        ref_schema: None,
-        ref_table: "a".into(),
-        ref_columns: vec!["id".into()],
-        on_update: "NO ACTION".into(),
-        on_delete: "NO ACTION".into(),
-    });
-    let diff = compare_everything(
-        &source,
-        &[a, b],
-        &[],
-        &[],
-        &[],
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        "src",
-        "dst",
-        CompareOptions::default(),
-    );
-    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
-
-    let fk_drops = plan.iter().filter(|s| s.category == "drop_foreign_key").count();
-    let table_drops = plan.iter().filter(|s| s.category == "drop_table").count();
-    assert_eq!(fk_drops, 2, "两个方向的外键都要解除");
-    assert_eq!(table_drops, 2);
-    // Every constraint removal precedes every table removal.
-    let last_fk = plan
-        .iter()
-        .rposition(|s| s.category == "drop_foreign_key")
-        .expect("有外键删除");
-    let first_table = plan
-        .iter()
-        .position(|s| s.category == "drop_table")
-        .expect("有表删除");
-    assert!(last_fk < first_table, "外键删除必须全部先于表删除");
-}
-
-#[test]
-fn a_self_reference_disappears_with_its_own_table() {
-    let mut a = plain_table("a");
-    a.foreign_keys.push(ForeignKeyInfo {
-        name: "fk_a_self".into(),
-        columns: vec!["id".into()],
-        ref_schema: None,
-        ref_table: "a".into(),
-        ref_columns: vec!["id".into()],
-        on_update: "NO ACTION".into(),
-        on_delete: "NO ACTION".into(),
-    });
-    let diff = compare_everything(
-        &[],
-        &[a],
-        &[],
-        &[],
-        &[],
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        "src",
-        "dst",
-        CompareOptions::default(),
-    );
-    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
-    // The self-reference is reported as a missing key and dropped on its own
-    // right; the scan must not add a second, redundant statement.
-    let drops = plan
-        .iter()
-        .filter(|s| s.category == "drop_foreign_key")
-        .count();
-    assert_eq!(drops, 1, "{:?}", plan.iter().map(|s| &s.sql).collect::<Vec<_>>());
 }

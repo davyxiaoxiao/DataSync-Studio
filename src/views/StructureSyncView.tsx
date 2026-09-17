@@ -72,7 +72,7 @@ export function StructureSyncView() {
   const [previewing, setPreviewing] = useState(false);
   const [applying, setApplying] = useState(false);
   const [runResult, setRunResult] = useState<SyncRunResult | null>(null);
-  const [stopOnError, setStopOnError] = useState(false);
+  const [useTransaction, setUseTransaction] = useState(true);
 
   const diff = comparison?.diff ?? null;
 
@@ -255,7 +255,7 @@ export function StructureSyncView() {
       const result = await api.applySchemaSync({
         compareId: comparison.compareId,
         selection: selectionPayload,
-        stopOnError,
+        useTransaction,
         jobId,
       });
       setRunResult(result);
@@ -468,13 +468,16 @@ export function StructureSyncView() {
               </button>
               <span className="faint">已选 {selectedCount} 项变更</span>
               <div className="grow" />
-              <label className="check">
+              <label
+                className="check"
+                title="PostgreSQL 支持 DDL 事务，任一条失败会整体回滚；MySQL 的 DDL 会隐式提交，无法回滚，失败时会立即停止"
+              >
                 <input
                   type="checkbox"
-                  checked={stopOnError}
-                  onChange={(event) => setStopOnError(event.target.checked)}
+                  checked={useTransaction}
+                  onChange={(event) => setUseTransaction(event.target.checked)}
                 />
-                遇错停止
+                整体事务（失败即回滚）
               </label>
               <button className="btn" onClick={() => void doPreview()} disabled={previewing || selectedCount === 0}>
                 {previewing ? "生成中…" : "预览 SQL"}

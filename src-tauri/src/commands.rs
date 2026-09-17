@@ -15,7 +15,7 @@ use crate::data::{
 };
 use crate::data::plan::DataPlan;
 use crate::db::value::{ColumnMeta, Value};
-use crate::db::{open_pool, Pool, StatementOutcome};
+use crate::db::{open_pool, DdlRun, Pool, StatementOutcome};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::jobs::ProgressReporter;
@@ -534,9 +534,15 @@ pub struct SyncRunResult {
     pub message: String,
     pub failures: Vec<StatementOutcome>,
     pub sample: Vec<StatementOutcome>,
-    /// Non-fatal notes, e.g. a generated column that had to be downgraded.
+    /// Non-fatal notes, e.g. a table that will fail on a non-empty target.
     pub warnings: Vec<String>,
     pub cancelled: bool,
+    /// A transaction was used and rolled back, so the target is unchanged.
+    pub rolled_back: bool,
+    /// Whether the engine could run the plan atomically.
+    pub transactional: bool,
+    /// Statements never attempted because execution stopped at a failure.
+    pub skipped: usize,
 }
 
 const SAMPLE_LIMIT: usize = 300;
@@ -570,6 +576,54 @@ fn summarize(
         sample,
         warnings,
         cancelled,
+        rolled_back: false,
+        transactional: false,
+        skipped: 0,
+    }
+}
+
+/// Schema sync reports rollback explicitly: the difference between "nothing
+/// happened" and "half of it happened" matters enormously to the user.
+fn summarize_ddl(run: DdlRun, elapsed_ms: u64, warnings: Vec<String>) -> SyncRunResult {
+    let total = run.outcomes.len();
+    let failed = run.outcomes.iter().filter(|o| !o.ok).count();
+    let succeeded = total - failed;
+    let failures: Vec<StatementOutcome> = run.outcomes.iter().filter(|o| !o.ok).cloned().collect();
+    let sample: Vec<StatementOutcome> = run.outcomes.iter().take(SAMPLE_LIMIT).cloned().collect();
+
+    let message = if run.cancelled && run.rolled_back {
+        format!("结构同步已取消，事务已回滚：目标库未发生任何变更（已执行 {total} 条）")
+    } else if run.cancelled {
+        format!(
+            "结构同步已取消：已执行 {total} 条语句（该数据库不支持 DDL 事务，已执行的变更无法回滚）"
+        )
+    } else if failed == 0 {
+        format!("结构同步完成：共执行 {total} 条语句")
+    } else if run.rolled_back {
+        format!(
+            "结构同步失败，事务已回滚：目标库未发生任何变更（第 {total} 条失败，剩余 {} 条未执行）",
+            run.skipped
+        )
+    } else {
+        format!(
+            "结构同步失败：已执行 {total} 条语句（该数据库不支持 DDL 事务，无法回滚，已执行的变更会保留），剩余 {} 条未执行",
+            run.skipped
+        )
+    };
+
+    SyncRunResult {
+        total,
+        succeeded,
+        failed,
+        elapsed_ms,
+        message,
+        failures,
+        sample,
+        warnings,
+        cancelled: run.cancelled,
+        rolled_back: run.rolled_back,
+        transactional: run.transactional,
+        skipped: run.skipped,
     }
 }
 
@@ -579,8 +633,9 @@ pub struct ApplySchemaRequest {
     pub compare_id: String,
     #[serde(default)]
     pub selection: Option<SyncSelection>,
-    #[serde(default)]
-    pub stop_on_error: bool,
+    /// Wrap the whole plan in a transaction where the engine supports it.
+    #[serde(default = "default_true")]
+    pub use_transaction: bool,
     #[serde(default)]
     pub job_id: Option<String>,
 }
@@ -620,16 +675,15 @@ pub async fn apply_schema_sync(
     let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
     let started = Instant::now();
     let run = pool
-        .run_script_reporting(&sql, request.stop_on_error, &reporter)
+        .run_ddl(&sql, request.use_transaction, &reporter)
         .await;
     end_job(&state, job);
     reporter.finish("done", "结构同步完成", "结构同步结束");
-    Ok(summarize(
-        run.outcomes,
+    let run = run?;
+    Ok(summarize_ddl(
+        run,
         started.elapsed().as_millis() as u64,
-        "结构同步",
         warnings,
-        run.cancelled,
     ))
 }
 

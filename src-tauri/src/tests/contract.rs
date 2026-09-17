@@ -590,6 +590,9 @@ fn sync_run_result_shape() {
         sample: vec![outcome],
         warnings: vec!["提示".into()],
         cancelled: false,
+        rolled_back: true,
+        transactional: true,
+        skipped: 2,
     };
     assert_keys(
         &to_json(&run),
@@ -603,6 +606,9 @@ fn sync_run_result_shape() {
             "sample",
             "warnings",
             "cancelled",
+            "rolledBack",
+            "transactional",
+            "skipped",
         ],
     );
 }
@@ -730,11 +736,11 @@ fn command_requests_accept_the_frontend_payloads() {
     let apply_schema: crate::commands::ApplySchemaRequest = serde_json::from_value(json!({
         "compareId": "c1",
         "selection": { "tables": [], "views": [], "types": [] },
-        "stopOnError": true,
+        "useTransaction": true,
         "jobId": "job-2"
     }))
     .expect("deserialisable");
-    assert!(apply_schema.stop_on_error);
+    assert!(apply_schema.use_transaction);
     assert!(apply_schema.selection.is_some());
 
     let compare_data: crate::commands::CompareDataRequest = serde_json::from_value(json!({

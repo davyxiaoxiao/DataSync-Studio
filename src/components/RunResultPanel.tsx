@@ -11,6 +11,17 @@ export function RunResultPanel({ result, title }: { result: SyncRunResult; title
       className="card"
       style={{ borderColor: result.failed > 0 ? "#f3c2c2" : "#b7dfc3", marginTop: 10 }}
     >
+      {result.rolledBack && (
+        <div className="warnbox" style={{ marginTop: 8 }}>
+          事务已回滚：目标库未发生任何变更，可以修正问题后重新执行。
+        </div>
+      )}
+      {result.failed > 0 && !result.transactional && (
+        <div className="errbox" style={{ marginTop: 8 }}>
+          该数据库不支持 DDL 事务，已执行的变更无法回滚，请手工核对目标库。
+        </div>
+      )}
+
       <div className="card-title" style={{ color: tone }}>
         <button
           className="icon-btn"

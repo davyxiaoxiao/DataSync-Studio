@@ -253,11 +253,11 @@ fn source_view_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
     }
 }
 
-/// A NOT NULL column with no default, added once the target already holds rows.
+/// A **nullable** column plus real values.
 ///
-/// The *source* side is prepared the same way the tool has to prepare the
-/// target: PostgreSQL refuses the bare ALTER on a populated table, so a
-/// placeholder value is used and the default dropped again.
+/// This is the shape the tool can handle while keeping the two syncs separate:
+/// the structure sync adds the column without touching a single row, the data
+/// sync writes the values, and a second structure sync tightens the constraint.
 fn late_column_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
     let users = dialect.qualified(Some(ns), "users");
     let column = dialect.quote("channel");
@@ -265,17 +265,31 @@ fn late_column_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
         Dialect::Mysql => "VARCHAR(32)",
         Dialect::Postgres => "character varying(32)",
     };
-    // The existing rows get real values, so that a following data sync has
-    // something to backfill (the target will hold the placeholder instead).
     let fill = match dialect {
         Dialect::Mysql => format!("UPDATE {users} SET {column} = CONCAT('web-', `id`)"),
         Dialect::Postgres => format!("UPDATE {users} SET {column} = 'web-' || \"id\""),
     };
     vec![
-        format!("ALTER TABLE {users} ADD COLUMN {column} {type_name} NOT NULL DEFAULT ''"),
-        format!("ALTER TABLE {users} ALTER COLUMN {column} DROP DEFAULT"),
+        format!("ALTER TABLE {users} ADD COLUMN {column} {type_name} NULL"),
         fill,
     ]
+}
+
+/// Tighten the column to NOT NULL once the data has been synchronised.
+///
+/// The syntax differs per engine, which is exactly why the tool generates the
+/// statement rather than the test.
+fn tighten_column_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
+    let users = dialect.qualified(Some(ns), "users");
+    let column = dialect.quote("channel");
+    match dialect {
+        Dialect::Mysql => vec![format!(
+            "ALTER TABLE {users} MODIFY COLUMN {column} VARCHAR(32) NOT NULL"
+        )],
+        Dialect::Postgres => vec![format!(
+            "ALTER TABLE {users} ALTER COLUMN {column} SET NOT NULL"
+        )],
+    }
 }
 
 /// Drop the source-side views in reverse dependency order.
@@ -401,6 +415,28 @@ async fn refresh_source_matviews(pool: &Pool, dialect: Dialect, ns: &str) {
         )
         .await;
     }
+}
+
+/// Read one column from the first row, distinguishing NULL from a value.
+async fn scalar_opt(
+    pool: &Pool,
+    namespace: &str,
+    table: &str,
+    column: &str,
+    dialect: Dialect,
+) -> Option<String> {
+    let sql = format!(
+        "SELECT {} FROM {}",
+        dialect.quote(column),
+        dialect.qualified(Some(namespace), table)
+    );
+    let rows = pool
+        .fetch(&sql, &[], &[crate::db::value::ColumnKind::Str])
+        .await
+        .unwrap_or_else(|e| panic!("读取 {table}.{column} 失败: {e}"));
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(|value| value.display())
 }
 
 /// Read one text column from the first row of a table.
@@ -796,10 +832,8 @@ async fn roundtrip(
         "{tag}: 生成列应由目标端重算为 amount*2 = 20.00, 实际 {value}"
     );
 
-    // ---- 9. NOT NULL column added while the target already holds rows ------
-    // PostgreSQL rejects this outright unless values are supplied for the
-    // existing rows; the planner backfills with a placeholder default and then
-    // removes it again.
+    // ---- 9. a column added while the target already holds rows -------------
+    // Structure sync only adds the column; it must not write a single row.
     exec_all(source_pool, &late_column_ddl(source_dialect, source_ns)).await;
 
     let (late, late_sources, _) = compare_schema_core(
@@ -827,44 +861,39 @@ async fn roundtrip(
         Some(target_ns),
         &mut late_warnings,
     );
+    assert_eq!(
+        late_plan.iter().filter(|s| s.category == "add_column").count(),
+        1,
+        "{tag}: 只应产生一条 ADD COLUMN"
+    );
     run_plan(target_pool, late_plan.into_iter().map(|s| s.sql).collect()).await;
 
-    let (after_late, _, _) = compare_schema_core(
-        source_pool,
-        source_ns,
-        target_pool,
-        target_ns,
-        CompareOptions::default(),
-        None,
-        &ProgressReporter::inert(),
-    )
-    .await
-    .expect("re-compare after late column");
-    assert_structurally_identical(&after_late, &format!("{tag} 非空列新增"));
-
-    // The placeholder must not survive as a real default.
-    let target_structure =
-        crate::schema::introspect::load_table(target_pool, target_ns, "users")
-            .await
-            .expect("load target users");
+    let target_structure = crate::schema::introspect::load_table(target_pool, target_ns, "users")
+        .await
+        .expect("load target users");
     let channel = target_structure
         .column("channel")
         .expect("目标表应有 channel 列");
-    assert!(!channel.nullable, "{tag}: channel 应为非空");
     assert!(
-        channel.default.is_none(),
-        "{tag}: 占位默认值应当已被删除，实际 {:?}",
-        channel.default
+        channel.nullable,
+        "{tag}: 结构同步只应加可空列，NOT NULL 由后续流程加上"
     );
-    // Existing rows were backfilled so the column could be made NOT NULL.
-    let filled = scalar_text(target_pool, target_ns, "users", "channel", target_dialect).await;
-    assert_eq!(filled, "", "{tag}: 现有行应被回填为空串占位值");
+    // The decisive assertion: structure sync wrote no row data.
+    let untouched = scalar_opt(target_pool, target_ns, "users", "channel", target_dialect).await;
+    assert_eq!(
+        untouched, None,
+        "{tag}: 结构同步不得向现有行写入任何值，实际 {untouched:?}"
+    );
 
-    // ---- 10. a data sync then fills the new column with real values --------
-    // Structure sync only guarantees the column exists; the values come from a
-    // data sync, which is exactly the composition the tool offers.
+    // ---- 10. the data sync fills the column with the real values -----------
     let (pending, fill_plan, _) = compare_data_core(
-        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 200,
+        source_pool,
+        &source_ep,
+        target_pool,
+        &target_ep,
+        &[],
+        &[],
+        200,
         &ProgressReporter::inert(),
     )
     .await
@@ -874,11 +903,16 @@ async fn roundtrip(
         "{tag}: 新增列的真实值应被识别为待更新, 实际 {:?}",
         pending.summary
     );
-    let updated = pending.summary.updates;
     apply_data(target_pool, target_ns, fill_plan.select(true, true, true)).await;
 
     let (filled_pass, _, _) = compare_data_core(
-        source_pool, &source_ep, target_pool, &target_ep, &[], &[], 200,
+        source_pool,
+        &source_ep,
+        target_pool,
+        &target_ep,
+        &[],
+        &[],
+        200,
         &ProgressReporter::inert(),
     )
     .await
@@ -893,10 +927,58 @@ async fn roundtrip(
         "{tag}: 回填后 users 应完全一致"
     );
     let backfilled = scalar_text(target_pool, target_ns, "users", "channel", target_dialect).await;
+    assert_eq!(backfilled, "web-1", "{tag}: 数据同步应写入源端真实值");
+
+    // ---- 11. now the constraint can be applied ----------------------------
+    exec_all(source_pool, &tighten_column_ddl(source_dialect, source_ns)).await;
+    let (tighten, tighten_sources, _) = compare_schema_core(
+        source_pool,
+        source_ns,
+        target_pool,
+        target_ns,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("compare tightened column");
     assert_eq!(
-        backfilled, "web-1",
-        "{tag}: 回填 {updated} 行后 channel 应为源端真实值"
+        tighten.summary.changed_columns, 1,
+        "{tag}: 可空 -> 非空应被识别为一处列变更, 实际 {:?}",
+        tighten.summary
     );
+    let tighten_plan = generate(
+        &tighten,
+        &tighten_sources,
+        None,
+        Some(target_ns),
+        &mut Vec::new(),
+    );
+    run_plan(target_pool, tighten_plan.into_iter().map(|s| s.sql).collect()).await;
+
+    let (final_state, _, _) = compare_schema_core(
+        source_pool,
+        source_ns,
+        target_pool,
+        target_ns,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("re-compare after tightening");
+    assert_structurally_identical(&final_state, &format!("{tag} 非空约束同步"));
+    let tightened = crate::schema::introspect::load_table(target_pool, target_ns, "users")
+        .await
+        .expect("load target users");
+    assert!(
+        !tightened.column("channel").expect("channel").nullable,
+        "{tag}: channel 最终应为非空"
+    );
+
+    // The data survived all of it.
+    let survivor = scalar_text(target_pool, target_ns, "users", "channel", target_dialect).await;
+    assert_eq!(survivor, "web-1", "{tag}: 收紧约束不应影响数据");
 }
 
 #[tokio::test]
@@ -1564,6 +1646,152 @@ async fn live_postgres_dropping_referenced_tables() {
         "pg 删表",
     )
     .await;
+}
+
+/// A failing DDL statement must not leave the target half-migrated.
+///
+/// The plan deliberately contains a statement that succeeds followed by one that
+/// cannot: adding a NOT NULL column with no default to a populated table. On
+/// PostgreSQL the whole plan is one transaction, so the first change must be
+/// undone as well.
+#[tokio::test]
+async fn live_postgres_ddl_rolls_back_on_failure() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    let (src, dst) = ("datasync_live_rb_src", "datasync_live_rb_dst");
+    drop_namespace(&pool, Dialect::Postgres, src).await;
+    drop_namespace(&pool, Dialect::Postgres, dst).await;
+    create_namespace(&pool, Dialect::Postgres, src).await;
+    create_namespace(&pool, Dialect::Postgres, dst).await;
+
+    assert!(
+        pool.supports_transactional_ddl(),
+        "PostgreSQL 应支持 DDL 事务"
+    );
+
+    let source_table = Dialect::Postgres.qualified(Some(src), "users");
+    let target_table = Dialect::Postgres.qualified(Some(dst), "users");
+
+    // The target already holds rows.
+    exec(
+        &pool,
+        &format!(
+            "CREATE TABLE {target_table} (\"id\" integer NOT NULL, \"email\" character varying(32), CONSTRAINT \"users_pkey\" PRIMARY KEY (\"id\"))"
+        ),
+    )
+    .await;
+    exec(
+        &pool,
+        &format!("INSERT INTO {target_table} VALUES (1, 'a'), (2, 'b')"),
+    )
+    .await;
+
+    // The source has an extra nullable column and an extra NOT NULL column.
+    exec(
+        &pool,
+        &format!(
+            "CREATE TABLE {source_table} (
+                \"id\" integer NOT NULL,
+                \"email\" character varying(32),
+                \"extra\" character varying(32),
+                \"code\" character varying(32) NOT NULL,
+                CONSTRAINT \"users_pkey\" PRIMARY KEY (\"id\"))"
+        ),
+    )
+    .await;
+    exec(
+        &pool,
+        &format!("INSERT INTO {source_table} VALUES (1, 'a', 'x', 'c1'), (2, 'b', 'y', 'c2')"),
+    )
+    .await;
+
+    let (diff, sources, _) = compare_schema_core(
+        &pool,
+        src,
+        &pool,
+        dst,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("compare");
+    assert_eq!(diff.summary.new_columns, 2, "{:?}", diff.summary);
+
+    let plan = generate(&diff, &sources, None, Some(dst), &mut Vec::new());
+    let sql: Vec<String> = plan
+        .iter()
+        .filter(|s| s.category == "add_column")
+        .map(|s| s.sql.clone())
+        .collect();
+    assert_eq!(sql.len(), 2, "{sql:?}");
+
+    let run = pool
+        .run_ddl(&sql, true, &ProgressReporter::inert())
+        .await
+        .expect("run ddl");
+
+    assert!(run.transactional, "应使用事务");
+    assert!(run.rolled_back, "失败后应整体回滚");
+    assert_eq!(
+        run.outcomes.iter().filter(|o| o.ok).count(),
+        1,
+        "第一条语句应当成功执行过"
+    );
+    assert_eq!(run.outcomes.iter().filter(|o| !o.ok).count(), 1);
+    assert_eq!(run.skipped, 0, "两条语句都已尝试");
+
+    // The decisive check: the column added by the *successful* statement is gone.
+    let after = crate::schema::introspect::load_table(&pool, dst, "users")
+        .await
+        .expect("load target users");
+    assert!(
+        after.column("extra").is_none(),
+        "回滚后不应留下任何变更，实际列: {:?}",
+        after.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+    assert!(after.column("code").is_none());
+    // And the rows are untouched.
+    let rows = scalar_count(&pool, dst, "users", Dialect::Postgres).await;
+    assert_eq!(rows, 2);
+
+    // Running the same plan without a transaction would leave the first change
+    // behind, which is why the option matters.
+    let run = pool
+        .run_ddl(&sql, false, &ProgressReporter::inert())
+        .await
+        .expect("run ddl without a transaction");
+    assert!(!run.transactional);
+    assert!(!run.rolled_back);
+    // Both statements were attempted (the second one failed), so nothing was
+    // skipped; the point is that the first one's change survives.
+    assert_eq!(run.skipped, 0);
+    assert_eq!(run.outcomes.iter().filter(|o| o.ok).count(), 1);
+    let after = crate::schema::introspect::load_table(&pool, dst, "users")
+        .await
+        .expect("load target users");
+    assert!(
+        after.column("extra").is_some(),
+        "非事务模式下已执行的变更会保留 —— 这正是需要提示用户的事实"
+    );
+
+    drop_namespace(&pool, Dialect::Postgres, src).await;
+    drop_namespace(&pool, Dialect::Postgres, dst).await;
+}
+
+#[tokio::test]
+async fn live_mysql_reports_that_ddl_cannot_be_rolled_back() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    // MySQL commits every DDL statement implicitly, so the tool must say so
+    // rather than implying a rollback it cannot perform.
+    assert!(!pool.supports_transactional_ddl());
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must
