@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
-use crate::schema::diff::{ChangeKind, SchemaDiff, TableDiff};
-use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure};
+use crate::schema::diff::{ChangeKind, SchemaDiff, TableDiff, TypeDiff};
+use crate::schema::model::{
+    ColumnInfo, CustomType, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +46,9 @@ pub struct SyncSelection {
     /// Names of the views/ materialised views to apply.
     #[serde(default)]
     pub views: Vec<String>,
+    /// Names of the user-defined types (PostgreSQL enum/domain) to apply.
+    #[serde(default)]
+    pub types: Vec<String>,
 }
 
 impl SyncSelection {
@@ -94,15 +99,26 @@ fn is_boolean_family(column: &ColumnInfo) -> bool {
 /// Render the DEFAULT clause for a column, or `None` when there is no usable
 /// default. Only one engine is ever involved, so each dialect is handled with
 /// its own native representation.
-fn render_default(column: &ColumnInfo, dialect: Dialect) -> Option<String> {
+fn render_default(
+    column: &ColumnInfo,
+    dialect: Dialect,
+    source_schema: &str,
+    target_schema: Option<&str>,
+) -> Option<String> {
     let raw = column.default.as_ref()?.trim().to_string();
     if raw.is_empty() || raw.eq_ignore_ascii_case("NULL") {
         return None;
     }
     match dialect {
         // `pg_get_expr` already yields a complete, correctly typed expression
-        // such as `'abc'::character varying`, `0`, `true` or `now()`.
-        Dialect::Postgres => Some(raw),
+        // such as `'abc'::character varying`, `0`, `true` or `now()`. Any
+        // namespace it carries must be rewritten, otherwise a default such as
+        // `'new'::src.order_state` would not match the target's own enum type.
+        Dialect::Postgres => Some(remap_schema_references(
+            &raw,
+            source_schema,
+            target_schema.unwrap_or(""),
+        )),
         Dialect::Mysql => {
             let upper = raw.to_ascii_uppercase();
             if is_time_keyword(&upper) {
@@ -135,10 +151,21 @@ struct ColumnDdl {
     warning: Option<String>,
 }
 
-fn column_definition(column: &ColumnInfo, target: Dialect) -> ColumnDdl {
+fn column_definition(
+    column: &ColumnInfo,
+    target: Dialect,
+    schema: Option<&str>,
+    source_schema: &str,
+) -> ColumnDdl {
     let q = |name: &str| target.quote(name);
-    // Both sides are the same engine, so the declared type is reused verbatim.
-    let mut parts = vec![format!("{} {}", q(&column.name), column.full_type)];
+    // Both sides are the same engine, so the declared type is reused verbatim —
+    // except for user-defined types, which must be schema-qualified because the
+    // target schema is not necessarily on the connection's search_path.
+    let type_name = match (&column.udt_name, target) {
+        (Some(udt), Dialect::Postgres) => target.qualified(schema, udt),
+        _ => column.full_type.clone(),
+    };
+    let mut parts = vec![format!("{} {}", q(&column.name), type_name)];
 
     if column.is_generated {
         if let Some(expression) = column
@@ -192,7 +219,7 @@ fn column_definition(column: &ColumnInfo, target: Dialect) -> ColumnDdl {
         if !column.nullable {
             parts.push("NOT NULL".into());
         }
-        if let Some(default) = render_default(column, target) {
+        if let Some(default) = render_default(column, target, source_schema, schema) {
             parts.push(format!("DEFAULT {default}"));
         }
         if column.is_auto_increment && target == Dialect::Mysql {
@@ -263,6 +290,167 @@ fn index_ddl(index: &IndexInfo, table: &str, target: Dialect, schema: Option<&st
     }
 }
 
+fn create_type_ddl(entry: &CustomType, target: Dialect, schema: Option<&str>) -> String {
+    let qualified = target.qualified(schema, &entry.name);
+    if entry.kind == "enum" {
+        let labels: Vec<String> = entry
+            .labels
+            .iter()
+            .map(|label| target.string_literal(label))
+            .collect();
+        format!("CREATE TYPE {qualified} AS ENUM ({});", labels.join(", "))
+    } else {
+        let base = entry.base_type.clone().unwrap_or_else(|| "text".into());
+        let mut sql = format!("CREATE DOMAIN {qualified} AS {base}");
+        if !entry.domain_nullable {
+            sql.push_str(" NOT NULL");
+        }
+        if let Some(default) = entry.domain_default.as_deref().filter(|d| !d.is_empty()) {
+            sql.push_str(&format!(" DEFAULT {default}"));
+        }
+        for (index, constraint) in entry.constraints.iter().enumerate() {
+            // `pg_get_constraintdef` already returns e.g. `CHECK ((VALUE > 0))`.
+            sql.push_str(&format!(
+                " CONSTRAINT {} {constraint}",
+                target.quote(&format!("{}_check_{}", entry.name, index + 1))
+            ));
+        }
+        sql.push(';');
+        return sql;
+    }
+}
+
+fn drop_type_ddl(entry: &CustomType, target: Dialect, schema: Option<&str>) -> String {
+    let keyword = if entry.kind == "enum" { "TYPE" } else { "DOMAIN" };
+    format!(
+        "DROP {keyword} IF EXISTS {};",
+        target.qualified(schema, &entry.name)
+    )
+}
+
+/// Statements that reconcile an existing enum/domain with its source.
+fn alter_type_ddl(
+    entry: &TypeDiff,
+    target: Dialect,
+    schema: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Vec<DdlStatement> {
+    let (Some(source), Some(existing)) = (entry.source.as_ref(), entry.target.as_ref()) else {
+        return Vec::new();
+    };
+    let qualified = target.qualified(schema, &entry.name);
+    let mut out = Vec::new();
+
+    if source.kind != existing.kind || source.kind == "domain" {
+        if source.kind == "domain" {
+            if source.base_type != existing.base_type {
+                warnings.push(format!(
+                    "域 {} 的基础类型由 {} 变为 {}，PostgreSQL 不支持修改域的基础类型，需要手工重建",
+                    entry.name,
+                    existing.base_type.clone().unwrap_or_default(),
+                    source.base_type.clone().unwrap_or_default()
+                ));
+            }
+            if source.domain_nullable != existing.domain_nullable {
+                out.push(DdlStatement {
+                    table: entry.name.clone(),
+                    category: "alter_type".into(),
+                    object: entry.name.clone(),
+                    sql: format!(
+                        "ALTER DOMAIN {qualified} {};",
+                        if source.domain_nullable {
+                            "DROP NOT NULL"
+                        } else {
+                            "SET NOT NULL"
+                        }
+                    ),
+                });
+            }
+            if source.domain_default != existing.domain_default {
+                let clause = match source.domain_default.as_deref().filter(|d| !d.is_empty()) {
+                    Some(default) => format!("SET DEFAULT {default}"),
+                    None => "DROP DEFAULT".to_string(),
+                };
+                out.push(DdlStatement {
+                    table: entry.name.clone(),
+                    category: "alter_type".into(),
+                    object: entry.name.clone(),
+                    sql: format!("ALTER DOMAIN {qualified} {clause};"),
+                });
+            }
+            let added: Vec<&String> = source
+                .constraints
+                .iter()
+                .filter(|c| !existing.constraints.contains(c))
+                .collect();
+            for (index, constraint) in added.iter().enumerate() {
+                out.push(DdlStatement {
+                    table: entry.name.clone(),
+                    category: "alter_type".into(),
+                    object: entry.name.clone(),
+                    sql: format!(
+                        "ALTER DOMAIN {qualified} ADD CONSTRAINT {} {constraint};",
+                        target.quote(&format!("{}_added_{}", entry.name, index + 1))
+                    ),
+                });
+            }
+            if existing
+                .constraints
+                .iter()
+                .any(|c| !source.constraints.contains(c))
+            {
+                warnings.push(format!(
+                    "域 {} 存在被删除的 CHECK 约束，PostgreSQL 需要显式的约束名，请手工删除",
+                    entry.name
+                ));
+            }
+        }
+        return out;
+    }
+
+    // Enum: PostgreSQL can only add labels, optionally positioned.
+    let removed: Vec<&String> = existing
+        .labels
+        .iter()
+        .filter(|label| !source.labels.contains(label))
+        .collect();
+    let added: Vec<&String> = source
+        .labels
+        .iter()
+        .filter(|label| !existing.labels.contains(label))
+        .collect();
+    if !removed.is_empty() {
+        warnings.push(format!(
+            "枚举 {} 存在被删除的值（{}），PostgreSQL 不支持删除枚举值，需要手工重建类型及其依赖列",
+            entry.name,
+            removed
+                .iter()
+                .map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return out;
+    }
+    for label in added {
+        let position = source.labels.iter().position(|l| l == label);
+        let anchor = position
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|previous| source.labels.get(previous))
+            .map(|previous| format!(" AFTER {}", target.string_literal(previous)))
+            .unwrap_or_default();
+        out.push(DdlStatement {
+            table: entry.name.clone(),
+            category: "alter_type".into(),
+            object: entry.name.clone(),
+            sql: format!(
+                "ALTER TYPE {qualified} ADD VALUE {}{anchor};",
+                target.string_literal(label)
+            ),
+        });
+    }
+    out
+}
+
 fn view_keyword(view: &ViewStructure, target: Dialect) -> &'static str {
     if view.is_materialized() && target == Dialect::Postgres {
         "MATERIALIZED VIEW"
@@ -271,14 +459,14 @@ fn view_keyword(view: &ViewStructure, target: Dialect) -> &'static str {
     }
 }
 
-/// Rewrite a view body so that references to the source namespace point at the
-/// target namespace.
+/// Rewrite references to the source namespace so they point at the target.
 ///
-/// Both engines qualify the relations a view reads: PostgreSQL renders
-/// `FROM ns.table` and MySQL renders ``from `ns`.`table` ``. Copying the body
-/// verbatim would leave the target's view reading the *source* database, which
-/// is both wrong and invisible until the two databases diverge.
-fn remap_view_schema(definition: &str, source_schema: &str, target_schema: &str) -> String {
+/// Everything a server hands back is qualified with the namespace it came from:
+/// PostgreSQL renders a view as `FROM ns.table` and a default as
+/// `'x'::ns.myenum`, MySQL renders ``from `ns`.`table` ``. Copying that text
+/// verbatim would leave the target reading the *source* database, which is both
+/// wrong and invisible until the two databases diverge.
+fn remap_schema_references(definition: &str, source_schema: &str, target_schema: &str) -> String {
     if source_schema.is_empty() || source_schema == target_schema {
         return definition.to_string();
     }
@@ -328,7 +516,7 @@ fn create_view_ddl(
     source_schema: &str,
 ) -> String {
     let qualified = target.qualified(schema, &view.name);
-    let body = remap_view_schema(
+    let body = remap_schema_references(
         view.definition.trim().trim_end_matches(';'),
         source_schema,
         schema.unwrap_or(""),
@@ -432,7 +620,7 @@ fn create_table_ddl(
     let tref = target.qualified(schema, &structure.name);
     let mut body: Vec<String> = Vec::new();
     for column in &structure.columns {
-        let definition = column_definition(column, target);
+        let definition = column_definition(column, target, schema, source_schema);
         if let Some(warning) = definition.warning {
             warnings.push(format!("表 {}：{warning}", structure.name));
         }
@@ -563,6 +751,7 @@ fn alter_column_statements(
     table: &TableDiff,
     target: Dialect,
     schema: Option<&str>,
+    source_schema: &str,
     warnings: &mut Vec<String>,
 ) -> Vec<DdlStatement> {
     let q = |name: &str| target.quote(name);
@@ -609,7 +798,7 @@ fn alter_column_statements(
         };
         match diff.kind {
             ChangeKind::New => {
-                let definition = column_definition(column, target);
+                let definition = column_definition(column, target, schema, source_schema);
                 if let Some(warning) = definition.warning {
                     warnings.push(format!("表 {}：{warning}", table.name));
                 }
@@ -651,7 +840,7 @@ fn alter_column_statements(
                     ));
                 }
                 if target == Dialect::Mysql {
-                    let definition = column_definition(column, target);
+                    let definition = column_definition(column, target, schema, source_schema);
                     if let Some(warning) = definition.warning {
                         warnings.push(format!("表 {}：{warning}", table.name));
                     }
@@ -711,7 +900,7 @@ fn alter_column_statements(
                     }
                     let default_changed = diff.differences.iter().any(|d| d.field == "默认值");
                     if default_changed {
-                        let clause = match render_default(column, target) {
+                        let clause = match render_default(column, target, source_schema, schema) {
                             Some(value) => format!("SET DEFAULT {value}"),
                             None => "DROP DEFAULT".to_string(),
                         };
@@ -789,6 +978,9 @@ pub fn generate(
         Some(s) => s.table(table).is_some(),
         None => true,
     };
+
+    let (create_types, alter_types, drop_types) =
+        plan_types(diff, selection, target, target_schema, warnings);
 
     let (drop_views, create_views) = plan_views(
         diff,
@@ -990,6 +1182,7 @@ pub fn generate(
                     &filtered,
                     target,
                     target_schema,
+                    &diff.source_namespace,
                     warnings,
                 ));
 
@@ -1051,12 +1244,77 @@ pub fn generate(
     plan.extend(drop_views);
     plan.extend(drop_fks);
     plan.extend(drop_tables);
+    // A type can only be dropped once nothing references it, so the drops wait
+    // until the very end while the creates come before the tables that use them.
+    plan.extend(create_types);
     plan.extend(create_tables);
     plan.extend(body);
     plan.extend(add_indexes);
     plan.extend(add_fks);
     plan.extend(create_views);
+    plan.extend(alter_types);
+    plan.extend(drop_types);
     plan
+}
+
+/// Plan user-defined types. A type's own changes come before the tables that
+/// use it, and its removal after everything that referenced it.
+fn plan_types(
+    diff: &SchemaDiff,
+    selection: Option<&SyncSelection>,
+    target: Dialect,
+    schema: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> (Vec<DdlStatement>, Vec<DdlStatement>, Vec<DdlStatement>) {
+    if diff.types.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let selected: Option<std::collections::HashSet<&str>> = selection.map(|s| {
+        s.types
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<&str>>()
+    });
+    let is_selected = |name: &str| match &selected {
+        Some(set) => set.contains(name),
+        None => true,
+    };
+
+    let mut creates = Vec::new();
+    let mut alters = Vec::new();
+    let mut drops = Vec::new();
+    for entry in &diff.types {
+        if !is_selected(&entry.name) {
+            continue;
+        }
+        match entry.kind {
+            ChangeKind::New => {
+                if let Some(source) = entry.source.as_ref() {
+                    creates.push(DdlStatement {
+                        table: entry.name.clone(),
+                        category: "create_type".into(),
+                        object: entry.name.clone(),
+                        sql: create_type_ddl(source, target, schema),
+                    });
+                }
+            }
+            ChangeKind::Changed => {
+                alters.extend(alter_type_ddl(entry, target, schema, warnings));
+            }
+            ChangeKind::Missing => {
+                if let Some(existing) = entry.target.as_ref() {
+                    drops.push(DdlStatement {
+                        table: entry.name.clone(),
+                        category: "drop_type".into(),
+                        object: entry.name.clone(),
+                        sql: drop_type_ddl(existing, target, schema),
+                    });
+                }
+            }
+            ChangeKind::Identical => {}
+        }
+    }
+    (creates, alters, drops)
 }
 
 /// Work out which views must be dropped and recreated, and in what order.

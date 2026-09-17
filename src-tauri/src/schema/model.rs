@@ -30,6 +30,10 @@ pub struct ColumnInfo {
     pub comment: Option<String>,
     pub charset: Option<String>,
     pub collation: Option<String>,
+    /// Set when the column uses a user-defined type (enum or domain), so the
+    /// generated DDL can schema-qualify it.
+    #[serde(default)]
+    pub udt_name: Option<String>,
 }
 
 impl ColumnInfo {
@@ -232,4 +236,29 @@ pub fn normalize_sql_text(value: &str) -> String {
         collapsed = collapsed.trim_end().to_string();
     }
     collapsed
+}
+
+/// A user-defined type. Only PostgreSQL has these; MySQL's `ENUM` is declared
+/// inline on the column and needs no separate object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomType {
+    pub name: String,
+    /// `enum` | `domain`
+    pub kind: String,
+    /// Enum labels, in declaration order.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Domain base type as declared, e.g. `numeric(10,2)`.
+    #[serde(default)]
+    pub base_type: Option<String>,
+    #[serde(default)]
+    pub domain_nullable: bool,
+    #[serde(default)]
+    pub domain_default: Option<String>,
+    /// Domain CHECK expressions, e.g. `CHECK ((VALUE > 0))`.
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    #[serde(default)]
+    pub comment: Option<String>,
 }

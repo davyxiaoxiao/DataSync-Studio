@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
 use crate::schema::model::{
-    ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
+    ColumnInfo, CustomType, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +97,16 @@ pub struct ViewDiff {
     pub differences: Vec<FieldChange>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeDiff {
+    pub name: String,
+    pub kind: ChangeKind,
+    pub source: Option<CustomType>,
+    pub target: Option<CustomType>,
+    pub differences: Vec<FieldChange>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffSummary {
@@ -110,6 +120,9 @@ pub struct DiffSummary {
     pub index_changes: usize,
     pub foreign_key_changes: usize,
     pub primary_key_changes: usize,
+    pub new_types: usize,
+    pub missing_types: usize,
+    pub changed_types: usize,
     pub new_views: usize,
     pub missing_views: usize,
     pub changed_views: usize,
@@ -125,7 +138,76 @@ pub struct SchemaDiff {
     pub target_dialect: Dialect,
     pub tables: Vec<TableDiff>,
     pub views: Vec<ViewDiff>,
+    pub types: Vec<TypeDiff>,
     pub summary: DiffSummary,
+}
+
+/// Everything the comparison needs beyond the two object lists.
+#[derive(Debug, Clone, Copy)]
+pub struct CompareContext<'a> {
+    pub source_dialect: Dialect,
+    pub target_dialect: Dialect,
+    /// Namespaces let type and default references that merely differ by
+    /// namespace (`src.mood` vs `dst.mood`) compare as equal.
+    pub source_namespace: &'a str,
+    pub target_namespace: &'a str,
+    pub options: CompareOptions,
+}
+
+impl<'a> CompareContext<'a> {
+    pub fn new(
+        source_dialect: Dialect,
+        target_dialect: Dialect,
+        source_namespace: &'a str,
+        target_namespace: &'a str,
+        options: CompareOptions,
+    ) -> CompareContext<'a> {
+        CompareContext {
+            source_dialect,
+            target_dialect,
+            source_namespace,
+            target_namespace,
+            options,
+        }
+    }
+
+    /// Remove any `namespace.` qualifier from a type or expression reference.
+    ///
+    /// A PostgreSQL enum column reports its type as `src.order_state` and its
+    /// default as `'new'::src.order_state`, while the target reports the same
+    /// things against `dst`. The namespaces necessarily differ, so they are
+    /// stripped before comparing; the quotes are dropped first so that quoted
+    /// forms (`"src".order_state`) are handled too.
+    fn localize(&self, value: &str, namespace: &str) -> String {
+        let unquoted: String = value.chars().filter(|c| *c != '"' && *c != '`').collect();
+        let trimmed = unquoted.trim();
+        if namespace.is_empty() {
+            return trimmed.to_string();
+        }
+        let chars: Vec<char> = trimmed.chars().collect();
+        let needle: Vec<char> = namespace.to_lowercase().chars().collect();
+        let mut out = String::with_capacity(trimmed.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let fits = i + needle.len() < chars.len()
+                && chars[i..i + needle.len()]
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .eq(needle.iter().copied())
+                && chars[i + needle.len()] == '.';
+            let boundary = i == 0 || {
+                let previous = chars[i - 1];
+                !(previous.is_alphanumeric() || previous == '_')
+            };
+            if fits && boundary {
+                i += needle.len() + 1;
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,15 +231,28 @@ impl Default for CompareOptions {
 /// have to change in the target to match the source.
 /// Full comparison including views.
 #[allow(clippy::too_many_arguments)]
-pub fn compare_with_views(
+/// Full comparison: tables, views and user-defined types.
+#[allow(clippy::too_many_arguments)]
+pub fn compare_everything(
     source: &[TableStructure],
     target: &[TableStructure],
     source_views: &[ViewStructure],
     target_views: &[ViewStructure],
+    source_types: &[CustomType],
+    target_types: &[CustomType],
     source_dialect: Dialect,
     target_dialect: Dialect,
+    source_namespace: &str,
+    target_namespace: &str,
     options: CompareOptions,
 ) -> SchemaDiff {
+    let context = CompareContext::new(
+        source_dialect,
+        target_dialect,
+        source_namespace,
+        target_namespace,
+        options,
+    );
     let key_of = |name: &str| {
         if options.ignore_case {
             name.to_lowercase()
@@ -179,22 +274,16 @@ pub fn compare_with_views(
         match target_map.get(&key) {
             Some(tgt) => {
                 used_targets.push(key);
-                tables.push(diff_table(
-                    Some(src),
-                    Some(tgt),
-                    source_dialect,
-                    target_dialect,
-                    options,
-                ));
+                tables.push(diff_table(Some(src), Some(tgt), context));
             }
-            None => tables.push(diff_table(Some(src), None, source_dialect, target_dialect, options)),
+            None => tables.push(diff_table(Some(src), None, context)),
         }
     }
 
     for tgt in target {
         let key = key_of(&tgt.name);
         if !used_targets.contains(&key) {
-            tables.push(diff_table(None, Some(tgt), source_dialect, target_dialect, options));
+            tables.push(diff_table(None, Some(tgt), context));
         }
     }
 
@@ -241,15 +330,145 @@ pub fn compare_with_views(
         }
     }
 
+    let types = diff_types(source_types, target_types);
+    for entry in &types {
+        match entry.kind {
+            ChangeKind::New => summary.new_types += 1,
+            ChangeKind::Missing => summary.missing_types += 1,
+            ChangeKind::Changed => summary.changed_types += 1,
+            ChangeKind::Identical => {}
+        }
+    }
+
     SchemaDiff {
-        source_namespace: String::new(),
-        target_namespace: String::new(),
+        source_namespace: source_namespace.to_string(),
+        target_namespace: target_namespace.to_string(),
         source_dialect,
         target_dialect,
         tables,
         views,
+        types,
         summary,
     }
+}
+
+fn diff_types(source: &[CustomType], target: &[CustomType]) -> Vec<TypeDiff> {
+    let mut out = Vec::new();
+    for entry in source {
+        match target.iter().find(|t| t.name == entry.name) {
+            Some(existing) => {
+                let mut differences = Vec::new();
+                if entry.kind != existing.kind {
+                    differences.push(FieldChange {
+                        field: "类型种类".into(),
+                        source: Some(entry.kind.clone()),
+                        target: Some(existing.kind.clone()),
+                    });
+                } else if entry.kind == "enum" {
+                    let added: Vec<String> = entry
+                        .labels
+                        .iter()
+                        .filter(|label| !existing.labels.contains(label))
+                        .cloned()
+                        .collect();
+                    let removed: Vec<String> = existing
+                        .labels
+                        .iter()
+                        .filter(|label| !entry.labels.contains(label))
+                        .cloned()
+                        .collect();
+                    let reordered = added.is_empty()
+                        && removed.is_empty()
+                        && entry.labels != existing.labels;
+                    if !added.is_empty() || !removed.is_empty() || reordered {
+                        differences.push(FieldChange {
+                            field: "枚举值".into(),
+                            source: Some(entry.labels.join(", ")),
+                            target: Some(existing.labels.join(", ")),
+                        });
+                    }
+                } else {
+                    if entry.base_type != existing.base_type {
+                        differences.push(FieldChange {
+                            field: "基础类型".into(),
+                            source: entry.base_type.clone(),
+                            target: existing.base_type.clone(),
+                        });
+                    }
+                    if entry.domain_nullable != existing.domain_nullable {
+                        differences.push(FieldChange {
+                            field: "允许为空".into(),
+                            source: Some(
+                                if entry.domain_nullable { "YES" } else { "NO" }.into(),
+                            ),
+                            target: Some(
+                                if existing.domain_nullable { "YES" } else { "NO" }.into(),
+                            ),
+                        });
+                    }
+                    if normalize_default(entry.domain_default.as_deref().unwrap_or(""))
+                        != normalize_default(existing.domain_default.as_deref().unwrap_or(""))
+                    {
+                        differences.push(FieldChange {
+                            field: "默认值".into(),
+                            source: entry.domain_default.clone(),
+                            target: existing.domain_default.clone(),
+                        });
+                    }
+                    let mut source_constraints: Vec<String> = entry
+                        .constraints
+                        .iter()
+                        .map(|c| normalize_type_text(c))
+                        .collect();
+                    let mut target_constraints: Vec<String> = existing
+                        .constraints
+                        .iter()
+                        .map(|c| normalize_type_text(c))
+                        .collect();
+                    source_constraints.sort();
+                    target_constraints.sort();
+                    if source_constraints != target_constraints {
+                        differences.push(FieldChange {
+                            field: "约束".into(),
+                            source: Some(entry.constraints.join("; ")),
+                            target: Some(existing.constraints.join("; ")),
+                        });
+                    }
+                }
+                out.push(TypeDiff {
+                    name: entry.name.clone(),
+                    kind: if differences.is_empty() {
+                        ChangeKind::Identical
+                    } else {
+                        ChangeKind::Changed
+                    },
+                    source: Some(entry.clone()),
+                    target: Some(existing.clone()),
+                    differences,
+                });
+            }
+            None => out.push(TypeDiff {
+                name: entry.name.clone(),
+                kind: ChangeKind::New,
+                source: Some(entry.clone()),
+                target: None,
+                differences: Vec::new(),
+            }),
+        }
+    }
+    for existing in target {
+        if !source.iter().any(|entry| entry.name == existing.name) {
+            out.push(TypeDiff {
+                name: existing.name.clone(),
+                kind: ChangeKind::Missing,
+                source: None,
+                target: Some(existing.clone()),
+                differences: Vec::new(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 fn diff_views(source: &[ViewStructure], target: &[ViewStructure]) -> Vec<ViewDiff> {
@@ -320,10 +539,9 @@ fn diff_views(source: &[ViewStructure], target: &[ViewStructure]) -> Vec<ViewDif
 fn diff_table(
     source: Option<&TableStructure>,
     target: Option<&TableStructure>,
-    source_dialect: Dialect,
-    target_dialect: Dialect,
-    options: CompareOptions,
+    context: CompareContext<'_>,
 ) -> TableDiff {
+    let options = context.options;
     let name = source
         .map(|t| t.name.clone())
         .or_else(|| target.map(|t| t.name.clone()))
@@ -365,13 +583,7 @@ fn diff_table(
     for column in &src.columns {
         match tgt.column(&column.name) {
             Some(existing) => {
-                let differences = column_differences(
-                    column,
-                    existing,
-                    source_dialect,
-                    target_dialect,
-                    options,
-                );
+                let differences = column_differences(column, existing, context);
                 diff.columns.push(ColumnDiff {
                     name: column.name.clone(),
                     kind: if differences.is_empty() {
@@ -513,15 +725,19 @@ fn diff_table(
 fn column_differences(
     source: &ColumnInfo,
     target: &ColumnInfo,
-    source_dialect: Dialect,
-    target_dialect: Dialect,
-    options: CompareOptions,
+    context: CompareContext<'_>,
 ) -> Vec<FieldChange> {
+    let options = context.options;
+    let source_dialect = context.source_dialect;
+    let target_dialect = context.target_dialect;
     let mut out = Vec::new();
 
     // Both endpoints are the same engine, so the declared types are directly
-    // comparable once display widths and whitespace are normalised.
-    if source.canonical_type() != target.canonical_type() {
+    // comparable once display widths, whitespace and the (necessarily
+    // different) namespace of a user-defined type are normalised away.
+    let source_type = context.localize(&source.canonical_type(), context.source_namespace);
+    let target_type = context.localize(&target.canonical_type(), context.target_namespace);
+    if source_type != target_type {
         out.push(FieldChange {
             field: "类型".into(),
             source: Some(source.full_type.clone()),
@@ -537,8 +753,14 @@ fn column_differences(
         });
     }
 
-    let source_default = source.default.clone().unwrap_or_default();
-    let target_default = target.default.clone().unwrap_or_default();
+    let source_default = context.localize(
+        &source.default.clone().unwrap_or_default(),
+        context.source_namespace,
+    );
+    let target_default = context.localize(
+        &target.default.clone().unwrap_or_default(),
+        context.target_namespace,
+    );
     if !defaults_match(source, target, &source_default, &target_default) {
         out.push(FieldChange {
             field: "默认值".into(),
@@ -667,6 +889,16 @@ fn fk_differences(source: &ForeignKeyInfo, target: &ForeignKeyInfo) -> Vec<Field
 /// quoting, whitespace, redundant parentheses and cast annotations: the same
 /// `amount * 2` comes back as ``(`amount` * 2)`` from MySQL and as
 /// `(amount * (2)::numeric)` from PostgreSQL.
+/// Whitespace/quote insensitive text used when comparing constraint bodies.
+fn normalize_type_text(value: &str) -> String {
+    value
+        .to_lowercase()
+        .replace('"', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn normalize_generation(value: Option<&str>) -> String {
     let Some(raw) = value else {
         return String::new();

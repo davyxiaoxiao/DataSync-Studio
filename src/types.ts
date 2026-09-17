@@ -150,6 +150,9 @@ export interface DiffSummary {
   indexChanges: number;
   foreignKeyChanges: number;
   primaryKeyChanges: number;
+  newTypes: number;
+  missingTypes: number;
+  changedTypes: number;
   newViews: number;
   missingViews: number;
   changedViews: number;
@@ -173,6 +176,26 @@ export interface ViewDiff {
   differences: FieldChange[];
 }
 
+export interface CustomType {
+  name: string;
+  /** "enum" | "domain" */
+  kind: string;
+  labels: string[];
+  baseType?: string | null;
+  domainNullable: boolean;
+  domainDefault?: string | null;
+  constraints: string[];
+  comment?: string | null;
+}
+
+export interface TypeDiff {
+  name: string;
+  kind: ChangeKind;
+  source?: CustomType | null;
+  target?: CustomType | null;
+  differences: FieldChange[];
+}
+
 export interface SchemaDiff {
   sourceNamespace: string;
   targetNamespace: string;
@@ -180,6 +203,7 @@ export interface SchemaDiff {
   targetDialect: Dialect;
   tables: TableDiff[];
   views: ViewDiff[];
+  types: TypeDiff[];
   summary: DiffSummary;
 }
 
@@ -301,6 +325,7 @@ export interface TableSelection {
 export interface SyncSelection {
   tables: TableSelection[];
   views: string[];
+  types: string[];
 }
 
 export interface TableEndpoint {

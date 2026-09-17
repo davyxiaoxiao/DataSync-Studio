@@ -4,8 +4,8 @@ use crate::db::value::ColumnKind;
 use crate::db::Pool;
 use crate::error::AppResult;
 use crate::schema::model::{
-    ColumnInfo, ForeignKeyInfo, IndexInfo, NamespaceInfo, TableStructure, TableSummary,
-    ViewStructure,
+    ColumnInfo, CustomType, ForeignKeyInfo, IndexInfo, NamespaceInfo, TableStructure,
+    TableSummary, ViewStructure,
 };
 
 const MYSQL_SYSTEM_SCHEMAS: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
@@ -235,6 +235,7 @@ async fn load_mysql_table(pool: &Pool, schema: &str, table: &str) -> AppResult<T
             comment: non_empty(row.get(8)),
             charset: non_empty(row.get(9)),
             collation: non_empty(row.get(10)),
+            udt_name: None,
         });
     }
 
@@ -421,7 +422,8 @@ async fn load_pg_table(pool: &Pool, schema: &str, table: &str) -> AppResult<Tabl
                           pg_get_expr(d.adbin, d.adrelid), \
                           col_description(a.attrelid, a.attnum), \
                           a.attidentity::text, a.attgenerated::text, \
-                          coll.collname \
+                          coll.collname, \
+                          CASE WHEN t.typtype IN ('e', 'd') THEN t.typname END \
                    FROM pg_catalog.pg_attribute a \
                    JOIN pg_catalog.pg_type t ON t.oid = a.atttypid \
                    LEFT JOIN pg_catalog.pg_attrdef d \
@@ -437,7 +439,7 @@ async fn load_pg_table(pool: &Pool, schema: &str, table: &str) -> AppResult<Tabl
         pool,
         col_sql,
         &[schema, table],
-        &[S, I, S, S, B, S, S, S, S, S],
+        &[S, I, S, S, B, S, S, S, S, S, S],
     )
     .await?;
 
@@ -508,6 +510,7 @@ async fn load_pg_table(pool: &Pool, schema: &str, table: &str) -> AppResult<Tabl
             comment: non_empty(row.get(6)),
             charset: None,
             collation,
+            udt_name: non_empty(row.get(10)),
         });
     }
 
@@ -736,4 +739,81 @@ fn contains_identifier(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// User-defined types (PostgreSQL only)
+// ---------------------------------------------------------------------------
+
+pub async fn list_custom_types(pool: &Pool, namespace: &str) -> AppResult<Vec<CustomType>> {
+    if matches!(pool, Pool::MySql(_)) {
+        // MySQL declares ENUM/SET inline on the column; there is no separate type.
+        return Ok(Vec::new());
+    }
+
+    let enum_sql = "SELECT t.typname, e.enumlabel, obj_description(t.oid, 'pg_type') \
+                    FROM pg_catalog.pg_type t \
+                    JOIN pg_catalog.pg_enum e ON e.enumtypid = t.oid \
+                    JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+                    WHERE n.nspname = $1 \
+                    ORDER BY t.typname, e.enumsortorder";
+    let enum_rows = query(pool, enum_sql, &[namespace], &[S, S, S]).await?;
+    let mut enums: Vec<CustomType> = Vec::new();
+    for row in enum_rows {
+        let name = row[0].clone();
+        match enums.iter_mut().find(|t| t.name == name) {
+            Some(existing) => existing.labels.push(row[1].clone()),
+            None => enums.push(CustomType {
+                name,
+                kind: "enum".into(),
+                labels: vec![row[1].clone()],
+                base_type: None,
+                domain_nullable: false,
+                domain_default: None,
+                constraints: Vec::new(),
+                comment: non_empty(row.get(2)),
+            }),
+        }
+    }
+
+    let domain_sql = "SELECT t.typname, format_type(t.typbasetype, t.typtypmod), \
+                             t.typnotnull, t.typdefault, obj_description(t.oid, 'pg_type') \
+                      FROM pg_catalog.pg_type t \
+                      JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+                      WHERE n.nspname = $1 AND t.typtype = 'd' \
+                      ORDER BY t.typname";
+    let domain_rows = query(pool, domain_sql, &[namespace], &[S, S, B, S, S]).await?;
+    let mut domains: Vec<CustomType> = Vec::new();
+    for row in domain_rows {
+        domains.push(CustomType {
+            name: row[0].clone(),
+            kind: "domain".into(),
+            labels: Vec::new(),
+            base_type: non_empty(row.get(1)),
+            domain_nullable: !as_bool(row.get(2).map(String::as_str).unwrap_or("f")),
+            domain_default: non_empty(row.get(3)),
+            constraints: Vec::new(),
+            comment: non_empty(row.get(4)),
+        });
+    }
+
+    if !domains.is_empty() {
+        let constraint_sql = "SELECT t.typname, c.conname, pg_get_constraintdef(c.oid) \
+                              FROM pg_catalog.pg_constraint c \
+                              JOIN pg_catalog.pg_type t ON t.oid = c.contypid \
+                              JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+                              WHERE n.nspname = $1 AND c.contype = 'c' \
+                              ORDER BY t.typname, c.conname";
+        let rows = query(pool, constraint_sql, &[namespace], &[S, S, S]).await?;
+        for row in rows {
+            if let Some(domain) = domains.iter_mut().find(|d| d.name == row[0]) {
+                domain.constraints.push(row[2].clone());
+            }
+        }
+    }
+
+    let mut all = enums;
+    all.extend(domains);
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(all)
 }

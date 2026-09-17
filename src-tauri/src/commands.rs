@@ -20,7 +20,7 @@ use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::jobs::ProgressReporter;
 use crate::schema::ddl::{generate, DdlStatement, SyncSelection};
-use crate::schema::diff::{compare_with_views, ChangeKind, CompareOptions, SchemaDiff};
+use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
 use crate::schema::model::{NamespaceInfo, TableStructure, TableSummary};
 use crate::state::{AppState, SchemaCompare};
@@ -404,18 +404,24 @@ pub(crate) async fn compare_schema_core(
     warnings.extend(target_warnings);
     reporter.check_cancelled()?;
 
-    reporter.force("introspect", "读取视图", 0, None, "正在读取视图定义");
+    reporter.force("introspect", "读取视图与自定义类型", 0, None, "正在读取视图与类型定义");
     let source_views = introspect::list_views(source_pool, source_namespace).await?;
     let target_views = introspect::list_views(target_pool, target_namespace).await?;
+    let source_types = introspect::list_custom_types(source_pool, source_namespace).await?;
+    let target_types = introspect::list_custom_types(target_pool, target_namespace).await?;
     reporter.check_cancelled()?;
 
-    let mut diff = compare_with_views(
+    let mut diff = compare_everything(
         &source_structures,
         &target_structures,
         &source_views,
         &target_views,
+        &source_types,
+        &target_types,
         source_pool.dialect(),
         target_pool.dialect(),
+        source_namespace,
+        target_namespace,
         options,
     );
     diff.source_namespace = source_namespace.to_string();

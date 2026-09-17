@@ -9,6 +9,7 @@ import { useJobProgress } from "../jobs";
 import { useStore } from "../store";
 import type {
   ChangeKind,
+  TypeDiff,
   ViewDiff,
   ColumnDiff,
   CompareSchemaResult,
@@ -62,6 +63,7 @@ export function StructureSyncView() {
   const [comparison, setComparison] = useState<CompareSchemaResult | null>(null);
   const [selection, setSelection] = useState<Record<string, TableSel>>({});
   const [viewSelection, setViewSelection] = useState<Record<string, boolean>>({});
+  const [typeSelection, setTypeSelection] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [filter, setFilter] = useState("");
   const [onlyChanges, setOnlyChanges] = useState(true);
@@ -82,6 +84,19 @@ export function StructureSyncView() {
           .map((view) => [
             view.name,
             mode === "all" ? true : mode === "none" ? false : view.kind !== "missing",
+          ]),
+      ),
+    [],
+  );
+
+  const buildTypeSelection = useCallback(
+    (result: CompareSchemaResult, mode: "safe" | "all" | "none") =>
+      Object.fromEntries(
+        result.diff.types
+          .filter((entry) => entry.kind !== "identical")
+          .map((entry) => [
+            entry.name,
+            mode === "all" ? true : mode === "none" ? false : entry.kind !== "missing",
           ]),
       ),
     [],
@@ -150,6 +165,7 @@ export function StructureSyncView() {
       setComparison(result);
       setSelection(buildSelection(result, "safe"));
       setViewSelection(buildViewSelection(result, "safe"));
+      setTypeSelection(buildTypeSelection(result, "safe"));
       for (const warning of result.warnings) log("warn", warning);
       const summary = result.diff.summary;
       log(
@@ -191,12 +207,16 @@ export function StructureSyncView() {
       views: Object.entries(viewSelection)
         .filter(([, enabled]) => enabled)
         .map(([name]) => name),
+      types: Object.entries(typeSelection)
+        .filter(([, enabled]) => enabled)
+        .map(([name]) => name),
     };
-  }, [selection, viewSelection]);
+  }, [selection, viewSelection, typeSelection]);
 
   const selectedCount = useMemo(
     () =>
       Object.values(viewSelection).filter(Boolean).length +
+      Object.values(typeSelection).filter(Boolean).length +
       Object.values(selection)
         .filter((s) => s.enabled)
         .reduce((total, s) => {
@@ -267,6 +287,14 @@ export function StructureSyncView() {
           table.name.toLowerCase().includes(keyword) ||
           table.columns.some((c) => c.name.toLowerCase().includes(keyword)),
       );
+  }, [diff, filter, onlyChanges]);
+
+  const visibleTypes = useMemo(() => {
+    if (!diff) return [];
+    const keyword = filter.trim().toLowerCase();
+    return diff.types
+      .filter((entry) => (onlyChanges ? entry.kind !== "identical" : true))
+      .filter((entry) => !keyword || entry.name.toLowerCase().includes(keyword));
   }, [diff, filter, onlyChanges]);
 
   const visibleViews = useMemo(() => {
@@ -396,6 +424,14 @@ export function StructureSyncView() {
                   </span>
                   <span className="cap">视图变更</span>
                 </div>
+                <div className="stat">
+                  <span className="num">
+                    {diff.summary.newTypes +
+                      diff.summary.changedTypes +
+                      diff.summary.missingTypes}
+                  </span>
+                  <span className="cap">自定义类型</span>
+                </div>
               </div>
             </div>
 
@@ -405,6 +441,7 @@ export function StructureSyncView() {
                 onClick={() => {
                   setSelection(buildSelection(comparison!, "safe"));
                   setViewSelection(buildViewSelection(comparison!, "safe"));
+                  setTypeSelection(buildTypeSelection(comparison!, "safe"));
                 }}
               >
                 默认选择（不含删除）
@@ -414,6 +451,7 @@ export function StructureSyncView() {
                 onClick={() => {
                   setSelection(buildSelection(comparison!, "all"));
                   setViewSelection(buildViewSelection(comparison!, "all"));
+                  setTypeSelection(buildTypeSelection(comparison!, "all"));
                 }}
               >
                 全选
@@ -423,6 +461,7 @@ export function StructureSyncView() {
                 onClick={() => {
                   setSelection(buildSelection(comparison!, "none"));
                   setViewSelection(buildViewSelection(comparison!, "none"));
+                  setTypeSelection(buildTypeSelection(comparison!, "none"));
                 }}
               >
                 全不选
@@ -485,6 +524,28 @@ export function StructureSyncView() {
                 没有符合条件的表
               </div>
             )}
+            {visibleTypes.length > 0 && (
+              <div className="node">
+                <div className="node-head" style={{ background: "var(--bg-subtle)" }}>
+                  <span style={{ width: 20 }} />
+                  <span className="name">自定义类型（enum / domain）</span>
+                  <span className="detail">{visibleTypes.length} 个有差异</span>
+                </div>
+                <div className="node-body" style={{ paddingLeft: 30 }}>
+                  {visibleTypes.map((entry) => (
+                    <TypeDiffRow
+                      key={entry.name}
+                      entry={entry}
+                      checked={typeSelection[entry.name] ?? false}
+                      onChange={(value) =>
+                        setTypeSelection((prev) => ({ ...prev, [entry.name]: value }))
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
             {visibleViews.length > 0 && (
               <div className="node">
                 <div className="node-head" style={{ background: "var(--bg-subtle)" }}>
@@ -746,6 +807,37 @@ function ViewDiffRow({
         {view.kind === "changed" && view.differences.length > 0
           ? `变更：${view.differences.map((d) => d.field).join("、")}`
           : ""}
+      </span>
+    </div>
+  );
+}
+
+function TypeDiffRow({
+  entry,
+  checked,
+  onChange,
+}: {
+  entry: TypeDiff;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="obj-row" title={entry.differences.map((d) => d.field).join(", ")}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        style={{ accentColor: "var(--accent)", marginLeft: 0 }}
+      />
+      <span className="badge" style={{ minWidth: 34, justifyContent: "center" }}>
+        {entry.source?.kind === "domain" ? "DOM" : "ENUM"}
+      </span>
+      <span className="obj-name">{entry.name}</span>
+      <span className={`badge ${changeTone(entry.kind) ?? ""}`}>{KIND_LABEL[entry.kind]}</span>
+      <span className="obj-detail">
+        {entry.kind === "changed"
+          ? `变更：${entry.differences.map((d) => d.field).join("、")}`
+          : (entry.source ?? entry.target)?.labels.join(", ") ?? ""}
       </span>
     </div>
   );
