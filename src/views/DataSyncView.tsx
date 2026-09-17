@@ -35,6 +35,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
   const [doUpdate, setDoUpdate] = useState(true);
   const [doDelete, setDoDelete] = useState(false);
   const [useTransaction, setUseTransaction] = useState(true);
+  const [refreshMatviews, setRefreshMatviews] = useState(true);
 
   const [applying, setApplying] = useState(false);
   const [runResult, setRunResult] = useState<SyncRunResult | null>(null);
@@ -113,6 +114,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
         update: doUpdate,
         delete: doDelete,
         useTransaction,
+        refreshMaterializedViews: refreshMatviews,
         jobId,
       });
       setRunResult(outcome);
@@ -275,6 +277,16 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
                 />
                 使用事务
               </label>
+              {connections.find((c) => c.id === target.connectionId)?.dialect === "postgres" && (
+                <label className="check" title="物化视图在创建时快照数据，写入后需要刷新才不会读到旧值">
+                  <input
+                    type="checkbox"
+                    checked={refreshMatviews}
+                    onChange={(event) => setRefreshMatviews(event.target.checked)}
+                  />
+                  同步后刷新物化视图
+                </label>
+              )}
               <div className="grow" />
               <span className="faint">共 {selectedStatements} 行受影响</span>
               <button className="btn" onClick={() => setPreviewOpen(true)} disabled={selectedStatements === 0}>

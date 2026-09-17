@@ -20,7 +20,7 @@ use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::jobs::ProgressReporter;
 use crate::schema::ddl::{generate, DdlStatement, SyncSelection};
-use crate::schema::diff::{compare, ChangeKind, CompareOptions, SchemaDiff};
+use crate::schema::diff::{compare_with_views, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
 use crate::schema::model::{NamespaceInfo, TableStructure, TableSummary};
 use crate::state::{AppState, SchemaCompare};
@@ -404,9 +404,16 @@ pub(crate) async fn compare_schema_core(
     warnings.extend(target_warnings);
     reporter.check_cancelled()?;
 
-    let mut diff = compare(
+    reporter.force("introspect", "读取视图", 0, None, "正在读取视图定义");
+    let source_views = introspect::list_views(source_pool, source_namespace).await?;
+    let target_views = introspect::list_views(target_pool, target_namespace).await?;
+    reporter.check_cancelled()?;
+
+    let mut diff = compare_with_views(
         &source_structures,
         &target_structures,
+        &source_views,
+        &target_views,
         source_pool.dialect(),
         target_pool.dialect(),
         options,
@@ -948,6 +955,7 @@ pub(crate) async fn compare_data_core(
         insert: insert_sql,
         update: update_sql,
         delete: delete_sql,
+        target_namespace: target.namespace.clone(),
         created_at: Instant::now(),
     };
 
@@ -1014,10 +1022,95 @@ pub struct ApplyDataRequest {
     pub delete: bool,
     #[serde(default = "default_true")]
     pub use_transaction: bool,
+    /// PostgreSQL materialised views snapshot their data at creation time, so
+    /// they must be refreshed after the underlying rows change.
+    #[serde(default = "default_true")]
+    pub refresh_materialized_views: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Engine-agnostic core of applying a data plan: execute the statements and,
+/// on PostgreSQL, refresh any materialised views so they are not left stale.
+pub(crate) async fn apply_data_plan(
+    pool: &Pool,
+    statements: &[String],
+    use_transaction: bool,
+    target_namespace: &str,
+    refresh: bool,
+    reporter: &ProgressReporter,
+) -> AppResult<(Vec<StatementOutcome>, Vec<String>, bool)> {
+    if statements.is_empty() {
+        return Ok((Vec::new(), Vec::new(), false));
+    }
+
+    let (mut outcomes, cancelled) = if use_transaction {
+        // MySQL cannot roll back DDL but DML is transactional on both engines.
+        let run = pool
+            .run_in_transaction_reporting(statements, reporter)
+            .await?;
+        (run.outcomes, run.cancelled)
+    } else {
+        let run = pool.run_script_reporting(statements, false, reporter).await;
+        (run.outcomes, run.cancelled)
+    };
+
+    let mut warnings = Vec::new();
+    if !cancelled && refresh {
+        refresh_materialized_views(pool, target_namespace, &mut outcomes, &mut warnings).await;
+    }
+    Ok((outcomes, warnings, cancelled))
+}
+
+/// Refresh every materialised view in a namespace.
+///
+/// A materialised view is populated when it is created, so rows written later
+/// would otherwise leave it stale. PostgreSQL is the only supported engine with
+/// them; on MySQL this is a no-op.
+async fn refresh_materialized_views(
+    pool: &Pool,
+    namespace: &str,
+    outcomes: &mut Vec<StatementOutcome>,
+    warnings: &mut Vec<String>,
+) {
+    if pool.dialect() != Dialect::Postgres {
+        return;
+    }
+    let views = match introspect::list_views(pool, namespace).await {
+        Ok(views) => views,
+        Err(err) => {
+            warnings.push(format!("读取物化视图失败，未刷新: {err}"));
+            return;
+        }
+    };
+    for view in views.iter().filter(|v| v.is_materialized()) {
+        let sql = format!(
+            "REFRESH MATERIALIZED VIEW {};",
+            pool.dialect().qualified(Some(namespace), &view.name)
+        );
+        let started = Instant::now();
+        match pool.execute(&sql).await {
+            Ok(affected) => outcomes.push(StatementOutcome {
+                sql,
+                ok: true,
+                rows_affected: affected,
+                error: None,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            }),
+            Err(err) => {
+                warnings.push(format!("刷新物化视图 {} 失败: {err}", view.name));
+                outcomes.push(StatementOutcome {
+                    sql,
+                    ok: false,
+                    rows_affected: 0,
+                    error: Some(err.to_string()),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -1027,49 +1120,52 @@ pub async fn apply_data_sync(
     request: ApplyDataRequest,
 ) -> AppResult<SyncRunResult> {
     let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
-    let statements = state
+
+    let plan = state
         .plans
         .with(&request.plan_id, |plan| {
-            plan.select(request.insert, request.update, request.delete)
+            (
+                plan.select(request.insert, request.update, request.delete),
+                plan.target_namespace.clone(),
+            )
         })
         .ok_or_else(|| AppError::msg("对比计划已过期，请重新对比"))?;
+    let (statements, target_namespace) = plan;
 
     if statements.is_empty() {
-        return Ok(summarize(Vec::new(), 0, "数据同步", Vec::new(), false));
+        end_job(&state, job);
+        return Ok(summarize(
+            Vec::new(),
+            0,
+            "数据同步",
+            Vec::new(),
+            false,
+        ));
     }
 
     let pool = pool_for(&state, &request.connection_id).await?;
     let started = Instant::now();
+    let outcome = apply_data_plan(
+        &pool,
+        &statements,
+        request.use_transaction,
+        &target_namespace,
+        request.refresh_materialized_views,
+        &reporter,
+    )
+    .await;
 
-    if request.use_transaction {
-        // MySQL cannot roll back DDL but DML is transactional on both engines.
-        let run = pool
-            .run_in_transaction_reporting(&statements, &reporter)
-            .await?;
-        state.plans.remove(&request.plan_id);
-        end_job(&state, job);
-        reporter.finish("done", "数据同步完成", "数据同步结束");
-        return Ok(summarize(
-            run.outcomes,
-            started.elapsed().as_millis() as u64,
-            "数据同步",
-            Vec::new(),
-            run.cancelled,
-        ));
-    }
-
-    let run = pool
-        .run_script_reporting(&statements, false, &reporter)
-        .await;
     state.plans.remove(&request.plan_id);
     end_job(&state, job);
     reporter.finish("done", "数据同步完成", "数据同步结束");
+
+    let (outcomes, warnings, cancelled) = outcome?;
     Ok(summarize(
-        run.outcomes,
+        outcomes,
         started.elapsed().as_millis() as u64,
         "数据同步",
-        Vec::new(),
-        run.cancelled,
+        warnings,
+        cancelled,
     ))
 }
 

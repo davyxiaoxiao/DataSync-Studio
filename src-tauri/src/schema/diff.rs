@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
-use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure};
+use crate::schema::model::{
+    ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +87,16 @@ impl TableDiff {
 
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewDiff {
+    pub name: String,
+    pub kind: ChangeKind,
+    pub source: Option<ViewStructure>,
+    pub target: Option<ViewStructure>,
+    pub differences: Vec<FieldChange>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffSummary {
@@ -98,6 +110,10 @@ pub struct DiffSummary {
     pub index_changes: usize,
     pub foreign_key_changes: usize,
     pub primary_key_changes: usize,
+    pub new_views: usize,
+    pub missing_views: usize,
+    pub changed_views: usize,
+    pub identical_views: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +124,7 @@ pub struct SchemaDiff {
     pub source_dialect: Dialect,
     pub target_dialect: Dialect,
     pub tables: Vec<TableDiff>,
+    pub views: Vec<ViewDiff>,
     pub summary: DiffSummary,
 }
 
@@ -130,9 +147,13 @@ impl Default for CompareOptions {
 
 /// Compare source (desired) against target (current) and describe what would
 /// have to change in the target to match the source.
-pub fn compare(
+/// Full comparison including views.
+#[allow(clippy::too_many_arguments)]
+pub fn compare_with_views(
     source: &[TableStructure],
     target: &[TableStructure],
+    source_views: &[ViewStructure],
+    target_views: &[ViewStructure],
     source_dialect: Dialect,
     target_dialect: Dialect,
     options: CompareOptions,
@@ -210,14 +231,90 @@ pub fn compare(
         }
     }
 
+    let views = diff_views(source_views, target_views);
+    for view in &views {
+        match view.kind {
+            ChangeKind::New => summary.new_views += 1,
+            ChangeKind::Missing => summary.missing_views += 1,
+            ChangeKind::Changed => summary.changed_views += 1,
+            ChangeKind::Identical => summary.identical_views += 1,
+        }
+    }
+
     SchemaDiff {
         source_namespace: String::new(),
         target_namespace: String::new(),
         source_dialect,
         target_dialect,
         tables,
+        views,
         summary,
     }
+}
+
+fn diff_views(source: &[ViewStructure], target: &[ViewStructure]) -> Vec<ViewDiff> {
+    let mut out = Vec::new();
+    for view in source {
+        match target.iter().find(|t| t.name == view.name) {
+            Some(existing) => {
+                let mut differences = Vec::new();
+                if view.kind != existing.kind {
+                    differences.push(FieldChange {
+                        field: "类型".into(),
+                        source: Some(view.kind.clone()),
+                        target: Some(existing.kind.clone()),
+                    });
+                }
+                if view.normalized_definition() != existing.normalized_definition() {
+                    differences.push(FieldChange {
+                        field: "定义".into(),
+                        source: Some(view.definition.clone()),
+                        target: Some(existing.definition.clone()),
+                    });
+                }
+                if view.comment.as_deref().unwrap_or("")
+                    != existing.comment.as_deref().unwrap_or("")
+                {
+                    differences.push(FieldChange {
+                        field: "注释".into(),
+                        source: view.comment.clone(),
+                        target: existing.comment.clone(),
+                    });
+                }
+                out.push(ViewDiff {
+                    name: view.name.clone(),
+                    kind: if differences.is_empty() {
+                        ChangeKind::Identical
+                    } else {
+                        ChangeKind::Changed
+                    },
+                    source: Some(view.clone()),
+                    target: Some(existing.clone()),
+                    differences,
+                });
+            }
+            None => out.push(ViewDiff {
+                name: view.name.clone(),
+                kind: ChangeKind::New,
+                source: Some(view.clone()),
+                target: None,
+                differences: Vec::new(),
+            }),
+        }
+    }
+    for existing in target {
+        if !source.iter().any(|v| v.name == existing.name) {
+            out.push(ViewDiff {
+                name: existing.name.clone(),
+                kind: ChangeKind::Missing,
+                source: None,
+                target: Some(existing.clone()),
+                differences: Vec::new(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 fn diff_table(

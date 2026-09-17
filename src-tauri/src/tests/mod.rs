@@ -11,8 +11,10 @@ use crate::data::{
 use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
 use crate::schema::ddl::{generate, SyncSelection, TableSelection};
-use crate::schema::diff::{compare, ChangeKind, CompareOptions};
-use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure};
+use crate::schema::diff::{compare_with_views, ChangeKind, CompareOptions};
+use crate::schema::model::{
+    ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure,
+};
 
 fn col(name: &str, family: &str, full_type: &str) -> ColumnInfo {
     ColumnInfo {
@@ -50,6 +52,7 @@ fn table(name: &str, columns: Vec<ColumnInfo>, pk: &[&str]) -> TableStructure {
 
 fn selection_for(tables: &[&str]) -> SyncSelection {
     SyncSelection {
+        views: Vec::new(),
         tables: tables
             .iter()
             .map(|name| TableSelection {
@@ -79,13 +82,7 @@ fn diff_reports_new_and_missing_tables() {
     let source = vec![table("only_in_source", vec![pk.clone()], &["id"])];
     let target = vec![table("only_in_target", vec![pk], &["id"])];
 
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     assert_eq!(diff.summary.new_tables, 1);
     assert_eq!(diff.summary.missing_tables, 1);
 
@@ -126,13 +123,7 @@ fn diff_classifies_column_changes() {
         &["id"],
     )];
 
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     assert_eq!(diff.summary.changed_tables, 1);
     assert_eq!(diff.summary.new_columns, 1);
     assert_eq!(diff.summary.changed_columns, 1);
@@ -151,13 +142,7 @@ fn diff_classifies_column_changes() {
 fn int_display_width_is_not_a_difference() {
     let source = vec![table("t", vec![col("id", "INT", "int")], &[])];
     let target = vec![table("t", vec![col("id", "INT", "int(11)")], &[])];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     assert_eq!(diff.tables[0].kind, ChangeKind::Identical);
 }
 
@@ -194,13 +179,7 @@ fn create_table_ddl_mysql_inlines_indexes_but_defers_foreign_keys() {
     });
 
     let source = vec![structure.clone()];
-    let diff = compare(
-        &source,
-        &[],
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &[], &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     let mut sources = HashMap::new();
     sources.insert("users".to_string(), structure);
 
@@ -247,13 +226,7 @@ fn create_table_ddl_postgres_splits_indexes_and_comments() {
     });
 
     let source = vec![structure.clone()];
-    let diff = compare(
-        &source,
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &[], &[], &[], Dialect::Postgres, Dialect::Postgres, CompareOptions::default());
     let mut sources = HashMap::new();
     sources.insert("users".to_string(), structure);
 
@@ -299,13 +272,7 @@ fn alter_plan_orders_drops_before_adds() {
         vec![col("id", "INT", "int"), col("gone", "TEXT", "text")],
         &[],
     )];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
     let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
     assert_eq!(categories, vec!["drop_column", "add_column"]);
@@ -322,23 +289,21 @@ fn selection_filters_out_destructive_and_deselected_work() {
         .push(col("added", "VARCHAR", "varchar(32)"));
     let source = vec![source_structure.clone()];
     let target = vec![table("t", vec![col("id", "INT", "int")], &[])];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
 
     let mut sources = HashMap::new();
     sources.insert("t".to_string(), source_structure);
 
     // Nothing selected -> empty plan.
-    let empty = SyncSelection { tables: Vec::new() };
+    let empty = SyncSelection {
+        tables: Vec::new(),
+        views: Vec::new(),
+    };
     assert!(generate(&diff, &sources, Some(&empty), None, &mut Vec::new()).is_empty());
 
     // Only the `added` column explicitly.
     let selective = SyncSelection {
+        views: Vec::new(),
         tables: vec![TableSelection {
             name: "t".into(),
             whole_table: false,
@@ -357,13 +322,7 @@ fn selection_filters_out_destructive_and_deselected_work() {
 fn dropping_a_table_can_be_selected_out() {
     let source: Vec<TableStructure> = Vec::new();
     let target = vec![table("obsolete", vec![col("id", "INT", "int")], &[])];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     assert_eq!(diff.tables[0].kind, ChangeKind::Missing);
 
     // Default selection (everything on) drops it.
@@ -373,6 +332,7 @@ fn dropping_a_table_can_be_selected_out() {
 
     // Explicitly deselected -> nothing happens.
     let none = SyncSelection {
+        views: Vec::new(),
         tables: vec![TableSelection {
             name: "obsolete".into(),
             whole_table: false,
@@ -723,13 +683,7 @@ fn generated_column_ddl_is_reproduced_per_dialect() {
     let mysql_column = generated_col("total", "DECIMAL", "decimal(12,2)", "(`amount` * 2)");
     let structure = table_with_column(mysql_column);
     let source = vec![structure.clone()];
-    let diff = compare(
-        &source,
-        &[],
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &[], &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     let mut sources = HashMap::new();
     sources.insert("orders".to_string(), structure);
     let mut warnings = Vec::new();
@@ -747,13 +701,7 @@ fn generated_column_ddl_is_reproduced_per_dialect() {
     let pg_column = generated_col("total", "DECIMAL", "numeric(12,2)", "(amount * 2)");
     let structure = table_with_column(pg_column);
     let source = vec![structure.clone()];
-    let diff = compare(
-        &source,
-        &[],
-        Dialect::Postgres,
-        Dialect::Postgres,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &[], &[], &[], Dialect::Postgres, Dialect::Postgres, CompareOptions::default());
     let mut sources = HashMap::new();
     sources.insert("orders".to_string(), structure);
     let mut warnings = Vec::new();
@@ -778,13 +726,7 @@ fn generated_column_is_not_a_default() {
 
     let source = vec![table_with_column(generated)];
     let target = vec![table_with_column(plain)];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     let fields: Vec<&str> = diff.tables[0].columns[1]
         .differences
         .iter()
@@ -809,13 +751,7 @@ fn same_generation_expression_with_different_formatting_is_identical() {
         "decimal(12,2)",
         "((`amount`  *  2))",
     ))];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
+    let diff = compare_with_views(&source, &target, &[], &[], Dialect::Mysql, Dialect::Mysql, CompareOptions::default());
     assert_eq!(diff.tables[0].kind, ChangeKind::Identical, "{:#?}", diff.tables[0]);
 }
 
@@ -859,4 +795,269 @@ fn reporter_observes_the_cancellation_flag() {
     assert!(reporter.is_cancelled());
     let error = reporter.check_cancelled().expect_err("取消后应返回错误");
     assert!(error.to_string().contains("已取消"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Views
+// ---------------------------------------------------------------------------
+
+fn view(name: &str, definition: &str, dependencies: &[&str]) -> ViewStructure {
+    ViewStructure {
+        name: name.into(),
+        kind: "view".into(),
+        definition: definition.into(),
+        comment: None,
+        dependencies: dependencies.iter().map(|d| (*d).to_string()).collect(),
+    }
+}
+
+fn base_table() -> TableStructure {
+    table(
+        "users",
+        vec![col("id", "INT", "int"), col("email", "VARCHAR", "varchar(64)")],
+        &["id"],
+    )
+}
+
+fn plan_for(
+    source_tables: Vec<TableStructure>,
+    source_views: Vec<ViewStructure>,
+    target_tables: Vec<TableStructure>,
+    target_views: Vec<ViewStructure>,
+    dialect: Dialect,
+) -> Vec<crate::schema::ddl::DdlStatement> {
+    let diff = compare_with_views(
+        &source_tables,
+        &target_tables,
+        &source_views,
+        &target_views,
+        dialect,
+        dialect,
+        CompareOptions::default(),
+    );
+    let sources: HashMap<String, TableStructure> =
+        source_tables.into_iter().map(|t| (t.name.clone(), t)).collect();
+    let selection = SyncSelection {
+        tables: Vec::new(),
+        views: Vec::new(),
+    };
+    // An empty selection means "nothing"; use a permissive one instead.
+    let permissive = SyncSelection {
+        tables: diff
+            .tables
+            .iter()
+            .filter(|t| t.kind != ChangeKind::Identical)
+            .map(|t| TableSelection {
+                name: t.name.clone(),
+                whole_table: true,
+                columns: t.columns.iter().map(|c| c.name.clone()).collect(),
+                primary_key: true,
+                indexes: t.indexes.iter().map(|i| i.name.clone()).collect(),
+                foreign_keys: t.foreign_keys.iter().map(|f| f.name.clone()).collect(),
+            })
+            .collect(),
+        views: diff.views.iter().map(|v| v.name.clone()).collect(),
+    };
+    let _ = selection;
+    generate(&diff, &sources, Some(&permissive), None, &mut Vec::new())
+}
+
+#[test]
+fn view_diff_classifies_each_case() {
+    let diff = compare_with_views(
+        &[base_table()],
+        &[base_table()],
+        &[
+            view("v_new", "select 1", &[]),
+            view("v_changed", "select id from users", &["users"]),
+            view("v_same", "select 1", &[]),
+        ],
+        &[
+            view("v_changed", "select email from users", &["users"]),
+            view("v_same", "select 1", &[]),
+            view("v_gone", "select 1", &[]),
+        ],
+        Dialect::Mysql,
+        Dialect::Mysql,
+        CompareOptions::default(),
+    );
+    assert_eq!(diff.summary.new_views, 1);
+    assert_eq!(diff.summary.changed_views, 1);
+    assert_eq!(diff.summary.missing_views, 1);
+    assert_eq!(diff.summary.identical_views, 1);
+
+    let by_name = |name: &str| diff.views.iter().find(|v| v.name == name).unwrap();
+    assert_eq!(by_name("v_new").kind, ChangeKind::New);
+    assert_eq!(by_name("v_changed").kind, ChangeKind::Changed);
+    assert_eq!(by_name("v_same").kind, ChangeKind::Identical);
+    assert_eq!(by_name("v_gone").kind, ChangeKind::Missing);
+    assert_eq!(by_name("v_changed").differences[0].field, "定义");
+}
+
+#[test]
+fn view_definition_comparison_ignores_formatting() {
+    let diff = compare_with_views(
+        &[base_table()],
+        &[base_table()],
+        &[view("v", "SELECT  `id`  FROM `users`", &["users"])],
+        &[view("v", "select id from users", &["users"])],
+        Dialect::Mysql,
+        Dialect::Mysql,
+        CompareOptions::default(),
+    );
+    assert_eq!(diff.views[0].kind, ChangeKind::Identical);
+}
+
+#[test]
+fn views_are_dropped_first_and_created_last() {
+    let plan = plan_for(
+        vec![base_table()],
+        vec![view("v_users", "select id from users", &["users"])],
+        vec![],
+        vec![],
+        Dialect::Mysql,
+    );
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert_eq!(
+        categories,
+        vec!["create_table", "create_view"],
+        "视图必须在建表之后创建"
+    );
+    assert!(plan[1].sql.contains("CREATE OR REPLACE VIEW `v_users` AS select id from users"));
+}
+
+#[test]
+fn materialised_view_uses_the_postgres_form() {
+    let mut matview = view("mv_users", "SELECT id FROM users", &["users"]);
+    matview.kind = "materialized".into();
+    let plan = plan_for(
+        vec![base_table()],
+        vec![matview],
+        vec![],
+        vec![],
+        Dialect::Postgres,
+    );
+    let create = plan
+        .iter()
+        .find(|s| s.category == "create_view")
+        .expect("应生成物化视图");
+    assert!(
+        create
+            .sql
+            .contains("CREATE MATERIALIZED VIEW \"mv_users\" AS SELECT id FROM users WITH DATA"),
+        "{}",
+        create.sql
+    );
+}
+
+#[test]
+fn a_table_change_rebuilds_dependent_views_in_dependency_order() {
+    // `users.name` widens, so `v_users` (which reads it) must be rebuilt, and
+    // `v_emails` (which reads `v_users`) must be rebuilt after it.
+    let mut target_users = base_table();
+    target_users.columns[1].full_type = "varchar(32)".into();
+
+    let plan = plan_for(
+        vec![base_table()],
+        vec![
+            view("v_users", "select id, name from users", &["users"]),
+            view("v_emails", "select email from v_users", &["v_users"]),
+        ],
+        vec![target_users],
+        vec![
+            view("v_users", "select id, name from users", &["users"]),
+            view("v_emails", "select email from v_users", &["v_users"]),
+        ],
+        Dialect::Postgres,
+    );
+
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert_eq!(
+        categories,
+        vec!["drop_view", "drop_view", "modify_column", "create_view", "create_view"],
+        "应先删视图（逆依赖序）再改表，最后按依赖序重建：{categories:?}"
+    );
+    // Reverse dependency order on the way out: the consumer goes first.
+    assert!(plan[0].sql.contains("\"v_emails\""), "{}", plan[0].sql);
+    assert!(plan[1].sql.contains("\"v_users\""), "{}", plan[1].sql);
+    // Dependency order on the way back in.
+    assert!(plan[3].sql.contains("\"v_users\""), "{}", plan[3].sql);
+    assert!(plan[4].sql.contains("\"v_emails\""), "{}", plan[4].sql);
+}
+
+#[test]
+fn a_deselected_dependent_view_is_still_rebuilt() {
+    let mut target_users = base_table();
+    target_users.columns[1].full_type = "varchar(32)".into();
+
+    let diff = compare_with_views(
+        &[base_table()],
+        &[target_users],
+        &[view("v_users", "select name from users", &["users"])],
+        &[view("v_users", "select name from users", &["users"])],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        CompareOptions::default(),
+    );
+    let mut warnings = Vec::new();
+    let plan = generate(
+        &diff,
+        &HashMap::new(),
+        // The table change is selected but the view is left unchecked.
+        Some(&SyncSelection {
+            tables: diff
+                .tables
+                .iter()
+                .map(|t| TableSelection {
+                    name: t.name.clone(),
+                    whole_table: true,
+                    columns: t.columns.iter().map(|c| c.name.clone()).collect(),
+                    primary_key: true,
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                })
+                .collect(),
+            views: Vec::new(),
+        }),
+        None,
+        &mut warnings,
+    );
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert!(
+        categories.contains(&"drop_view") && categories.contains(&"create_view"),
+        "依赖视图必须自动重建: {categories:?}"
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("自动加入重建列表"), "{warnings:?}");
+}
+
+#[test]
+fn dropping_a_view_is_selected_out_by_default() {
+    let diff = compare_with_views(
+        &[base_table()],
+        &[base_table()],
+        &[],
+        &[view("v_gone", "select 1", &[])],
+        Dialect::Mysql,
+        Dialect::Mysql,
+        CompareOptions::default(),
+    );
+    // `None` means "apply everything", so the drop is planned.
+    let plan = generate(&diff, &HashMap::new(), None, None, &mut Vec::new());
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].category, "drop_view");
+    assert!(plan[0].sql.contains("DROP VIEW IF EXISTS `v_gone`"));
+
+    // An explicit selection that omits it applies nothing.
+    let plan = generate(
+        &diff,
+        &HashMap::new(),
+        Some(&SyncSelection {
+            tables: Vec::new(),
+            views: Vec::new(),
+        }),
+        None,
+        &mut Vec::new(),
+    );
+    assert!(plan.is_empty());
 }

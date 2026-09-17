@@ -10,6 +10,8 @@ pub struct DataPlan {
     pub insert: Vec<String>,
     pub update: Vec<String>,
     pub delete: Vec<String>,
+    /// Target namespace, needed to refresh materialised views afterwards.
+    pub target_namespace: String,
     pub created_at: Instant,
 }
 

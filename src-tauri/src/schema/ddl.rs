@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
 use crate::schema::diff::{ChangeKind, SchemaDiff, TableDiff};
-use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure};
+use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure, ViewStructure};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +41,9 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct SyncSelection {
     pub tables: Vec<TableSelection>,
+    /// Names of the views/ materialised views to apply.
+    #[serde(default)]
+    pub views: Vec<String>,
 }
 
 impl SyncSelection {
@@ -258,6 +261,98 @@ fn index_ddl(index: &IndexInfo, table: &str, target: Dialect, schema: Option<&st
         // CREATE INDEX; the index is created in the table's schema.
         Dialect::Postgres => format!("CREATE {unique}INDEX {} ON {tref} ({cols})", q(&index.name)),
     }
+}
+
+fn view_keyword(view: &ViewStructure, target: Dialect) -> &'static str {
+    if view.is_materialized() && target == Dialect::Postgres {
+        "MATERIALIZED VIEW"
+    } else {
+        "VIEW"
+    }
+}
+
+/// Rewrite a view body so that references to the source namespace point at the
+/// target namespace.
+///
+/// Both engines qualify the relations a view reads: PostgreSQL renders
+/// `FROM ns.table` and MySQL renders ``from `ns`.`table` ``. Copying the body
+/// verbatim would leave the target's view reading the *source* database, which
+/// is both wrong and invisible until the two databases diverge.
+fn remap_view_schema(definition: &str, source_schema: &str, target_schema: &str) -> String {
+    if source_schema.is_empty() || source_schema == target_schema {
+        return definition.to_string();
+    }
+    let mut out = definition.to_string();
+    for quote in ['"', '`'] {
+        let from = format!("{quote}{source_schema}{quote}.");
+        let to = format!("{quote}{target_schema}{quote}.");
+        out = out.replace(&from, &to);
+    }
+    replace_qualifier(&out, source_schema, target_schema)
+}
+
+/// Replace `schema.` when `schema` stands alone as an identifier, case
+/// insensitively and without touching longer identifiers that merely contain it.
+fn replace_qualifier(input: &str, from: &str, to: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let needle: Vec<char> = from.to_lowercase().chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let fits = i + needle.len() < chars.len()
+            && chars[i..i + needle.len()]
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .eq(needle.iter().copied())
+            && chars[i + needle.len()] == '.';
+        let boundary = i == 0 || {
+            let previous = chars[i - 1];
+            !(previous.is_alphanumeric() || previous == '_' || previous == '"' || previous == '`')
+        };
+        if fits && boundary {
+            out.push_str(to);
+            out.push('.');
+            i += needle.len() + 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn create_view_ddl(
+    view: &ViewStructure,
+    target: Dialect,
+    schema: Option<&str>,
+    source_schema: &str,
+) -> String {
+    let qualified = target.qualified(schema, &view.name);
+    let body = remap_view_schema(
+        view.definition.trim().trim_end_matches(';'),
+        source_schema,
+        schema.unwrap_or(""),
+    );
+    if view.is_materialized() && target == Dialect::Postgres {
+        // PostgreSQL has no CREATE OR REPLACE for materialised views; the
+        // planner always drops them first.
+        format!("CREATE MATERIALIZED VIEW {qualified} AS {body} WITH DATA;")
+    } else {
+        format!("CREATE OR REPLACE VIEW {qualified} AS {body};")
+    }
+}
+
+fn drop_view_ddl(view: &ViewStructure, target: Dialect, schema: Option<&str>) -> String {
+    let keyword = view_keyword(view, target);
+    format!(
+        "DROP {keyword} IF EXISTS {};",
+        target.qualified(schema, &view.name)
+    )
+}
+
+/// PostgreSQL cannot replace a materialised view in place.
+fn needs_drop_before_create(view: &ViewStructure, target: Dialect) -> bool {
+    view.is_materialized() && target == Dialect::Postgres
 }
 
 fn drop_index_ddl(index: &IndexInfo, table: &str, target: Dialect, schema: Option<&str>) -> String {
@@ -695,6 +790,15 @@ pub fn generate(
         None => true,
     };
 
+    let (drop_views, create_views) = plan_views(
+        diff,
+        selection,
+        target,
+        target_schema,
+        &diff.source_namespace,
+        warnings,
+    );
+
     let mut drop_fks: Vec<DdlStatement> = Vec::new();
     let mut drop_tables: Vec<DdlStatement> = Vec::new();
     let mut create_tables: Vec<DdlStatement> = Vec::new();
@@ -942,13 +1046,184 @@ pub fn generate(
     }
 
     let mut plan = Vec::new();
+    // Views are dropped before any table work (PostgreSQL refuses to alter a
+    // table a view depends on) and recreated once every table exists.
+    plan.extend(drop_views);
     plan.extend(drop_fks);
     plan.extend(drop_tables);
     plan.extend(create_tables);
     plan.extend(body);
     plan.extend(add_indexes);
     plan.extend(add_fks);
+    plan.extend(create_views);
     plan
+}
+
+/// Work out which views must be dropped and recreated, and in what order.
+///
+/// A view is rebuilt when it is added, changed, or when it reads from a table
+/// (or another rebuilt view) that is itself changing — otherwise PostgreSQL
+/// would reject the column change underneath it.
+fn plan_views(
+    diff: &SchemaDiff,
+    selection: Option<&SyncSelection>,
+    target: Dialect,
+    target_schema: Option<&str>,
+    source_schema: &str,
+    warnings: &mut Vec<String>,
+) -> (Vec<DdlStatement>, Vec<DdlStatement>) {
+    if diff.views.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let selected: Option<std::collections::HashSet<&str>> = selection.map(|s| {
+        s.views
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<&str>>()
+    });
+    let is_selected = |name: &str| match &selected {
+        Some(set) => set.contains(name),
+        None => true,
+    };
+
+    let mut changed_relations: std::collections::HashSet<String> = diff
+        .tables
+        .iter()
+        .filter(|t| t.kind != ChangeKind::Identical)
+        .map(|t| t.name.clone())
+        .collect();
+
+    // Transitive closure over the view dependency graph.
+    let mut rebuild: std::collections::HashSet<String> = diff
+        .views
+        .iter()
+        .filter(|v| v.kind == ChangeKind::New || v.kind == ChangeKind::Changed)
+        .filter(|v| is_selected(&v.name))
+        .map(|v| v.name.clone())
+        .collect();
+
+    loop {
+        let mut added = false;
+        for view in &diff.views {
+            if view.kind == ChangeKind::Missing || rebuild.contains(&view.name) {
+                continue;
+            }
+            let Some(source) = view.source.as_ref() else {
+                continue;
+            };
+            // An unchanged view that a user explicitly deselected is still
+            // rebuilt when it sits on top of a change, because leaving it in
+            // place would make the change fail.
+            if source
+                .dependencies
+                .iter()
+                .any(|dependency| changed_relations.contains(dependency))
+            {
+                if !is_selected(&view.name) {
+                    warnings.push(format!(
+                        "视图 {} 依赖于本次变更的表，已自动加入重建列表",
+                        view.name
+                    ));
+                }
+                rebuild.insert(view.name.clone());
+                changed_relations.insert(view.name.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    // Topological order: dependencies first, cycles fall back to name order.
+    let mut ordered: Vec<&crate::schema::diff::ViewDiff> = Vec::new();
+    let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending: Vec<&crate::schema::diff::ViewDiff> = diff
+        .views
+        .iter()
+        .filter(|v| rebuild.contains(&v.name))
+        .collect();
+    pending.sort_by(|a, b| a.name.cmp(&b.name));
+    while !pending.is_empty() {
+        let mut progressed = false;
+        let mut index = 0;
+        while index < pending.len() {
+            let view = pending[index];
+            let ready = view
+                .source
+                .as_ref()
+                .map(|source| {
+                    source.dependencies.iter().all(|dependency| {
+                        !rebuild.contains(dependency) || placed.contains(dependency)
+                    })
+                })
+                .unwrap_or(true);
+            if ready {
+                placed.insert(view.name.clone());
+                ordered.push(view);
+                pending.remove(index);
+                progressed = true;
+            } else {
+                index += 1;
+            }
+        }
+        if !progressed {
+            // Circular view definitions: emit the rest in name order.
+            for view in pending.drain(..) {
+                placed.insert(view.name.clone());
+                ordered.push(view);
+            }
+        }
+    }
+
+    let mut drops: Vec<DdlStatement> = Vec::new();
+    // Views that disappear entirely are dropped but never recreated.
+    for view in diff.views.iter().filter(|v| v.kind == ChangeKind::Missing) {
+        if !is_selected(&view.name) {
+            continue;
+        }
+        if let Some(existing) = view.target.as_ref() {
+            drops.push(DdlStatement {
+                table: view.name.clone(),
+                category: "drop_view".into(),
+                object: view.name.clone(),
+                sql: drop_view_ddl(existing, target, target_schema),
+            });
+        }
+    }
+    // Rebuilt views are dropped in reverse dependency order. A view that does
+    // not exist on the target yet needs no drop: CREATE OR REPLACE creates it.
+    for view in ordered.iter().rev() {
+        if view.target.is_none() {
+            continue;
+        }
+        if let Some(source) = view.source.as_ref() {
+            drops.push(DdlStatement {
+                table: view.name.clone(),
+                category: "drop_view".into(),
+                object: view.name.clone(),
+                sql: drop_view_ddl(source, target, target_schema),
+            });
+        }
+    }
+
+    let mut creates: Vec<DdlStatement> = Vec::new();
+    for view in ordered {
+        if let Some(source) = view.source.as_ref() {
+            creates.push(DdlStatement {
+                table: view.name.clone(),
+                category: "create_view".into(),
+                object: view.name.clone(),
+                sql: create_view_ddl(source, target, target_schema, source_schema),
+            });
+        }
+    }
+
+    // A materialised view cannot be replaced in place, so the drop is always
+    // emitted above; nothing further is needed here.
+    let _ = needs_drop_before_create;
+    (drops, creates)
 }
 
 fn diff_has_comment_change(table: &TableDiff) -> bool {

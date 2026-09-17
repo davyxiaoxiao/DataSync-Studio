@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::{compare_data_core, compare_schema_core};
+use crate::commands::{apply_data_plan, compare_data_core, compare_schema_core};
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
 use crate::dialect::Dialect;
@@ -91,7 +91,31 @@ async fn exec_all(pool: &Pool, statements: &[String]) {
     }
 }
 
-/// Run a generated plan and fail loudly on the first error, printing the SQL.
+/// Apply a data plan through the same core the command layer uses, so the
+/// materialised-view refresh is covered too.
+async fn apply_data(target_pool: &Pool, target_ns: &str, statements: Vec<String>) -> Vec<String> {
+    let (outcomes, warnings, cancelled) = apply_data_plan(
+        target_pool,
+        &statements,
+        true,
+        target_ns,
+        true,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("数据同步失败: {e}"));
+    assert!(!cancelled, "数据同步不应被取消");
+    let failures: Vec<String> = outcomes
+        .iter()
+        .filter(|o| !o.ok)
+        .map(|o| format!("{}\n  -> {}", o.sql, o.error.clone().unwrap_or_default()))
+        .collect();
+    assert!(failures.is_empty(), "数据同步有语句失败:\n{}", failures.join("\n"));
+    assert!(warnings.is_empty(), "数据同步产生告警: {warnings:?}");
+    warnings
+}
+
+/// Run a generated schema plan and fail loudly on the first error, printing the SQL.
 async fn run_plan(pool: &Pool, statements: Vec<String>) {
     let run = pool
         .run_script_reporting(&statements, false, &ProgressReporter::inert())
@@ -197,6 +221,48 @@ fn source_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
     }
 }
 
+/// Views on top of the source tables: one direct, one layered on the first, and
+/// on PostgreSQL additionally a materialised view.
+fn source_view_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
+    let users = dialect.qualified(Some(ns), "users");
+    let v_users = dialect.qualified(Some(ns), "v_users");
+    let v_emails = dialect.qualified(Some(ns), "v_user_emails");
+    let mv_users = dialect.qualified(Some(ns), "mv_users");
+    match dialect {
+        Dialect::Mysql => vec![
+            format!("CREATE VIEW {v_users} AS SELECT `id`, `email`, `name` FROM {users}"),
+            format!("CREATE VIEW {v_emails} AS SELECT `email` FROM {v_users}"),
+        ],
+        Dialect::Postgres => vec![
+            format!("CREATE VIEW {v_users} AS SELECT \"id\", \"email\", \"name\" FROM {users}"),
+            format!("CREATE VIEW {v_emails} AS SELECT \"email\" FROM {v_users}"),
+            format!(
+                "CREATE MATERIALIZED VIEW {mv_users} AS SELECT \"id\", \"email\" FROM {users} WITH DATA"
+            ),
+        ],
+    }
+}
+
+/// Drop the source-side views in reverse dependency order.
+fn drop_view_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
+    let mut names: Vec<&str> = view_names(dialect);
+    names.reverse();
+    names
+        .into_iter()
+        .map(|name| {
+            let keyword = if name.starts_with("mv_") && dialect == Dialect::Postgres {
+                "MATERIALIZED VIEW"
+            } else {
+                "VIEW"
+            };
+            format!(
+                "DROP {keyword} IF EXISTS {}",
+                dialect.qualified(Some(ns), name)
+            )
+        })
+        .collect()
+}
+
 /// Structural drift applied to the *source* after the first sync: one added
 /// column, one widened column, one dropped column, one retyped column, one new
 /// index and one new column default.
@@ -268,6 +334,54 @@ fn drift_data_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
     }
 }
 
+fn view_names(dialect: Dialect) -> Vec<&'static str> {
+    match dialect {
+        Dialect::Mysql => vec!["v_users", "v_user_emails"],
+        Dialect::Postgres => vec!["v_users", "v_user_emails", "mv_users"],
+    }
+}
+
+/// Refresh the *source* materialised views after seeding.
+///
+/// The test creates them before the data exists, and nothing syncs into the
+/// source, so a source-side DBA would refresh them by hand. The target side is
+/// left alone: refreshing it is what the tool must do.
+async fn refresh_source_matviews(pool: &Pool, dialect: Dialect, ns: &str) {
+    if dialect != Dialect::Postgres {
+        return;
+    }
+    let views = crate::schema::introspect::list_views(pool, ns)
+        .await
+        .expect("list source views");
+    for view in views.iter().filter(|v| v.is_materialized()) {
+        exec(
+            pool,
+            &format!(
+                "REFRESH MATERIALIZED VIEW {}",
+                dialect.qualified(Some(ns), &view.name)
+            ),
+        )
+        .await;
+    }
+}
+
+/// `SELECT COUNT(*)` through a view on the target side.
+async fn scalar_count(pool: &Pool, namespace: &str, name: &str, dialect: Dialect) -> i64 {
+    let sql = format!(
+        "SELECT COUNT(*) FROM {}",
+        dialect.qualified(Some(namespace), name)
+    );
+    let rows = pool
+        .fetch(&sql, &[], &[crate::db::value::ColumnKind::Int])
+        .await
+        .unwrap_or_else(|e| panic!("查询视图 {name} 失败: {e}"));
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(|value| value.display())
+        .and_then(|text| text.parse().ok())
+        .unwrap_or_else(|| panic!("视图 {name} 未返回计数: {rows:?}"))
+}
+
 fn assert_structurally_identical(diff: &crate::schema::diff::SchemaDiff, context: &str) {
     let remaining: Vec<String> = diff
         .tables
@@ -329,6 +443,7 @@ async fn roundtrip(
 ) {
     // ---- 1. build the source schema ------------------------------------
     exec_all(source_pool, &source_ddl(source_dialect, source_ns)).await;
+    exec_all(source_pool, &source_view_ddl(source_dialect, source_ns)).await;
 
     // ---- 2. sync structure into an empty target ------------------------
     let (diff, sources, _warnings) = compare_schema_core(
@@ -344,6 +459,12 @@ async fn roundtrip(
     assert_eq!(
         diff.summary.new_tables, 2,
         "{tag}: 期望空目标库有 2 张新表, 实际 {:?}",
+        diff.summary
+    );
+    let expected_views = if source_dialect == Dialect::Postgres { 3 } else { 2 };
+    assert_eq!(
+        diff.summary.new_views, expected_views,
+        "{tag}: 期望空目标库有 {expected_views} 个视图, 实际 {:?}",
         diff.summary
     );
 
@@ -363,9 +484,32 @@ async fn roundtrip(
     .await
     .expect("re-compare schema");
     assert_structurally_identical(&after, &format!("{tag} 首次同步"));
+    for name in view_names(source_dialect) {
+        let count = scalar_count(target_pool, target_ns, name, target_dialect).await;
+        assert_eq!(count, 0, "{tag}: 目标端视图 {name} 应可查询且为空");
+    }
+    // Regression guard: the copied view body must read from the *target*
+    // namespace. Copying it verbatim would leave the target's views reading the
+    // source database, which stays invisible while the two hold the same rows.
+    for view in crate::schema::introspect::list_views(target_pool, target_ns)
+        .await
+        .expect("list target views")
+    {
+        assert!(
+            !view.definition.contains(source_ns),
+            "{tag}: 目标端视图 {} 仍然引用源库 {source_ns}：{}",
+            view.name,
+            view.definition
+        );
+    }
 
     // ---- 4. introduce structural drift on the source -------------------
+    // PostgreSQL refuses to alter a column that a view depends on, so the
+    // test cycles its own source views around the drift. The *target* side is
+    // left untouched: rebuilding its views is exactly what is under test.
+    exec_all(source_pool, &drop_view_ddl(source_dialect, source_ns)).await;
     exec_all(source_pool, &drift_ddl(source_dialect, source_ns)).await;
+    exec_all(source_pool, &source_view_ddl(source_dialect, source_ns)).await;
 
     let (drift, drift_sources, _) = compare_schema_core(
         source_pool,
@@ -405,9 +549,16 @@ async fn roundtrip(
     .await
     .expect("re-compare after drift");
     assert_structurally_identical(&after_drift, &format!("{tag} 结构漂移同步"));
+    // `users.name` was widened and `bio` dropped while views depended on the
+    // table: PostgreSQL only allows that because the views were rebuilt.
+    for name in view_names(source_dialect) {
+        let count = scalar_count(target_pool, target_ns, name, target_dialect).await;
+        assert_eq!(count, 0, "{tag}: 漂移同步后视图 {name} 仍应可查询");
+    }
 
     // ---- 5. seed data on the source only -------------------------------
     exec_all(source_pool, &data_ddl(source_dialect, source_ns)).await;
+    refresh_source_matviews(source_pool, source_dialect, source_ns).await;
     let _ = target_dialect;
 
     let source_ep = TableEndpoint {
@@ -428,7 +579,7 @@ async fn roundtrip(
     assert_eq!(result.summary.updates, 0);
     assert_eq!(result.summary.deletes, 0);
 
-    run_plan(target_pool, plan.select(true, true, true)).await;
+    apply_data(target_pool, target_ns, plan.select(true, true, true)).await;
 
     let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100, &ProgressReporter::inert())
     .await
@@ -453,7 +604,7 @@ async fn roundtrip(
     assert_eq!(changed.summary.updates, 1, "{tag}: 期望 1 行待更新");
     assert_eq!(changed.summary.inserts, 0, "{tag}: 不应有新增");
 
-    run_plan(target_pool, plan.select(true, true, true)).await;
+    apply_data(target_pool, target_ns, plan.select(true, true, true)).await;
 
     let (settled, _, _) = compare_data_core(source_pool, &source_ep, target_pool, &target_ep, &[], &[], 100, &ProgressReporter::inert())
     .await
@@ -481,7 +632,7 @@ async fn roundtrip(
     .expect("compare orders data");
     assert_eq!(orders.summary.inserts, 2, "{tag}: orders 期望 2 行待插入 (源已删除 1 行)");
     assert_eq!(orders.summary.deletes, 0, "{tag}: 目标为空, 不应有删除");
-    run_plan(target_pool, plan.select(true, true, true)).await;
+    apply_data(target_pool, target_ns, plan.select(true, true, true)).await;
 
     let (orders_settled, _, _) = compare_data_core(source_pool, &source_orders, target_pool, &target_orders, &[], &[], 100, &ProgressReporter::inert())
     .await
@@ -496,6 +647,17 @@ async fn roundtrip(
         "{tag}: orders 同步后应完全一致, 实际 {:?}",
         orders_settled.summary
     );
+
+    // ---- 7b. the target's views now see the synchronised rows -------------
+    for name in view_names(source_dialect) {
+        let source_count = scalar_count(source_pool, source_ns, name, source_dialect).await;
+        let target_count = scalar_count(target_pool, target_ns, name, target_dialect).await;
+        assert_eq!(
+            source_count, target_count,
+            "{tag}: 视图 {name} 的行数应与源端一致"
+        );
+        assert!(source_count > 0, "{tag}: 视图 {name} 应有数据");
+    }
 
     // ---- 8. the generated column survived as a *generated* column ----------
     // It must be recomputed by the target engine, not copied or left empty.
@@ -671,7 +833,7 @@ async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str
     assert_eq!(result.summary.deletes, 0, "{tag}: 空目标不应有删除");
     assert_eq!(result.summary.updates, 0, "{tag}: 空目标不应有更新");
 
-    run_plan(pool, plan.select(true, true, true)).await;
+    apply_data(pool, dst, plan.select(true, true, true)).await;
 
     let (settled, _, _) = compare_data_core(
         pool,
@@ -750,7 +912,7 @@ async fn pagination_scenario(pool: &Pool, dialect: Dialect, src: &str, dst: &str
     assert_eq!(changed.summary.updates, touched, "{tag}: 更新数不符");
     assert_eq!(changed.summary.deletes, remove.len(), "{tag}: 删除数不符");
 
-    run_plan(pool, plan.select(true, true, true)).await;
+    apply_data(pool, dst, plan.select(true, true, true)).await;
 
     let (final_pass, _, _) = compare_data_core(
         pool,

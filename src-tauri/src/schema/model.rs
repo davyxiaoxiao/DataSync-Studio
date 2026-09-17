@@ -195,3 +195,41 @@ pub struct NamespaceInfo {
     pub collation: Option<String>,
     pub is_system: bool,
 }
+
+/// A view or materialised view, normalised across engines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewStructure {
+    pub name: String,
+    /// `view` | `materialized`
+    pub kind: String,
+    /// The SELECT body exactly as the server reports it.
+    pub definition: String,
+    pub comment: Option<String>,
+    /// Relations this view reads from, used to order creation and to find the
+    /// views that must be recreated when a table changes.
+    pub dependencies: Vec<String>,
+}
+
+impl ViewStructure {
+    pub fn is_materialized(&self) -> bool {
+        self.kind == "materialized"
+    }
+
+    /// Definition text used for change detection: engines re-render a view body
+    /// with their own quoting, spacing and parentheses.
+    pub fn normalized_definition(&self) -> String {
+        normalize_sql_text(&self.definition)
+    }
+}
+
+/// Loose SQL text normalisation shared by view and expression comparison.
+pub fn normalize_sql_text(value: &str) -> String {
+    let lowered = value.to_lowercase().replace('`', "").replace('"', "");
+    let mut collapsed = lowered.split_whitespace().collect::<Vec<_>>().join(" ");
+    while collapsed.ends_with(';') {
+        collapsed.pop();
+        collapsed = collapsed.trim_end().to_string();
+    }
+    collapsed
+}

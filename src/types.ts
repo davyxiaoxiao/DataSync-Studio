@@ -150,6 +150,27 @@ export interface DiffSummary {
   indexChanges: number;
   foreignKeyChanges: number;
   primaryKeyChanges: number;
+  newViews: number;
+  missingViews: number;
+  changedViews: number;
+  identicalViews: number;
+}
+
+export interface ViewStructure {
+  name: string;
+  /** "view" | "materialized" */
+  kind: string;
+  definition: string;
+  comment?: string | null;
+  dependencies: string[];
+}
+
+export interface ViewDiff {
+  name: string;
+  kind: ChangeKind;
+  source?: ViewStructure | null;
+  target?: ViewStructure | null;
+  differences: FieldChange[];
 }
 
 export interface SchemaDiff {
@@ -158,6 +179,7 @@ export interface SchemaDiff {
   sourceDialect: Dialect;
   targetDialect: Dialect;
   tables: TableDiff[];
+  views: ViewDiff[];
   summary: DiffSummary;
 }
 
@@ -278,6 +300,7 @@ export interface TableSelection {
 
 export interface SyncSelection {
   tables: TableSelection[];
+  views: string[];
 }
 
 export interface TableEndpoint {

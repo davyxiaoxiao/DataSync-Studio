@@ -9,6 +9,7 @@ import { useJobProgress } from "../jobs";
 import { useStore } from "../store";
 import type {
   ChangeKind,
+  ViewDiff,
   ColumnDiff,
   CompareSchemaResult,
   DdlStatement,
@@ -60,6 +61,7 @@ export function StructureSyncView() {
   const [comparing, setComparing] = useState(false);
   const [comparison, setComparison] = useState<CompareSchemaResult | null>(null);
   const [selection, setSelection] = useState<Record<string, TableSel>>({});
+  const [viewSelection, setViewSelection] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [filter, setFilter] = useState("");
   const [onlyChanges, setOnlyChanges] = useState(true);
@@ -71,6 +73,19 @@ export function StructureSyncView() {
   const [stopOnError, setStopOnError] = useState(false);
 
   const diff = comparison?.diff ?? null;
+
+  const buildViewSelection = useCallback(
+    (result: CompareSchemaResult, mode: "safe" | "all" | "none") =>
+      Object.fromEntries(
+        result.diff.views
+          .filter((view) => view.kind !== "identical")
+          .map((view) => [
+            view.name,
+            mode === "all" ? true : mode === "none" ? false : view.kind !== "missing",
+          ]),
+      ),
+    [],
+  );
 
   const buildSelection = useCallback(
     (result: CompareSchemaResult, mode: "safe" | "all" | "none"): Record<string, TableSel> => {
@@ -134,12 +149,14 @@ export function StructureSyncView() {
       });
       setComparison(result);
       setSelection(buildSelection(result, "safe"));
+      setViewSelection(buildViewSelection(result, "safe"));
       for (const warning of result.warnings) log("warn", warning);
       const summary = result.diff.summary;
       log(
         "ok",
         `对比完成（${Date.now() - started} ms）：新建表 ${summary.newTables}，修改表 ${summary.changedTables}，仅目标存在 ${summary.missingTables}，` +
-          `列变更 ${summary.newColumns + summary.changedColumns + summary.missingColumns}，索引变更 ${summary.indexChanges}，外键变更 ${summary.foreignKeyChanges}`,
+          `列变更 ${summary.newColumns + summary.changedColumns + summary.missingColumns}，索引变更 ${summary.indexChanges}，外键变更 ${summary.foreignKeyChanges}，` +
+          `视图变更 ${summary.newViews + summary.changedViews + summary.missingViews}`,
       );
       const changed = result.diff.tables.filter((t) => t.kind !== "identical");
       setExpanded(Object.fromEntries(changed.slice(0, 8).map((t) => [t.name, true])));
@@ -169,11 +186,17 @@ export function StructureSyncView() {
           .filter(([, v]) => v)
           .map(([k]) => k),
       }));
-    return { tables };
-  }, [selection]);
+    return {
+      tables,
+      views: Object.entries(viewSelection)
+        .filter(([, enabled]) => enabled)
+        .map(([name]) => name),
+    };
+  }, [selection, viewSelection]);
 
   const selectedCount = useMemo(
     () =>
+      Object.values(viewSelection).filter(Boolean).length +
       Object.values(selection)
         .filter((s) => s.enabled)
         .reduce((total, s) => {
@@ -244,6 +267,14 @@ export function StructureSyncView() {
           table.name.toLowerCase().includes(keyword) ||
           table.columns.some((c) => c.name.toLowerCase().includes(keyword)),
       );
+  }, [diff, filter, onlyChanges]);
+
+  const visibleViews = useMemo(() => {
+    if (!diff) return [];
+    const keyword = filter.trim().toLowerCase();
+    return diff.views
+      .filter((view) => (onlyChanges ? view.kind !== "identical" : true))
+      .filter((view) => !keyword || view.name.toLowerCase().includes(keyword));
   }, [diff, filter, onlyChanges]);
 
   const ready = Boolean(
@@ -357,17 +388,43 @@ export function StructureSyncView() {
                   </span>
                   <span className="cap">索引/外键变更</span>
                 </div>
+                <div className="stat">
+                  <span className="num">
+                    {diff.summary.newViews +
+                      diff.summary.changedViews +
+                      diff.summary.missingViews}
+                  </span>
+                  <span className="cap">视图变更</span>
+                </div>
               </div>
             </div>
 
             <div className="row" style={{ marginTop: 12 }}>
-              <button className="btn small" onClick={() => setSelection(buildSelection(comparison!, "safe"))}>
+              <button
+                className="btn small"
+                onClick={() => {
+                  setSelection(buildSelection(comparison!, "safe"));
+                  setViewSelection(buildViewSelection(comparison!, "safe"));
+                }}
+              >
                 默认选择（不含删除）
               </button>
-              <button className="btn small" onClick={() => setSelection(buildSelection(comparison!, "all"))}>
+              <button
+                className="btn small"
+                onClick={() => {
+                  setSelection(buildSelection(comparison!, "all"));
+                  setViewSelection(buildViewSelection(comparison!, "all"));
+                }}
+              >
                 全选
               </button>
-              <button className="btn small" onClick={() => setSelection(buildSelection(comparison!, "none"))}>
+              <button
+                className="btn small"
+                onClick={() => {
+                  setSelection(buildSelection(comparison!, "none"));
+                  setViewSelection(buildViewSelection(comparison!, "none"));
+                }}
+              >
                 全不选
               </button>
               <span className="faint">已选 {selectedCount} 项变更</span>
@@ -428,6 +485,28 @@ export function StructureSyncView() {
                 没有符合条件的表
               </div>
             )}
+            {visibleViews.length > 0 && (
+              <div className="node">
+                <div className="node-head" style={{ background: "var(--bg-subtle)" }}>
+                  <span style={{ width: 20 }} />
+                  <span className="name">视图 / 物化视图</span>
+                  <span className="detail">{visibleViews.length} 个有差异</span>
+                </div>
+                <div className="node-body" style={{ paddingLeft: 30 }}>
+                  {visibleViews.map((view) => (
+                    <ViewDiffRow
+                      key={view.name}
+                      view={view}
+                      checked={viewSelection[view.name] ?? false}
+                      onChange={(value) =>
+                        setViewSelection((prev) => ({ ...prev, [view.name]: value }))
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
             {visibleTables.map((table) => (
               <TableDiffNode
                 key={table.name}
@@ -636,6 +715,37 @@ function ObjectRow({ name, kind, checked, onChange, detail, prefix }: ObjectRowP
       <span className={`badge ${changeTone(kind) ?? ""}`}>{KIND_LABEL[kind]}</span>
       <span className="obj-detail" title={detail}>
         {detail}
+      </span>
+    </div>
+  );
+}
+
+function ViewDiffRow({
+  view,
+  checked,
+  onChange,
+}: {
+  view: ViewDiff;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="obj-row" title={view.differences.map((d) => d.field).join(", ")}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        style={{ accentColor: "var(--accent)", marginLeft: 0 }}
+      />
+      <span className="badge" style={{ minWidth: 34, justifyContent: "center" }}>
+        {view.source?.kind === "materialized" ? "MAT" : "VIEW"}
+      </span>
+      <span className="obj-name">{view.name}</span>
+      <span className={`badge ${changeTone(view.kind) ?? ""}`}>{KIND_LABEL[view.kind]}</span>
+      <span className="obj-detail">
+        {view.kind === "changed" && view.differences.length > 0
+          ? `变更：${view.differences.map((d) => d.field).join("、")}`
+          : ""}
       </span>
     </div>
   );

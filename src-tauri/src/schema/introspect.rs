@@ -5,6 +5,7 @@ use crate::db::Pool;
 use crate::error::AppResult;
 use crate::schema::model::{
     ColumnInfo, ForeignKeyInfo, IndexInfo, NamespaceInfo, TableStructure, TableSummary,
+    ViewStructure,
 };
 
 const MYSQL_SYSTEM_SCHEMAS: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
@@ -634,4 +635,105 @@ fn pg_action(code: &str) -> String {
         _ => "NO ACTION",
     }
     .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Views and materialised views
+// ---------------------------------------------------------------------------
+
+pub async fn list_views(pool: &Pool, namespace: &str) -> AppResult<Vec<ViewStructure>> {
+    let mut views = match pool {
+        Pool::MySql(_) => {
+            let sql = "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS \
+                       WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME";
+            let rows = query(pool, sql, &[namespace], &[S, S]).await?;
+            rows.into_iter()
+                .map(|row| ViewStructure {
+                    name: row[0].clone(),
+                    kind: "view".into(),
+                    definition: row.get(1).cloned().unwrap_or_default(),
+                    comment: None,
+                    dependencies: Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        }
+        Pool::Postgres(_) => {
+            // `pg_get_viewdef` returns the SELECT without a trailing semicolon.
+            // `relkind` is PostgreSQL's internal `"char"` type, which the driver
+            // cannot decode; cast it explicitly.
+            let sql = "SELECT c.relname, c.relkind::text, pg_get_viewdef(c.oid, true), \
+                              obj_description(c.oid, 'pg_class') \
+                       FROM pg_catalog.pg_class c \
+                       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                       WHERE n.nspname = $1 AND c.relkind IN ('v', 'm') \
+                       ORDER BY c.relname";
+            let rows = query(pool, sql, &[namespace], &[S, S, S, S]).await?;
+            rows.into_iter()
+                .map(|row| ViewStructure {
+                    name: row[0].clone(),
+                    kind: if row.get(1).map(String::as_str) == Some("m") {
+                        "materialized".into()
+                    } else {
+                        "view".into()
+                    },
+                    definition: row.get(2).cloned().unwrap_or_default(),
+                    comment: non_empty(row.get(3)),
+                    dependencies: Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Dependencies are derived from the bodies rather than from a catalog
+    // query: it works identically on both engines and on older MySQL versions.
+    let mut known: Vec<String> = list_tables(pool, namespace)
+        .await?
+        .iter()
+        .map(|table| table.name.clone())
+        .collect();
+    known.extend(views.iter().map(|view| view.name.clone()));
+
+    for view in &mut views {
+        view.dependencies = relations_referenced(&view.definition, &known, &view.name);
+    }
+    Ok(views)
+}
+
+/// Relation names that appear as whole identifiers in `definition`.
+fn relations_referenced(definition: &str, known: &[String], self_name: &str) -> Vec<String> {
+    let mut found: Vec<String> = known
+        .iter()
+        .filter(|name| !name.eq_ignore_ascii_case(self_name))
+        .filter(|name| contains_identifier(definition, name))
+        .cloned()
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let hay = haystack.to_lowercase();
+    let target = needle.to_lowercase();
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let bytes: Vec<char> = hay.chars().collect();
+    let target_chars: Vec<char> = target.chars().collect();
+    if target_chars.len() > bytes.len() {
+        return false;
+    }
+    for start in 0..=(bytes.len() - target_chars.len()) {
+        if bytes[start..start + target_chars.len()] != target_chars[..] {
+            continue;
+        }
+        let before_ok = start == 0 || !is_word(bytes[start - 1]);
+        let after = start + target_chars.len();
+        let after_ok = after >= bytes.len() || !is_word(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
 }

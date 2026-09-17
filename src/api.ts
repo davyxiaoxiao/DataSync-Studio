@@ -111,6 +111,8 @@ export const api = {
     update?: boolean;
     delete?: boolean;
     useTransaction?: boolean;
+    /** PostgreSQL: refresh materialised views once the rows are written. */
+    refreshMaterializedViews?: boolean;
     jobId?: string;
   }) => invoke<SyncRunResult>("apply_data_sync", { request }),
 
