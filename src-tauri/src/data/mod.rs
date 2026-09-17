@@ -1,0 +1,529 @@
+pub mod plan;
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::db::value::{Cell, ColumnKind, Value};
+use crate::db::Pool;
+use crate::dialect::Dialect;
+use crate::error::{AppError, AppResult};
+use crate::schema::model::TableStructure;
+
+/// Column mapping between the source and target table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnPair {
+    pub source: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableEndpoint {
+    pub connection_id: String,
+    #[serde(default)]
+    pub namespace: String,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyValue {
+    pub column: String,
+    pub value: Cell,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellChange {
+    pub column: String,
+    pub before: Cell,
+    pub after: Cell,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RowChange {
+    pub key: Vec<KeyValue>,
+    pub cells: Vec<CellChange>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataDiffSummary {
+    pub source_rows: usize,
+    pub target_rows: usize,
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataDiffResult {
+    pub plan_id: String,
+    pub columns: Vec<ColumnPair>,
+    pub key_columns: Vec<ColumnPair>,
+    pub summary: DataDiffSummary,
+    pub insert_preview: Vec<RowChange>,
+    pub update_preview: Vec<RowChange>,
+    pub delete_preview: Vec<RowChange>,
+    pub preview_truncated: bool,
+    pub sql_preview: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+pub const PREVIEW_ROWS: usize = 200;
+pub const SQL_PREVIEW_LIMIT: usize = 300;
+
+/// A resolved read plan for one table.
+pub struct ReadPlan {
+    pub select_sql: String,
+    pub columns: Vec<String>,
+    pub kinds: Vec<ColumnKind>,
+}
+
+pub fn build_read_plan(
+    dialect: Dialect,
+    namespace: &str,
+    table: &str,
+    structure: &TableStructure,
+    order_by: &[String],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> ReadPlan {
+    let q = |name: &str| dialect.quote(name);
+    let select_list: Vec<String> = structure
+        .columns
+        .iter()
+        .map(|column| {
+            let quoted = q(&column.name);
+            if dialect == Dialect::Postgres && column.needs_text_cast() {
+                format!("{quoted}::text AS {quoted}")
+            } else {
+                quoted
+            }
+        })
+        .collect();
+
+    let mut sql = format!(
+        "SELECT {} FROM {}",
+        select_list.join(", "),
+        dialect.qualified(Some(namespace), table)
+    );
+    if !order_by.is_empty() {
+        let cols: Vec<String> = order_by.iter().map(|c| q(c)).collect();
+        sql.push_str(&format!(" ORDER BY {}", cols.join(", ")));
+    }
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    if let Some(n) = offset {
+        if n > 0 {
+            // `LIMIT ... OFFSET ...` is valid on both engines.
+            if limit.is_none() {
+                sql.push_str(" LIMIT 18446744073709551615");
+            }
+            sql.push_str(&format!(" OFFSET {n}"));
+        }
+    }
+
+    ReadPlan {
+        select_sql: sql,
+        columns: structure.columns.iter().map(|c| c.name.clone()).collect(),
+        kinds: structure.columns.iter().map(|c| c.kind()).collect(),
+    }
+}
+
+pub async fn read_rows(pool: &Pool, plan: &ReadPlan) -> AppResult<Vec<Vec<Value>>> {
+    pool.fetch(&plan.select_sql, &[], &plan.kinds).await
+}
+
+/// Index of a column name inside a row vector.
+pub fn column_index(columns: &[String], name: &str) -> Option<usize> {
+    columns.iter().position(|c| c == name)
+}
+
+fn row_key(cells: &[&Value]) -> String {
+    cells
+        .iter()
+        .map(|v| v.canonical())
+        .collect::<Vec<_>>()
+        .join("\u{1}")
+}
+
+pub struct CompareInput<'a> {
+    pub source_rows: Vec<Vec<Value>>,
+    pub target_rows: Vec<Vec<Value>>,
+    pub source_columns: &'a [String],
+    pub target_columns: &'a [String],
+    pub column_pairs: &'a [ColumnPair],
+    pub key_pairs: &'a [ColumnPair],
+    pub target_kinds: &'a [ColumnKind],
+}
+
+pub struct CompareOutput {
+    pub inserts: Vec<Vec<Value>>,
+    pub updates: Vec<(Vec<Value>, Vec<(usize, Value)>)>,
+    pub deletes: Vec<Vec<Value>>,
+    pub unchanged: usize,
+}
+
+/// Compute the row level differences, keyed on the selected key columns.
+pub fn compare_rows(input: CompareInput<'_>) -> AppResult<CompareOutput> {
+    let CompareInput {
+        source_rows,
+        target_rows,
+        source_columns,
+        target_columns,
+        column_pairs,
+        key_pairs,
+        target_kinds,
+        ..
+    } = input;
+
+    let source_index: Vec<usize> = column_pairs
+        .iter()
+        .map(|p| {
+            column_index(source_columns, &p.source)
+                .ok_or_else(|| AppError::msg(format!("源表缺少字段 {}", p.source)))
+        })
+        .collect::<AppResult<_>>()?;
+    let target_index: Vec<usize> = column_pairs
+        .iter()
+        .map(|p| {
+            column_index(target_columns, &p.target)
+                .ok_or_else(|| AppError::msg(format!("目标表缺少字段 {}", p.target)))
+        })
+        .collect::<AppResult<_>>()?;
+
+    let source_key_index: Vec<usize> = key_pairs
+        .iter()
+        .map(|p| {
+            column_index(source_columns, &p.source)
+                .ok_or_else(|| AppError::msg(format!("源表缺少主键字段 {}", p.source)))
+        })
+        .collect::<AppResult<_>>()?;
+    let target_key_index: Vec<usize> = key_pairs
+        .iter()
+        .map(|p| {
+            column_index(target_columns, &p.target)
+                .ok_or_else(|| AppError::msg(format!("目标表缺少主键字段 {}", p.target)))
+        })
+        .collect::<AppResult<_>>()?;
+
+    // Columns that cannot be written back: generated columns are not detected
+    // here, but auto-increment keys are still writable so they stay included.
+    let writable: Vec<usize> = (0..target_columns.len())
+        .filter(|i| !matches!(target_kinds.get(*i), Some(ColumnKind::Text)))
+        .collect();
+    let _ = writable;
+
+    let mut target_map: HashMap<String, usize> = HashMap::with_capacity(target_rows.len());
+    for (idx, row) in target_rows.iter().enumerate() {
+        let keys: Vec<&Value> = target_key_index
+            .iter()
+            .filter_map(|i| row.get(*i))
+            .collect();
+        if keys.len() != target_key_index.len() {
+            continue;
+        }
+        target_map.insert(row_key(&keys), idx);
+    }
+
+    let mut inserts = Vec::new();
+    let mut updates = Vec::new();
+    let mut unchanged = 0usize;
+    let mut matched_targets: Vec<bool> = vec![false; target_rows.len()];
+
+    for row in &source_rows {
+        let keys: Vec<&Value> = source_key_index
+            .iter()
+            .filter_map(|i| row.get(*i))
+            .collect();
+        if keys.len() != source_key_index.len() {
+            continue;
+        }
+        let key = row_key(&keys);
+        match target_map.get(&key) {
+            None => inserts.push(row.clone()),
+            Some(&target_row_idx) => {
+                matched_targets[target_row_idx] = true;
+                let target_row = &target_rows[target_row_idx];
+                let mut changed: Vec<(usize, Value)> = Vec::new();
+                for (pair_idx, pair) in column_pairs.iter().enumerate() {
+                    let sidx = source_index[pair_idx];
+                    let tidx = target_index[pair_idx];
+                    let source_value = row.get(sidx).cloned().unwrap_or(Value::Null);
+                    let target_value = target_row.get(tidx).cloned().unwrap_or(Value::Null);
+                    if source_value.canonical() != target_value.canonical() {
+                        changed.push((tidx, source_value));
+                    }
+                    let _ = pair;
+                }
+                if changed.is_empty() {
+                    unchanged += 1;
+                } else {
+                    updates.push((target_row.clone(), changed));
+                }
+            }
+        }
+    }
+
+    let mut deletes = Vec::new();
+    for (idx, row) in target_rows.iter().enumerate() {
+        if !matched_targets[idx] {
+            deletes.push(row.clone());
+        }
+    }
+
+    Ok(CompareOutput {
+        inserts,
+        updates,
+        deletes,
+        unchanged,
+    })
+}
+
+/// Build the DML statements for one action.
+pub fn build_insert_statements(
+    target_dialect: Dialect,
+    namespace: &str,
+    table: &str,
+    source_columns: &[String],
+    target_columns: &[String],
+    target_kinds: &[ColumnKind],
+    column_pairs: &[ColumnPair],
+    rows: &[Vec<Value>],
+    batch_size: usize,
+) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let q = |name: &str| target_dialect.quote(name);
+
+    // Values are read from the *source* row but written against the *target*
+    // column list, and the two orders are independent (a column may have been
+    // added in the middle on one side). Resolve each pair to its indices once
+    // so the INSERT list and the value tuple always agree.
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(column_pairs.len());
+    for pair in column_pairs {
+        let Some(source_idx) = column_index(source_columns, &pair.source) else {
+            continue;
+        };
+        let Some(target_idx) = column_index(target_columns, &pair.target) else {
+            continue;
+        };
+        pairs.push((source_idx, target_idx));
+    }
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+
+    let column_list = pairs
+        .iter()
+        .map(|(_, target_idx)| q(&target_columns[*target_idx]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = target_dialect.qualified(Some(namespace), table);
+    let batch = batch_size.max(1);
+
+    let mut statements = Vec::new();
+    for chunk in rows.chunks(batch) {
+        let values: Vec<String> = chunk
+            .iter()
+            .map(|row| {
+                let cells: Vec<String> = pairs
+                    .iter()
+                    .map(|(source_idx, target_idx)| {
+                        let value = row.get(*source_idx).cloned().unwrap_or(Value::Null);
+                        let json_column =
+                            matches!(target_kinds.get(*target_idx), Some(ColumnKind::Json));
+                        value.literal(target_dialect, json_column)
+                    })
+                    .collect();
+                format!("({})", cells.join(", "))
+            })
+            .collect();
+        statements.push(format!(
+            "INSERT INTO {target} ({column_list}) VALUES {};",
+            values.join(", ")
+        ));
+    }
+    statements
+}
+
+pub fn build_update_statements(
+    target_dialect: Dialect,
+    namespace: &str,
+    table: &str,
+    target_columns: &[String],
+    target_kinds: &[ColumnKind],
+    key_pairs: &[ColumnPair],
+    updates: &[(Vec<Value>, Vec<(usize, Value)>)],
+) -> Vec<String> {
+    let q = |name: &str| target_dialect.quote(name);
+    let target = target_dialect.qualified(Some(namespace), table);
+    let key_indexes: Vec<(usize, &str)> = key_pairs
+        .iter()
+        .filter_map(|p| column_index(target_columns, &p.target).map(|i| (i, p.target.as_str())))
+        .collect();
+
+    let mut statements = Vec::new();
+    for (target_row, changes) in updates {
+        let assignments: Vec<String> = changes
+            .iter()
+            .map(|(idx, value)| {
+                let json_column = matches!(target_kinds.get(*idx), Some(ColumnKind::Json));
+                format!(
+                    "{} = {}",
+                    q(&target_columns[*idx]),
+                    value.literal(target_dialect, json_column)
+                )
+            })
+            .collect();
+        let conditions: Vec<String> = key_indexes
+            .iter()
+            .map(|(idx, name)| {
+                let value = target_row.get(*idx).cloned().unwrap_or(Value::Null);
+                let json_column = matches!(target_kinds.get(*idx), Some(ColumnKind::Json));
+                format!("{} = {}", q(name), value.literal(target_dialect, json_column))
+            })
+            .collect();
+        statements.push(format!(
+            "UPDATE {target} SET {} WHERE {};",
+            assignments.join(", "),
+            conditions.join(" AND ")
+        ));
+    }
+    statements
+}
+
+pub fn build_delete_statements(
+    target_dialect: Dialect,
+    namespace: &str,
+    table: &str,
+    target_columns: &[String],
+    target_kinds: &[ColumnKind],
+    key_pairs: &[ColumnPair],
+    rows: &[Vec<Value>],
+) -> Vec<String> {
+    let q = |name: &str| target_dialect.quote(name);
+    let target = target_dialect.qualified(Some(namespace), table);
+    let key_indexes: Vec<(usize, &str)> = key_pairs
+        .iter()
+        .filter_map(|p| column_index(target_columns, &p.target).map(|i| (i, p.target.as_str())))
+        .collect();
+
+    rows.iter()
+        .map(|row| {
+            let conditions: Vec<String> = key_indexes
+                .iter()
+                .map(|(idx, name)| {
+                    let value = row.get(*idx).cloned().unwrap_or(Value::Null);
+                    let json_column = matches!(target_kinds.get(*idx), Some(ColumnKind::Json));
+                    format!("{} = {}", q(name), value.literal(target_dialect, json_column))
+                })
+                .collect();
+            format!("DELETE FROM {target} WHERE {};", conditions.join(" AND "))
+        })
+        .collect()
+}
+
+/// Preview rows for INSERT: the "after" side comes from the source row.
+pub fn preview_inserts(
+    source_columns: &[String],
+    column_pairs: &[ColumnPair],
+    key_pairs: &[ColumnPair],
+    rows: &[Vec<Value>],
+) -> Vec<RowChange> {
+    rows.iter()
+        .take(PREVIEW_ROWS)
+        .map(|row| RowChange {
+            key: key_preview(source_columns, key_pairs, row, true),
+            cells: column_pairs
+                .iter()
+                .map(|pair| CellChange {
+                    column: pair.target.clone(),
+                    before: Cell::null(),
+                    after: column_index(source_columns, &pair.source)
+                        .and_then(|idx| row.get(idx))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_cell(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Preview rows for UPDATE.
+pub fn preview_updates(
+    target_columns: &[String],
+    key_pairs: &[ColumnPair],
+    rows: &[(Vec<Value>, Vec<(usize, Value)>)],
+) -> Vec<RowChange> {
+    rows.iter()
+        .take(PREVIEW_ROWS)
+        .map(|(target_row, changes)| RowChange {
+            key: key_preview(target_columns, key_pairs, target_row, false),
+            cells: changes
+                .iter()
+                .map(|(idx, value)| CellChange {
+                    column: target_columns[*idx].clone(),
+                    before: target_row.get(*idx).cloned().unwrap_or(Value::Null).to_cell(),
+                    after: value.to_cell(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Preview rows for DELETE.
+pub fn preview_deletes(
+    target_columns: &[String],
+    column_pairs: &[ColumnPair],
+    key_pairs: &[ColumnPair],
+    rows: &[Vec<Value>],
+) -> Vec<RowChange> {
+    rows.iter()
+        .take(PREVIEW_ROWS)
+        .map(|row| RowChange {
+            key: key_preview(target_columns, key_pairs, row, false),
+            cells: column_pairs
+                .iter()
+                .map(|pair| CellChange {
+                    column: pair.target.clone(),
+                    before: column_index(target_columns, &pair.target)
+                        .and_then(|idx| row.get(idx))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        .to_cell(),
+                    after: Cell::null(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Key values as displayed in the preview list. `side_is_source` selects which
+/// side of the mapping the column names come from.
+fn key_preview(
+    columns: &[String],
+    key_pairs: &[ColumnPair],
+    row: &[Value],
+    side_is_source: bool,
+) -> Vec<KeyValue> {
+    key_pairs
+        .iter()
+        .filter_map(|pair| {
+            let name = if side_is_source { &pair.source } else { &pair.target };
+            column_index(columns, name).map(|idx| KeyValue {
+                column: name.clone(),
+                value: row.get(idx).cloned().unwrap_or(Value::Null).to_cell(),
+            })
+        })
+        .collect()
+}

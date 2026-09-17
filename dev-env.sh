@@ -1,0 +1,11 @@
+# Source this to keep all tool caches inside the workspace (sandbox-friendly).
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CARGO_HOME="$ROOT/.cache/cargo"
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export XDG_CACHE_HOME="$ROOT/.cache/xdg"
+export npm_config_cache="$ROOT/.cache/npm"
+export npm_config_cache_dir="$ROOT/.cache/pnpm-cache"
+export npm_config_store_dir="$ROOT/.cache/pnpm-store"
+export npm_config_registry="https://registry.npmmirror.com"
+export PATH="$CARGO_HOME/bin:$PATH"
+mkdir -p "$XDG_CACHE_HOME" "$npm_config_cache" "$npm_config_cache_dir" "$npm_config_store_dir"
