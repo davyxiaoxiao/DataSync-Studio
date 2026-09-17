@@ -42,11 +42,17 @@ function diffDetail(differences: { field: string; source?: string | null; target
 }
 
 export function StructureSyncView() {
-  const { log } = useStore();
+  const { connections, log } = useStore();
   const [source, setSource] = useState<EndpointValue>({ connectionId: "", namespace: "" });
   const [target, setTarget] = useState<EndpointValue>({ connectionId: "", namespace: "" });
   const [ignoreComments, setIgnoreComments] = useState(true);
   const [ignoreCase, setIgnoreCase] = useState(false);
+
+  // The source engine anchors the pair: only same-engine targets are offered.
+  const sourceDialect = useMemo(
+    () => connections.find((c) => c.id === source.connectionId)?.dialect,
+    [connections, source.connectionId],
+  );
 
   const [comparing, setComparing] = useState(false);
   const [comparison, setComparison] = useState<CompareSchemaResult | null>(null);
@@ -178,9 +184,10 @@ export function StructureSyncView() {
     if (!comparison) return;
     setPreviewing(true);
     try {
-      const statements = await api.previewSchemaSql(comparison.compareId, selectionPayload);
-      setPreview(statements);
-      log("info", `已生成 ${statements.length} 条 DDL 语句`);
+      const outcome = await api.previewSchemaSql(comparison.compareId, selectionPayload);
+      setPreview(outcome.statements);
+      for (const warning of outcome.warnings) log("warn", warning);
+      log("info", `已生成 ${outcome.statements.length} 条 DDL 语句`);
     } catch (error) {
       log("err", `生成 SQL 失败: ${errorMessage(error)}`);
     } finally {
@@ -200,6 +207,7 @@ export function StructureSyncView() {
         stopOnError,
       });
       setRunResult(result);
+      for (const warning of result.warnings ?? []) log("warn", warning);
       if (result.failed > 0) {
         log("err", result.message);
         for (const failure of result.failures.slice(0, 8)) {
@@ -256,7 +264,11 @@ export function StructureSyncView() {
     <div className="panel-scroll">
       <div className="section">
         <div className="section-title">
-          同步方向 <span className="hint">把「源」的表结构应用到「目标」</span>
+          同步方向{" "}
+          <span className="hint">
+            把「源」的表结构应用到「目标」；仅支持同类型数据库（MySQL ↔ MySQL、PostgreSQL ↔
+            PostgreSQL），目标连接会按源的类型过滤
+          </span>
         </div>
         <div className="split">
           <EndpointPicker
@@ -274,6 +286,7 @@ export function StructureSyncView() {
             onChange={setTarget}
             onLog={log}
             disabled={comparing || applying}
+            dialectFilter={sourceDialect}
           />
         </div>
 

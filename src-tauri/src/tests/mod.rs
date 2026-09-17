@@ -11,7 +11,7 @@ use crate::data::{
 };
 use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
-use crate::schema::ddl::{generate, map_type, SyncSelection, TableSelection};
+use crate::schema::ddl::{generate, SyncSelection, TableSelection};
 use crate::schema::diff::{compare, ChangeKind, CompareOptions};
 use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure};
 
@@ -66,65 +66,8 @@ fn selection_for(tables: &[&str]) -> SyncSelection {
 // Type mapping
 // ---------------------------------------------------------------------------
 
-#[test]
-fn mysql_types_map_to_postgres() {
-    let cases = [
-        ("VARCHAR", "varchar(255)", "varchar(255)"),
-        ("INT", "int(11)", "integer"),
-        ("BIGINT", "bigint", "bigint"),
-        ("BIGINT UNSIGNED", "bigint unsigned", "numeric(20)"),
-        ("BOOLEAN", "tinyint(1)", "boolean"),
-        ("DECIMAL", "decimal(10,2)", "numeric(10,2)"),
-        ("DATETIME", "datetime", "timestamp"),
-        ("TIMESTAMP", "timestamp", "timestamptz"),
-        ("LONGTEXT", "longtext", "text"),
-        ("LONGBLOB", "longblob", "bytea"),
-        ("JSON", "json", "jsonb"),
-        ("DOUBLE", "double", "double precision"),
-    ];
-    for (family, full, expected) in cases {
-        let column = col("c", family, full);
-        assert_eq!(
-            map_type(Dialect::Mysql, Dialect::Postgres, &column),
-            expected,
-            "mapping {full} -> postgres"
-        );
-    }
-}
 
-#[test]
-fn postgres_types_map_to_mysql() {
-    let cases = [
-        ("VARCHAR", "character varying(255)", "varchar(255)"),
-        ("INT", "integer", "int"),
-        ("INT", "int4", "int"),
-        ("BOOL", "boolean", "tinyint(1)"),
-        ("TIMESTAMPTZ", "timestamp with time zone", "datetime"),
-        ("TIMESTAMP", "timestamp without time zone", "datetime"),
-        ("BYTEA", "bytea", "longblob"),
-        ("JSONB", "jsonb", "json"),
-        ("UUID", "uuid", "char(36)"),
-        ("DECIMAL", "numeric(10,2)", "decimal(10,2)"),
-        ("CHAR", "character(3)", "char(3)"),
-    ];
-    for (family, full, expected) in cases {
-        let column = col("c", family, full);
-        assert_eq!(
-            map_type(Dialect::Postgres, Dialect::Mysql, &column),
-            expected,
-            "mapping {full} -> mysql"
-        );
-    }
-}
 
-#[test]
-fn same_dialect_keeps_declared_type() {
-    let column = col("c", "VARCHAR", "varchar(64)");
-    assert_eq!(
-        map_type(Dialect::Mysql, Dialect::Mysql, &column),
-        "varchar(64)"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Diffing
@@ -219,44 +162,6 @@ fn int_display_width_is_not_a_difference() {
     assert_eq!(diff.tables[0].kind, ChangeKind::Identical);
 }
 
-#[test]
-fn cross_dialect_equivalent_types_are_not_differences() {
-    let source = vec![table(
-        "t",
-        vec![
-            col("id", "INT", "int(11)"),
-            col("name", "VARCHAR", "varchar(64)"),
-            col("created", "DATETIME", "datetime"),
-        ],
-        &[],
-    )];
-    let target = vec![table(
-        "t",
-        vec![
-            col("id", "INT", "integer"),
-            col("name", "VARCHAR", "character varying(64)"),
-            col("created", "TIMESTAMP", "timestamp without time zone"),
-        ],
-        &[],
-    )];
-    let diff = compare(
-        &source,
-        &target,
-        Dialect::Mysql,
-        Dialect::Postgres,
-        CompareOptions::default(),
-    );
-    assert_eq!(
-        diff.tables[0].kind,
-        ChangeKind::Identical,
-        "columns: {:#?}",
-        diff.tables[0]
-            .columns
-            .iter()
-            .map(|c| (&c.name, c.kind, &c.differences))
-            .collect::<Vec<_>>()
-    );
-}
 
 // ---------------------------------------------------------------------------
 // DDL generation
@@ -879,6 +784,7 @@ fn generated_column_is_not_a_default() {
 
 #[test]
 fn same_generation_expression_with_different_formatting_is_identical() {
+    // The server may re-render an expression; only the semantic text matters.
     let source = vec![table_with_column(generated_col(
         "total",
         "DECIMAL",
@@ -889,67 +795,16 @@ fn same_generation_expression_with_different_formatting_is_identical() {
         "total",
         "DECIMAL",
         "decimal(12,2)",
-        "(amount * 2)",
+        "((`amount`  *  2))",
     ))];
     let diff = compare(
         &source,
         &target,
         Dialect::Mysql,
-        Dialect::Postgres,
+        Dialect::Mysql,
         CompareOptions::default(),
     );
     assert_eq!(diff.tables[0].kind, ChangeKind::Identical, "{:#?}", diff.tables[0]);
 }
 
-#[test]
-fn non_portable_generation_expression_falls_back_to_a_plain_column() {
-    let column = generated_col("doc", "JSONB", "jsonb", "jsonb_build_object('a', \"id\")");
-    let structure = table_with_column(column);
-    let source = vec![structure.clone()];
-    let diff = compare(
-        &source,
-        &[],
-        Dialect::Postgres,
-        Dialect::Mysql,
-        CompareOptions::default(),
-    );
-    let mut sources = HashMap::new();
-    sources.insert("orders".to_string(), structure);
 
-    let mut warnings = Vec::new();
-    let plan = generate(&diff, &sources, None, None, &mut warnings);
-    assert!(
-        !plan[0].sql.contains("GENERATED ALWAYS"),
-        "不应生成无法移植的表达式: {}",
-        plan[0].sql
-    );
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("改为普通列"), "{warnings:?}");
-}
-
-#[test]
-fn simple_expression_ports_across_dialects_with_a_warning() {
-    let column = generated_col("total", "DECIMAL", "decimal(12,2)", "(`amount` * 2)");
-    let structure = table_with_column(column);
-    let source = vec![structure.clone()];
-    let diff = compare(
-        &source,
-        &[],
-        Dialect::Mysql,
-        Dialect::Postgres,
-        CompareOptions::default(),
-    );
-    let mut sources = HashMap::new();
-    sources.insert("orders".to_string(), structure);
-
-    let mut warnings = Vec::new();
-    let plan = generate(&diff, &sources, None, None, &mut warnings);
-    assert!(
-        plan[0]
-            .sql
-            .contains("GENERATED ALWAYS AS ((\"amount\" * 2)) STORED"),
-        "{}",
-        plan[0].sql
-    );
-    assert_eq!(warnings.len(), 1, "跨方言移植必须提示复核: {warnings:?}");
-}

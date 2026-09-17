@@ -190,6 +190,13 @@ export interface SyncRunResult {
   message: string;
   failures: StatementOutcome[];
   sample: StatementOutcome[];
+  /** Non-fatal notes, e.g. a generated column that had to be downgraded. */
+  warnings: string[];
+}
+
+export interface SchemaSqlPreview {
+  statements: DdlStatement[];
+  warnings: string[];
 }
 
 export interface Cell {

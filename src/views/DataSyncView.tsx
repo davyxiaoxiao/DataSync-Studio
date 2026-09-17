@@ -10,13 +10,19 @@ import type { DataDiffResult, RowChange, SyncRunResult } from "../types";
 type ChangeTab = "insert" | "update" | "delete";
 
 export function DataSyncView({ initial }: { initial?: EndpointValue }) {
-  const { log } = useStore();
+  const { connections, log } = useStore();
   const [source, setSource] = useState<EndpointValue>(
     initial ?? { connectionId: "", namespace: "", table: "" },
   );
   const [target, setTarget] = useState<EndpointValue>({ connectionId: "", namespace: "", table: "" });
   const [rowLimit, setRowLimit] = useState(200000);
   const [batchSize, setBatchSize] = useState(200);
+
+  // The source engine anchors the pair: only same-engine targets are offered.
+  const sourceDialect = useMemo(
+    () => connections.find((c) => c.id === source.connectionId)?.dialect,
+    [connections, source.connectionId],
+  );
 
   const [comparing, setComparing] = useState(false);
   const [result, setResult] = useState<DataDiffResult | null>(null);
@@ -136,7 +142,10 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
     <div className="panel-scroll">
       <div className="section">
         <div className="section-title">
-          数据同步 <span className="hint">按主键匹配，把源表数据合并到目标表</span>
+          数据同步{" "}
+          <span className="hint">
+            按主键匹配，把源表数据合并到目标表；仅支持同类型数据库，目标连接会按源的类型过滤
+          </span>
         </div>
         <div className="split">
           <EndpointPicker
@@ -156,6 +165,7 @@ export function DataSyncView({ initial }: { initial?: EndpointValue }) {
             onChange={setTarget}
             onLog={log}
             disabled={comparing || applying}
+            dialectFilter={sourceDialect}
           />
         </div>
 

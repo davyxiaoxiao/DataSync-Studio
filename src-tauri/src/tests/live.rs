@@ -598,10 +598,10 @@ async fn live_postgres_to_postgres_roundtrip() {
     drop_namespace(&pool, Dialect::Postgres, dst).await;
 }
 
-/// The interesting case: a MySQL schema migrated into PostgreSQL, including
-/// type mapping and cross-engine value comparison.
+/// Cross-engine synchronisation is deliberately refused, and the refusal must
+/// happen before any database work.
 #[tokio::test]
-async fn live_mysql_to_postgres_cross_engine() {
+async fn live_cross_engine_sync_is_rejected() {
     let (Some(mysql_target), Some(pg_target)) = (
         env_target("DATASYNC_MYSQL", Dialect::Mysql),
         env_target("DATASYNC_PG", Dialect::Postgres),
@@ -612,16 +612,47 @@ async fn live_mysql_to_postgres_cross_engine() {
     let mysql = connect(&mysql_target, Dialect::Mysql).await;
     let pg = connect(&pg_target, Dialect::Postgres).await;
 
-    let (src, dst) = ("datasync_live_cross_src", "datasync_live_cross_dst");
-    drop_namespace(&mysql, Dialect::Mysql, src).await;
-    drop_namespace(&pg, Dialect::Postgres, dst).await;
-    create_namespace(&mysql, Dialect::Mysql, src).await;
-    create_namespace(&pg, Dialect::Postgres, dst).await;
+    let schema_error = compare_schema_core(
+        &mysql,
+        "datasync_probe_src",
+        &pg,
+        "datasync_probe_dst",
+        CompareOptions::default(),
+        None,
+    )
+    .await
+    .expect_err("MySQL → PostgreSQL 的结构对比必须被拒绝");
+    let message = schema_error.to_string();
+    assert!(message.contains("不支持跨数据库类型同步"), "{message}");
 
-    roundtrip(&mysql, src, &pg, dst, Dialect::Mysql, Dialect::Postgres, "mysql→pg").await;
+    let source = TableEndpoint {
+        connection_id: "src".into(),
+        namespace: "datasync_probe_src".into(),
+        table: "t".into(),
+    };
+    let target = TableEndpoint {
+        connection_id: "dst".into(),
+        namespace: "datasync_probe_dst".into(),
+        table: "t".into(),
+    };
+    let data_error = compare_data_core(&mysql, &source, &pg, &target, &[], &[], 1000, 100)
+        .await
+        .err()
+        .expect("MySQL → PostgreSQL 的数据对比必须被拒绝");
+    assert!(data_error.to_string().contains("不支持跨数据库类型同步"));
 
-    drop_namespace(&mysql, Dialect::Mysql, src).await;
-    drop_namespace(&pg, Dialect::Postgres, dst).await;
+    // The same server compared with itself is accepted.
+    let (ok, _, _) = compare_schema_core(
+        &mysql,
+        "datasync_live_mysql_src",
+        &mysql,
+        "datasync_live_mysql_src",
+        CompareOptions::default(),
+        None,
+    )
+    .await
+    .expect("同类型对比应当被接受");
+    assert!(ok.tables.is_empty());
 }
 
 /// Guard against silently doing nothing when the environment is not configured.

@@ -282,6 +282,25 @@ pub struct CompareSchemaResult {
     pub warnings: Vec<String>,
 }
 
+/// Synchronisation is supported between two databases of the *same* engine.
+/// Mixing MySQL and PostgreSQL would require translating types, expressions and
+/// view SQL, which cannot be done reliably, so it is refused explicitly rather
+/// than attempted.
+fn ensure_same_engine(source: &Pool, target: &Pool) -> AppResult<()> {
+    let source_dialect = source.dialect();
+    let target_dialect = target.dialect();
+    if source_dialect == target_dialect {
+        return Ok(());
+    }
+    Err(AppError::msg(format!(
+        "不支持跨数据库类型同步：源连接是 {}，目标连接是 {}。请选择两个同为 {} 或同为 {} 的连接。",
+        source_dialect.label(),
+        target_dialect.label(),
+        source_dialect.label(),
+        target_dialect.label(),
+    )))
+}
+
 async fn load_structures(
     pool: &Pool,
     namespace: &str,
@@ -319,6 +338,7 @@ pub(crate) async fn compare_schema_core(
     options: CompareOptions,
     tables: Option<&Vec<String>>,
 ) -> AppResult<(SchemaDiff, HashMap<String, TableStructure>, Vec<String>)> {
+    ensure_same_engine(source_pool, target_pool)?;
     let (source_structures, mut warnings) =
         load_structures(source_pool, source_namespace, tables).await?;
     let (target_structures, target_warnings) =
@@ -578,6 +598,7 @@ pub(crate) async fn compare_data_core(
     row_limit: u64,
     batch_size: usize,
 ) -> AppResult<(DataDiffResult, DataPlan)> {
+    ensure_same_engine(source_pool, target_pool)?;
     let source_dialect = source_pool.dialect();
     let target_dialect = target_pool.dialect();
 
@@ -618,14 +639,6 @@ pub(crate) async fn compare_data_core(
             "源表与目标表没有可写入的同名字段，请手动配置字段映射",
         ));
     }
-    if source_dialect != target_dialect {
-        warnings.push(format!(
-            "跨数据库对比：{} → {}，类型不同可能导致比较结果偏保守",
-            source_dialect.label(),
-            target_dialect.label()
-        ));
-    }
-
     let source_order: Vec<String> = key_pairs.iter().map(|p| p.source.clone()).collect();
     let target_order: Vec<String> = key_pairs.iter().map(|p| p.target.clone()).collect();
 

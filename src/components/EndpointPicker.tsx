@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { useStore, dialectLabel } from "../store";
-import type { NamespaceInfo, TableSummary } from "../types";
+import type { Dialect, NamespaceInfo, TableSummary } from "../types";
 import { IconRefresh } from "./Icons";
 
 export interface EndpointValue {
@@ -16,6 +16,8 @@ interface Props {
   value: EndpointValue;
   withTable?: boolean;
   disabled?: boolean;
+  /** Only offer connections of this engine. Sync is same-engine only. */
+  dialectFilter?: Dialect;
   onChange: (value: EndpointValue) => void;
   onLog: (level: "info" | "ok" | "warn" | "err", message: string) => void;
 }
@@ -26,6 +28,7 @@ export function EndpointPicker({
   value,
   withTable,
   disabled,
+  dialectFilter,
   onChange,
   onLog,
 }: Props) {
@@ -35,9 +38,17 @@ export function EndpointPicker({
   const [loadingNamespaces, setLoadingNamespaces] = useState(false);
   const [loadingTables, setLoadingTables] = useState(false);
 
+  // Cross-engine sync is refused by the backend, so the picker never offers a
+  // connection of a different engine in the first place.
+  const offered = useMemo(
+    () =>
+      dialectFilter ? connections.filter((c) => c.dialect === dialectFilter) : connections,
+    [connections, dialectFilter],
+  );
+
   const connection = useMemo(
-    () => connections.find((c) => c.id === value.connectionId) ?? null,
-    [connections, value.connectionId],
+    () => offered.find((c) => c.id === value.connectionId) ?? null,
+    [offered, value.connectionId],
   );
 
   const loadNamespaces = useCallback(
@@ -77,10 +88,17 @@ export function EndpointPicker({
 
   // Pick a sensible default connection on first render.
   useEffect(() => {
-    if (!value.connectionId && connections.length > 0) {
-      onChange({ connectionId: connections[0].id, namespace: "", table: undefined });
+    if (!value.connectionId && offered.length > 0) {
+      onChange({ connectionId: offered[0].id, namespace: "", table: undefined });
     }
-  }, [connections, onChange, value.connectionId]);
+  }, [offered, onChange, value.connectionId]);
+
+  // Drop a selection that is no longer offered (e.g. the source engine changed).
+  useEffect(() => {
+    if (!value.connectionId) return;
+    if (offered.some((c) => c.id === value.connectionId)) return;
+    onChange({ connectionId: "", namespace: "", table: undefined });
+  }, [offered, onChange, value.connectionId]);
 
   useEffect(() => {
     if (value.connectionId) void loadNamespaces(value.connectionId);
@@ -132,6 +150,14 @@ export function EndpointPicker({
         </button>
       </div>
 
+      {dialectFilter && offered.length === 0 && (
+        <div className="warnbox" style={{ marginBottom: 8 }}>
+          还没有 {dialectFilter === "postgres" ? "PostgreSQL" : "MySQL"} 连接。
+          本工具只支持同类型数据库之间同步，请先用左上角「新建连接」添加一个
+          {dialectFilter === "postgres" ? " PostgreSQL " : " MySQL "}连接。
+        </div>
+      )}
+
       <div className="row">
         <select
           value={value.connectionId}
@@ -142,7 +168,7 @@ export function EndpointPicker({
           style={{ minWidth: 150 }}
         >
           <option value="">选择连接…</option>
-          {connections.map((config) => (
+          {offered.map((config) => (
             <option key={config.id} value={config.id}>
               {config.name}
             </option>

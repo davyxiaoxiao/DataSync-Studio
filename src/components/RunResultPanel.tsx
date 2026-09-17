@@ -25,6 +25,14 @@ export function RunResultPanel({ result, title }: { result: SyncRunResult; title
         </span>
       </div>
 
+      {(result.warnings ?? []).length > 0 && (
+        <div className="warnbox" style={{ marginTop: 8 }}>
+          {(result.warnings ?? []).map((warning, index) => (
+            <div key={index}>{warning}</div>
+          ))}
+        </div>
+      )}
+
       {expanded && (
         <div style={{ maxHeight: 260, overflow: "auto" }}>
           {(result.failed > 0 ? result.failures : result.sample).map((outcome, index) => (

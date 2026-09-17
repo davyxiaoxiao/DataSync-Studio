@@ -50,248 +50,8 @@ impl SyncSelection {
 }
 
 // ---------------------------------------------------------------------------
-// Type mapping
-// ---------------------------------------------------------------------------
-
-/// Lower-case canonical base name plus its argument list.
-fn parse_type(full_type: &str) -> (String, Option<String>) {
-    let lower = full_type.trim().to_lowercase();
-    let (base, args, tail) = match lower.find('(') {
-        Some(open) => {
-            let end = lower.rfind(')').unwrap_or(lower.len());
-            let base = lower[..open].trim().to_string();
-            let args = lower[open + 1..end].trim().to_string();
-            let tail = if end < lower.len() {
-                lower[end + 1..].trim().to_string()
-            } else {
-                String::new()
-            };
-            (base, args, tail)
-        }
-        None => (lower.trim().to_string(), String::new(), String::new()),
-    };
-    let combined = if tail.is_empty() {
-        base
-    } else {
-        format!("{base} {tail}")
-    };
-    let base = normalize_base(&combined);
-    (base, if args.is_empty() { None } else { Some(args) })
-}
-
-fn normalize_base(base: &str) -> String {
-    let collapsed = base.split_whitespace().collect::<Vec<_>>().join(" ");
-    match collapsed.as_str() {
-        "character varying" | "varchar" => "varchar".into(),
-        "character" | "bpchar" | "char" => "char".into(),
-        "timestamp with time zone" | "timestamptz" => "timestamptz".into(),
-        "timestamp without time zone" => "timestamp".into(),
-        "time with time zone" | "timetz" => "timetz".into(),
-        "time without time zone" | "time" => "time".into(),
-        "double precision" | "float8" | "double" => "double".into(),
-        "real" | "float4" => "real".into(),
-        "integer" | "int4" | "int" | "mediumint" => "integer".into(),
-        "int2" => "smallint".into(),
-        "int8" => "bigint".into(),
-        "numeric" | "decimal" | "dec" | "fixed" => "decimal".into(),
-        "bool" => "boolean".into(),
-        "bit varying" => "varbit".into(),
-        other => {
-            let stripped = other
-                .replace(" unsigned", "")
-                .replace(" zerofill", "")
-                .replace("[]", "");
-            stripped.trim().to_string()
-        }
-    }
-}
-
-fn has_unsigned(full_type: &str) -> bool {
-    full_type.to_lowercase().contains("unsigned")
-}
-
-fn first_arg(args: &Option<String>) -> Option<String> {
-    args.as_ref()
-        .and_then(|a| a.split(',').next())
-        .map(|s| s.trim().to_string())
-}
-
-/// The declared type to use on the `target` engine.
-pub fn map_type(source: Dialect, target: Dialect, column: &ColumnInfo) -> String {
-    if source == target {
-        return column.full_type.clone();
-    }
-    let (base, args) = parse_type(&column.full_type);
-    let unsigned = column.is_unsigned || has_unsigned(&column.full_type);
-    let arg_text = args.clone().unwrap_or_default();
-    let length = first_arg(&args).and_then(|v| v.parse::<i64>().ok());
-
-    match target {
-        Dialect::Postgres => match base.as_str() {
-            "boolean" => "boolean".into(),
-            "tinyint" => {
-                if column.data_type.eq_ignore_ascii_case("BOOLEAN") {
-                    "boolean".into()
-                } else {
-                    "smallint".into()
-                }
-            }
-            "smallint" => "smallint".into(),
-            "integer" => "integer".into(),
-            "bigint" => {
-                if unsigned {
-                    "numeric(20)".into()
-                } else {
-                    "bigint".into()
-                }
-            }
-            "decimal" => {
-                if arg_text.is_empty() {
-                    "numeric".into()
-                } else {
-                    format!("numeric({arg_text})")
-                }
-            }
-            "real" => "real".into(),
-            "double" => "double precision".into(),
-            "char" => {
-                if arg_text.is_empty() {
-                    "char(1)".into()
-                } else {
-                    format!("char({arg_text})")
-                }
-            }
-            "varchar" => match length {
-                Some(n) if n > 10_485_760 => "text".into(),
-                Some(n) => format!("varchar({n})"),
-                None => "varchar".into(),
-            },
-            "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set" => "text".into(),
-            "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "bytea" => {
-                "bytea".into()
-            }
-            "date" => "date".into(),
-            "time" => {
-                if arg_text.is_empty() {
-                    "time".into()
-                } else {
-                    format!("time({arg_text})")
-                }
-            }
-            "datetime" => {
-                if arg_text.is_empty() {
-                    "timestamp".into()
-                } else {
-                    format!("timestamp({arg_text})")
-                }
-            }
-            "timestamp" => {
-                if arg_text.is_empty() {
-                    "timestamptz".into()
-                } else {
-                    format!("timestamptz({arg_text})")
-                }
-            }
-            "year" => "smallint".into(),
-            "json" => "jsonb".into(),
-            "bit" => match length {
-                Some(1) | None => "boolean".into(),
-                Some(n) => format!("bit({n})"),
-            },
-            "geometry" => "bytea".into(),
-            other => {
-                if other.starts_with("enum") || other.starts_with("set") {
-                    "text".into()
-                } else {
-                    "text".into()
-                }
-            }
-        },
-        Dialect::Mysql => match base.as_str() {
-            "boolean" => "tinyint(1)".into(),
-            "smallint" => "smallint".into(),
-            "integer" => "int".into(),
-            "bigint" => "bigint".into(),
-            "decimal" => {
-                if arg_text.is_empty() {
-                    "decimal(65,30)".into()
-                } else {
-                    format!("decimal({arg_text})")
-                }
-            }
-            "real" => "float".into(),
-            "double" => "double".into(),
-            "char" => {
-                if arg_text.is_empty() {
-                    "char(1)".into()
-                } else {
-                    format!("char({arg_text})")
-                }
-            }
-            "varchar" => match length {
-                Some(n) if n > 65_535 => "longtext".into(),
-                Some(n) => format!("varchar({n})"),
-                None => "varchar(255)".into(),
-            },
-            "text" | "xml" | "tsvector" => "longtext".into(),
-            "bytea" => "longblob".into(),
-            "date" => "date".into(),
-            "time" | "timetz" => {
-                if arg_text.is_empty() {
-                    "time".into()
-                } else {
-                    format!("time({arg_text})")
-                }
-            }
-            "timestamp" | "timestamptz" => {
-                if arg_text.is_empty() {
-                    "datetime".into()
-                } else {
-                    format!("datetime({arg_text})")
-                }
-            }
-            "json" | "jsonb" => "json".into(),
-            "uuid" => "char(36)".into(),
-            "inet" | "cidr" => "varchar(64)".into(),
-            "macaddr" | "macaddr8" => "varchar(32)".into(),
-            "interval" => "varchar(64)".into(),
-            "varbit" => "varchar(64)".into(),
-            "money" => "decimal(19,4)".into(),
-            other if other.starts_with('_') => "json".into(),
-            _ => "longtext".into(),
-        },
-    }
-}
-
-/// Type text used when deciding whether a column changed.
-pub fn map_type_for_compare(source: Dialect, target: Dialect, column: &ColumnInfo) -> String {
-    if source == target {
-        column.canonical_type()
-    } else {
-        map_type(source, target, column).to_lowercase()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Default value handling
 // ---------------------------------------------------------------------------
-
-fn strip_pg_cast(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut in_quote = false;
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        match bytes[i] {
-            b'\'' => in_quote = !in_quote,
-            b':' if !in_quote && bytes[i + 1] == b':' => {
-                return value[..i].trim().to_string();
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    value.trim().to_string()
-}
 
 fn is_time_keyword(upper: &str) -> bool {
     upper.starts_with("CURRENT_TIMESTAMP")
@@ -328,86 +88,37 @@ fn is_boolean_family(column: &ColumnInfo) -> bool {
     )
 }
 
-/// Render the DEFAULT clause for a column on the target engine, or `None` when
-/// there is no usable default.
-fn render_default(
-    column: &ColumnInfo,
-    source: Dialect,
-    target: Dialect,
-) -> Option<String> {
+/// Render the DEFAULT clause for a column, or `None` when there is no usable
+/// default. Only one engine is ever involved, so each dialect is handled with
+/// its own native representation.
+fn render_default(column: &ColumnInfo, dialect: Dialect) -> Option<String> {
     let raw = column.default.as_ref()?.trim().to_string();
-    if raw.is_empty() {
+    if raw.is_empty() || raw.eq_ignore_ascii_case("NULL") {
         return None;
     }
-    let upper = raw.to_ascii_uppercase();
-    if upper == "NULL" {
-        return None;
-    }
-
-    // Expressions that are valid on both engines.
-    if is_time_keyword(&upper) {
-        return Some(match (source, target) {
-            (Dialect::Postgres, Dialect::Mysql) => "CURRENT_TIMESTAMP".to_string(),
-            _ => raw.clone(),
-        });
-    }
-
-    // A default produced by a generator expression keeps its parentheses.
-    let looks_like_expression = raw.starts_with('(')
-        || upper.contains("NEXTVAL(")
-        || upper.ends_with(')')
-        || upper.starts_with("ARRAY[");
-
-    if source == Dialect::Postgres {
-        let stripped = strip_pg_cast(&raw);
-        if target == Dialect::Postgres {
-            return Some(stripped);
-        }
-        // PostgreSQL -> MySQL
-        if stripped.eq_ignore_ascii_case("true") {
-            return Some("1".into());
-        }
-        if stripped.eq_ignore_ascii_case("false") {
-            return Some("0".into());
-        }
-        if stripped.starts_with('\'') {
-            return Some(stripped);
-        }
-        if is_numeric_family(column) || stripped.parse::<f64>().is_ok() {
-            return Some(stripped);
-        }
-        return Some(Dialect::Mysql.string_literal(&stripped));
-    }
-
-    // MySQL -> ...
-    if looks_like_expression {
-        return Some(raw.clone());
-    }
-    if is_boolean_family(column) {
-        let truthy = matches!(upper.as_str(), "1" | "TRUE" | "B'1'");
-        return Some(match target {
-            Dialect::Mysql => {
-                if truthy {
-                    "1".into()
-                } else {
-                    "0".into()
-                }
+    match dialect {
+        // `pg_get_expr` already yields a complete, correctly typed expression
+        // such as `'abc'::character varying`, `0`, `true` or `now()`.
+        Dialect::Postgres => Some(raw),
+        Dialect::Mysql => {
+            let upper = raw.to_ascii_uppercase();
+            if is_time_keyword(&upper) {
+                return Some(raw);
             }
-            Dialect::Postgres => {
-                if truthy {
-                    "true".into()
-                } else {
-                    "false".into()
-                }
+            let looks_like_expression =
+                raw.starts_with('(') || upper.ends_with(')') || upper.starts_with("ARRAY[");
+            if looks_like_expression {
+                return Some(raw);
             }
-        });
-    }
-    if is_numeric_family(column) && raw.parse::<f64>().is_ok() {
-        return Some(raw);
-    }
-    match target {
-        Dialect::Mysql => Some(Dialect::Mysql.string_literal(&raw)),
-        Dialect::Postgres => Some(Dialect::Postgres.string_literal(&raw)),
+            if is_boolean_family(column) {
+                let truthy = matches!(upper.as_str(), "1" | "TRUE" | "B'1'");
+                return Some(if truthy { "1" } else { "0" }.to_string());
+            }
+            if is_numeric_family(column) && raw.parse::<f64>().is_ok() {
+                return Some(raw);
+            }
+            Some(Dialect::Mysql.string_literal(&raw))
+        }
     }
 }
 
@@ -415,93 +126,16 @@ fn render_default(
 // Column definitions
 // ---------------------------------------------------------------------------
 
-/// Constructs that exist in one engine's expression language but not the
-/// other. When any of these survive translation the generated column is
-/// created as a plain column instead of guessing at a wrong expression.
-const NON_PORTABLE: [&str; 14] = [
-    "::", "jsonb_", "json_", "->>", "->", "regexp_", "array_", "string_agg", "unnest",
-    "substring_index", "group_concat", "date_format", "str_to_date", "convert_tz",
-];
-
-/// Mechanically translate a generation expression between dialects, reporting
-/// whether the result is trustworthy. Cross-dialect expressions are always
-/// surfaced as a warning so the user can review them.
-fn port_generation_expression(
-    expression: &str,
-    source: Dialect,
-    target: Dialect,
-) -> (String, bool) {
-    let trimmed = expression.trim();
-    if source == target {
-        return (trimmed.to_string(), true);
-    }
-    let mut ported = trimmed.to_string();
-    match (source, target) {
-        // MySQL quotes identifiers with backticks; PostgreSQL needs quotes.
-        (Dialect::Mysql, Dialect::Postgres) => {
-            ported = ported
-                .replace('`', "\"")
-                .replace("ifnull(", "coalesce(")
-                .replace("IFNULL(", "coalesce(");
-        }
-        // PostgreSQL double-quotes identifiers and annotates casts; MySQL uses
-        // backticks and has no `::`.
-        (Dialect::Postgres, Dialect::Mysql) => {
-            ported = ported.replace('"', "`");
-            ported = strip_pg_casts(&ported);
-        }
-        // Same engine: handled by the early return above.
-        _ => {}
-    }
-    let lowered = ported.to_lowercase();
-    let trustworthy =
-        !NON_PORTABLE.iter().any(|needle| lowered.contains(needle)) && !ported.contains("select ");
-    (ported, trustworthy)
-}
-
-/// Remove `expr::type` annotations, which MySQL does not understand.
-pub(crate) fn strip_pg_casts(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
-    let mut in_quote = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' {
-            in_quote = !in_quote;
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if !in_quote && ch == ':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
-            i += 2;
-            // Skip the type name (identifiers, spaces, digits, parentheses).
-            while i < bytes.len() {
-                let c = bytes[i] as char;
-                if c.is_alphanumeric() || c == '_' || c == ' ' || c == '(' || c == ')' || c == ',' {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-        i += 1;
-    }
-    out
-}
-
 /// A rendered column definition plus anything the user should know about it.
 struct ColumnDdl {
     sql: String,
     warning: Option<String>,
 }
 
-fn column_definition(column: &ColumnInfo, source: Dialect, target: Dialect) -> ColumnDdl {
+fn column_definition(column: &ColumnInfo, target: Dialect) -> ColumnDdl {
     let q = |name: &str| target.quote(name);
-    let ty = map_type(source, target, column);
-    let mut parts = vec![format!("{} {}", q(&column.name), ty)];
+    // Both sides are the same engine, so the declared type is reused verbatim.
+    let mut parts = vec![format!("{} {}", q(&column.name), column.full_type)];
 
     if column.is_generated {
         if let Some(expression) = column
@@ -510,40 +144,24 @@ fn column_definition(column: &ColumnInfo, source: Dialect, target: Dialect) -> C
             .map(str::trim)
             .filter(|e| !e.is_empty())
         {
-            let (ported, trustworthy) = port_generation_expression(expression, source, target);
-            if trustworthy {
-                // PostgreSQL only supports STORED generated columns.
-                let kind = match target {
-                    Dialect::Postgres => "STORED",
-                    Dialect::Mysql => match column.generation_kind.as_deref() {
-                        Some("virtual") => "VIRTUAL",
-                        _ => "STORED",
-                    },
-                };
-                parts.push(format!("GENERATED ALWAYS AS ({ported}) {kind}"));
-                let warning = (source != target).then(|| {
-                    format!(
-                        "列 {} 的生成表达式已按 {} 语法机械转换为「{ported}」，请核对结果是否符合预期",
-                        column.name,
-                        target.label()
-                    )
-                });
-                return ColumnDdl {
-                    sql: parts.join(" "),
-                    warning,
-                };
-            }
+            // Same engine on both sides, so the expression is reproduced
+            // verbatim. PostgreSQL only supports STORED generated columns.
+            let kind = match target {
+                Dialect::Postgres => "STORED",
+                Dialect::Mysql => match column.generation_kind.as_deref() {
+                    Some("virtual") => "VIRTUAL",
+                    _ => "STORED",
+                },
+            };
+            parts.push(format!("GENERATED ALWAYS AS ({expression}) {kind}"));
+            return ColumnDdl {
+                sql: parts.join(" "),
+                warning: None,
+            };
         }
         // No usable expression: fall back to an ordinary column so the table can
         // still be created, and warn rather than silently producing a column
         // whose values will never be computed.
-        let reason = match column.generation_expression.as_deref().map(str::trim) {
-            Some(expression) if !expression.is_empty() => format!(
-                "生成表达式无法可靠转换为 {} 语法（原表达式：{expression}），已改为普通列，请手动补回",
-                target.label()
-            ),
-            _ => "服务端未返回生成表达式，已改为普通列，请手动补回".to_string(),
-        };
         if !column.nullable {
             parts.push("NOT NULL".into());
         }
@@ -554,7 +172,10 @@ fn column_definition(column: &ColumnInfo, source: Dialect, target: Dialect) -> C
         }
         return ColumnDdl {
             sql: parts.join(" "),
-            warning: Some(format!("列 {}：{reason}", column.name)),
+            warning: Some(format!(
+                "列 {}：服务端未返回生成表达式，已改为普通列，请手动补回",
+                column.name
+            )),
         };
     }
 
@@ -568,7 +189,7 @@ fn column_definition(column: &ColumnInfo, source: Dialect, target: Dialect) -> C
         if !column.nullable {
             parts.push("NOT NULL".into());
         }
-        if let Some(default) = render_default(column, source, target) {
+        if let Some(default) = render_default(column, target) {
             parts.push(format!("DEFAULT {default}"));
         }
         if column.is_auto_increment && target == Dialect::Mysql {
@@ -707,7 +328,6 @@ fn drop_fk_ddl(
 
 fn create_table_ddl(
     structure: &TableStructure,
-    source: Dialect,
     target: Dialect,
     schema: Option<&str>,
     source_schema: &str,
@@ -717,7 +337,7 @@ fn create_table_ddl(
     let tref = target.qualified(schema, &structure.name);
     let mut body: Vec<String> = Vec::new();
     for column in &structure.columns {
-        let definition = column_definition(column, source, target);
+        let definition = column_definition(column, target);
         if let Some(warning) = definition.warning {
             warnings.push(format!("表 {}：{warning}", structure.name));
         }
@@ -846,7 +466,6 @@ fn previous_column(columns: &[&ColumnInfo], name: &str) -> Option<String> {
 
 fn alter_column_statements(
     table: &TableDiff,
-    source: &Dialect,
     target: Dialect,
     schema: Option<&str>,
     warnings: &mut Vec<String>,
@@ -895,7 +514,7 @@ fn alter_column_statements(
         };
         match diff.kind {
             ChangeKind::New => {
-                let definition = column_definition(column, *source, target);
+                let definition = column_definition(column, target);
                 if let Some(warning) = definition.warning {
                     warnings.push(format!("表 {}：{warning}", table.name));
                 }
@@ -937,7 +556,7 @@ fn alter_column_statements(
                     ));
                 }
                 if target == Dialect::Mysql {
-                    let definition = column_definition(column, *source, target);
+                    let definition = column_definition(column, target);
                     if let Some(warning) = definition.warning {
                         warnings.push(format!("表 {}：{warning}", table.name));
                     }
@@ -962,7 +581,7 @@ fn alter_column_statements(
                         .differences
                         .iter()
                         .any(|d| d.field == "类型");
-                    let new_type = map_type(*source, target, column);
+                    let new_type = column.full_type.clone();
                     if type_changed {
                         out.push(DdlStatement {
                             table: table.name.clone(),
@@ -997,7 +616,7 @@ fn alter_column_statements(
                     }
                     let default_changed = diff.differences.iter().any(|d| d.field == "默认值");
                     if default_changed {
-                        let clause = match render_default(column, *source, target) {
+                        let clause = match render_default(column, target) {
                             Some(value) => format!("SET DEFAULT {value}"),
                             None => "DROP DEFAULT".to_string(),
                         };
@@ -1068,7 +687,6 @@ pub fn generate(
     target_schema: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Vec<DdlStatement> {
-    let source_dialect = diff.source_dialect;
     let target = diff.target_dialect;
     // `None` means "no explicit selection was supplied, apply every change".
     // `Some(empty)` means the user unchecked everything and must apply nothing.
@@ -1096,7 +714,6 @@ pub fn generate(
                     if let Some(structure) = sources.get(&table.name) {
                         for statement in create_table_ddl(
                             structure,
-                            source_dialect,
                             target,
                             target_schema,
                             &diff.source_namespace,
@@ -1267,7 +884,6 @@ pub fn generate(
                 };
                 body.extend(alter_column_statements(
                     &filtered,
-                    &source_dialect,
                     target,
                     target_schema,
                     warnings,

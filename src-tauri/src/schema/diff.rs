@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dialect::Dialect;
-use crate::schema::ddl::map_type_for_compare;
 use crate::schema::model::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableStructure};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,9 +422,9 @@ fn column_differences(
 ) -> Vec<FieldChange> {
     let mut out = Vec::new();
 
-    let source_type = map_type_for_compare(source_dialect, target_dialect, source);
-    let target_type = target.canonical_type();
-    if !types_equivalent(&source_type, &target_type, source_dialect, target_dialect) {
+    // Both endpoints are the same engine, so the declared types are directly
+    // comparable once display widths and whitespace are normalised.
+    if source.canonical_type() != target.canonical_type() {
         out.push(FieldChange {
             field: "类型".into(),
             source: Some(source.full_type.clone()),
@@ -575,10 +574,7 @@ fn normalize_generation(value: Option<&str>) -> String {
     let Some(raw) = value else {
         return String::new();
     };
-    let mut text = crate::schema::ddl::strip_pg_casts(raw)
-        .to_lowercase()
-        .replace('`', "")
-        .replace('"', "");
+    let mut text = raw.to_lowercase().replace('`', "").replace('"', "");
     text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     for _ in 0..16 {
         let next = strip_single_token_parens(&strip_outer_parens(&text));
@@ -719,75 +715,4 @@ fn defaults_match(
         }
     }
     normalize_default(source_default) == normalize_default(target_default)
-}
-
-/// Loose type comparison used when the two endpoints are different engines.
-pub fn types_equivalent(
-    left: &str,
-    right: &str,
-    source_dialect: Dialect,
-    target_dialect: Dialect,
-) -> bool {
-    let a = normalize_type_text(left);
-    let b = normalize_type_text(right);
-    if a == b {
-        return true;
-    }
-    if source_dialect == target_dialect {
-        return false;
-    }
-    synonym(a.trim()) == synonym(b.trim())
-}
-
-fn normalize_type_text(value: &str) -> String {
-    let lower = value.to_lowercase();
-    let collapsed = lower.split_whitespace().collect::<Vec<_>>().join(" ");
-    strip_int_width(&collapsed)
-}
-
-fn strip_int_width(input: &str) -> String {
-    for family in ["tinyint", "smallint", "mediumint", "int", "integer", "bigint"] {
-        let prefix = format!("{family}(");
-        if let Some(rest) = input.strip_prefix(&prefix) {
-            if let Some(close) = rest.find(')') {
-                if rest[..close].chars().all(|c| c.is_ascii_digit()) {
-                    return format!("{family}{}", &rest[close + 1..]);
-                }
-            }
-        }
-    }
-    input.to_string()
-}
-
-/// Collapse engine-specific spellings of the same logical type.
-fn synonym(value: &str) -> String {
-    let without_modifiers = value
-        .replace(" unsigned", "")
-        .replace(" zerofill", "")
-        .replace(" without time zone", "")
-        .replace(" with time zone", "")
-        .replace("character varying", "varchar")
-        .replace("character", "char")
-        .replace("double precision", "double")
-        .replace("timestamp with time zone", "timestamptz");
-    let base = without_modifiers.trim();
-    let (head, args) = match base.find('(') {
-        Some(idx) => (&base[..idx], &base[idx..]),
-        None => (base, ""),
-    };
-    let head = match head.trim() {
-        "integer" | "int4" | "mediumint" => "int",
-        "int2" => "smallint",
-        "int8" => "bigint",
-        "numeric" | "dec" | "fixed" => "decimal",
-        "float4" => "float",
-        "float8" => "double",
-        "bool" => "boolean",
-        "bpchar" => "char",
-        "longtext" | "mediumtext" | "tinytext" => "text",
-        "longblob" | "mediumblob" | "tinyblob" => "blob",
-        "timestamptz" | "datetime" => "timestamp",
-        other => other,
-    };
-    format!("{head}{args}")
 }

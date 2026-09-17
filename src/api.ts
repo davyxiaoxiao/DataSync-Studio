@@ -5,9 +5,9 @@ import type {
   ConnectionConfig,
   ConnectionInfo,
   DataDiffResult,
-  DdlStatement,
   NamespaceInfo,
   SchemaDiff,
+  SchemaSqlPreview,
   SyncRunResult,
   SyncSelection,
   TableData,
@@ -84,7 +84,7 @@ export const api = {
   }) => invoke<CompareSchemaResult>("compare_schema", { request }),
 
   previewSchemaSql: (compareId: string, selection?: SyncSelection | null) =>
-    invoke<DdlStatement[]>("preview_schema_sql", { compareId, selection: selection ?? null }),
+    invoke<SchemaSqlPreview>("preview_schema_sql", { compareId, selection: selection ?? null }),
 
   applySchemaSync: (request: {
     compareId: string;
