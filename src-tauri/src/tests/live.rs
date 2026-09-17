@@ -15,7 +15,9 @@
 
 use std::collections::HashMap;
 
-use crate::commands::{apply_data_plan, compare_data_core, compare_schema_core};
+use crate::commands::{
+    apply_data_plan, compare_data_core, compare_schema_core, preview_table_data_core,
+};
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
 use crate::dialect::Dialect;
@@ -251,6 +253,24 @@ fn source_view_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
     }
 }
 
+/// A NOT NULL column with no default, added once the target already holds rows.
+///
+/// The *source* side is prepared the same way the tool has to prepare the
+/// target: PostgreSQL refuses the bare ALTER on a populated table, so a
+/// placeholder value is used and the default dropped again.
+fn late_column_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
+    let users = dialect.qualified(Some(ns), "users");
+    let column = dialect.quote("channel");
+    let type_name = match dialect {
+        Dialect::Mysql => "VARCHAR(32)",
+        Dialect::Postgres => "character varying(32)",
+    };
+    vec![
+        format!("ALTER TABLE {users} ADD COLUMN {column} {type_name} NOT NULL DEFAULT ''"),
+        format!("ALTER TABLE {users} ALTER COLUMN {column} DROP DEFAULT"),
+    ]
+}
+
 /// Drop the source-side views in reverse dependency order.
 fn drop_view_ddl(dialect: Dialect, ns: &str) -> Vec<String> {
     let mut names: Vec<&str> = view_names(dialect);
@@ -374,6 +394,29 @@ async fn refresh_source_matviews(pool: &Pool, dialect: Dialect, ns: &str) {
         )
         .await;
     }
+}
+
+/// Read one text column from the first row of a table.
+async fn scalar_text(
+    pool: &Pool,
+    namespace: &str,
+    table: &str,
+    column: &str,
+    dialect: Dialect,
+) -> String {
+    let sql = format!(
+        "SELECT {} FROM {}",
+        dialect.quote(column),
+        dialect.qualified(Some(namespace), table)
+    );
+    let rows = pool
+        .fetch(&sql, &[], &[crate::db::value::ColumnKind::Str])
+        .await
+        .unwrap_or_else(|e| panic!("读取 {table}.{column} 失败: {e}"));
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(|value| value.display())
+        .unwrap_or_else(|| panic!("{table}.{column} 没有值"))
 }
 
 /// `SELECT COUNT(*)` through a view on the target side.
@@ -745,6 +788,70 @@ async fn roundtrip(
         (value - 20.0).abs() < 1e-6,
         "{tag}: 生成列应由目标端重算为 amount*2 = 20.00, 实际 {value}"
     );
+
+    // ---- 9. NOT NULL column added while the target already holds rows ------
+    // PostgreSQL rejects this outright unless values are supplied for the
+    // existing rows; the planner backfills with a placeholder default and then
+    // removes it again.
+    exec_all(source_pool, &late_column_ddl(source_dialect, source_ns)).await;
+
+    let (late, late_sources, _) = compare_schema_core(
+        source_pool,
+        source_ns,
+        target_pool,
+        target_ns,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("compare late column");
+    assert_eq!(
+        late.summary.new_columns, 1,
+        "{tag}: 期望识别出 1 个新增列, 实际 {:?}",
+        late.summary
+    );
+
+    let mut late_warnings = Vec::new();
+    let late_plan = generate(
+        &late,
+        &late_sources,
+        None,
+        Some(target_ns),
+        &mut late_warnings,
+    );
+    run_plan(target_pool, late_plan.into_iter().map(|s| s.sql).collect()).await;
+
+    let (after_late, _, _) = compare_schema_core(
+        source_pool,
+        source_ns,
+        target_pool,
+        target_ns,
+        CompareOptions::default(),
+        None,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("re-compare after late column");
+    assert_structurally_identical(&after_late, &format!("{tag} 非空列新增"));
+
+    // The placeholder must not survive as a real default.
+    let target_structure =
+        crate::schema::introspect::load_table(target_pool, target_ns, "users")
+            .await
+            .expect("load target users");
+    let channel = target_structure
+        .column("channel")
+        .expect("目标表应有 channel 列");
+    assert!(!channel.nullable, "{tag}: channel 应为非空");
+    assert!(
+        channel.default.is_none(),
+        "{tag}: 占位默认值应当已被删除，实际 {:?}",
+        channel.default
+    );
+    // Existing rows were backfilled so the column could be made NOT NULL.
+    let filled = scalar_text(target_pool, target_ns, "users", "channel", target_dialect).await;
+    assert_eq!(filled, "", "{tag}: 现有行应被回填为空串占位值");
 }
 
 #[tokio::test]
@@ -1027,6 +1134,247 @@ async fn live_postgres_streaming_pagination() {
         "pg 分页",
     )
     .await;
+}
+
+/// Table data browsing: pagination, `has_more`, and the column kinds the grid
+/// switches on. PostgreSQL's `uuid`/`inet`/`text[]`/enum columns and MySQL's
+/// TEXT columns (reported as BLOB on the wire) are the interesting cases.
+async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
+    drop_namespace(pool, dialect, ns).await;
+    create_namespace(pool, dialect, ns).await;
+
+    let table = dialect.qualified(Some(ns), "browse");
+    let quoted = |name: &str| dialect.quote(name);
+
+    match dialect {
+        Dialect::Mysql => {
+            exec(
+                pool,
+                &format!(
+                    "CREATE TABLE {table} (
+                        `id` INT NOT NULL,
+                        `title` VARCHAR(64) NOT NULL,
+                        `body` TEXT,
+                        `amount` DECIMAL(10,2),
+                        `flag` TINYINT(1) NOT NULL,
+                        `created_at` DATETIME NOT NULL,
+                        `meta` JSON,
+                        `payload` LONGBLOB,
+                        `status` ENUM('draft','live') NOT NULL,
+                        PRIMARY KEY (`id`)
+                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+                ),
+            )
+            .await;
+        }
+        Dialect::Postgres => {
+            exec(
+                pool,
+                &format!(
+                    "CREATE TYPE {}.\"mood\" AS ENUM ('draft','live')",
+                    dialect.quote(ns)
+                ),
+            )
+            .await;
+            exec(
+                pool,
+                &format!(
+                    "CREATE TABLE {table} (
+                        \"id\" integer NOT NULL,
+                        \"title\" character varying(64) NOT NULL,
+                        \"body\" text,
+                        \"amount\" numeric(10,2),
+                        \"flag\" boolean NOT NULL,
+                        \"created_at\" timestamp NOT NULL,
+                        \"meta\" jsonb,
+                        \"payload\" bytea,
+                        \"status\" {}.\"mood\" NOT NULL,
+                        \"uid\" uuid,
+                        \"addr\" inet,
+                        \"tags\" text[],
+                        CONSTRAINT \"browse_pkey\" PRIMARY KEY (\"id\")
+                     )",
+                    dialect.quote(ns)
+                ),
+            )
+            .await;
+        }
+    }
+
+    let total = 10usize;
+    for id in 1..=total {
+        let sql = match dialect {
+            Dialect::Mysql => format!(
+                "INSERT INTO {table} (`id`,`title`,`body`,`amount`,`flag`,`created_at`,`meta`,`payload`,`status`)
+                 VALUES ({id}, 'title-{id}', 'body-{id}', {id}.25, {}, '2024-01-{:02} 08:00:00',
+                         '{{\"n\": {id}}}', X'0102', '{}')",
+                if id % 2 == 0 { 1 } else { 0 },
+                id,
+                if id % 2 == 0 { "live" } else { "draft" }
+            ),
+            Dialect::Postgres => format!(
+                "INSERT INTO {table} (\"id\",\"title\",\"body\",\"amount\",\"flag\",\"created_at\",\"meta\",\"payload\",\"status\",\"uid\",\"addr\",\"tags\")
+                 VALUES ({id}, 'title-{id}', 'body-{id}', {id}.25, {}, '2024-01-{:02} 08:00:00',
+                         '{{\"n\": {id}}}', '\\x0102'::bytea, '{}',
+                         '00000000-0000-0000-0000-{:012}'::uuid, '10.0.0.{id}'::inet,
+                         ARRAY['a','b']::text[])",
+                if id % 2 == 0 { "true" } else { "false" },
+                id,
+                if id % 2 == 0 { "live" } else { "draft" },
+                id
+            ),
+        };
+        exec(pool, &sql).await;
+    }
+
+    // ---- first page -------------------------------------------------------
+    let page1 = preview_table_data_core(pool, ns, "browse", Some(3), Some(0))
+        .await
+        .expect("browse page 1");
+    assert_eq!(page1.rows.len(), 3, "{tag}: 首页应有 3 行");
+    assert!(page1.has_more, "{tag}: 10 行取 3 行应当还有更多");
+    assert_eq!(page1.limit, 3);
+    assert_eq!(page1.offset, 0);
+    assert_eq!(page1.primary_key, vec!["id".to_string()]);
+
+    // ---- column kinds -----------------------------------------------------
+    use crate::db::value::ColumnKind;
+    let kind_of = |name: &str| -> ColumnKind {
+        page1
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{tag}: 缺少列 {name}"))
+            .kind
+    };
+    assert_eq!(kind_of("id"), ColumnKind::Int, "{tag}");
+    assert_eq!(kind_of("amount"), ColumnKind::Decimal, "{tag}");
+    assert_eq!(kind_of("flag"), ColumnKind::Bool, "{tag}");
+    assert_eq!(kind_of("created_at"), ColumnKind::DateTime, "{tag}");
+    assert_eq!(kind_of("meta"), ColumnKind::Json, "{tag}");
+    assert_eq!(kind_of("payload"), ColumnKind::Bytes, "{tag}");
+    assert_eq!(kind_of("title"), ColumnKind::Str, "{tag}");
+    assert_eq!(kind_of("body"), ColumnKind::Str, "{tag}");
+    // MySQL has a real ENUM type; PostgreSQL's is a user-defined type read as text.
+    match dialect {
+        Dialect::Mysql => assert_eq!(kind_of("status"), ColumnKind::Str, "{tag}"),
+        Dialect::Postgres => {
+            assert_eq!(kind_of("status"), ColumnKind::Text, "{tag}");
+            // Types the driver cannot decode natively must still come back.
+            assert_eq!(kind_of("uid"), ColumnKind::Str, "{tag}");
+            assert_eq!(kind_of("addr"), ColumnKind::Text, "{tag}");
+            assert_eq!(kind_of("tags"), ColumnKind::Text, "{tag}");
+        }
+    }
+    assert!(page1.columns.iter().any(|c| c.primary_key && c.name == "id"));
+
+    // ---- cells ------------------------------------------------------------
+    let column_index = |name: &str| -> usize {
+        page1
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{tag}: 缺少列 {name}"))
+    };
+    let text_at = |row: usize, name: &str| -> String {
+        page1.rows[row][column_index(name)]
+            .text
+            .clone()
+            .unwrap_or_else(|| panic!("{tag}: 第 {row} 行 {name} 为空"))
+    };
+    assert_eq!(page1.rows.len(), 3);
+    for (offset, row) in page1.rows.iter().enumerate() {
+        assert_eq!(
+            row.len(),
+            page1.columns.len(),
+            "{tag}: 第 {offset} 行的单元格数与列数不一致"
+        );
+    }
+    // Regression guard: MySQL reports TEXT columns as BLOB on the wire, and the
+    // information_schema text columns carry the binary flag. Reading any of them
+    // as bytes would show up here as a hex string.
+    for name in ["title", "body", "status"] {
+        let value = text_at(0, name);
+        assert_eq!(value, format!("{name}-1").replace("status-1", "draft"), "{tag}: {name}");
+    }
+    assert_eq!(text_at(0, "meta"), "{\"n\":1}", "{tag}: JSON 应渲染为文本");
+    if dialect == Dialect::Postgres {
+        assert_eq!(text_at(0, "uid"), "00000000-0000-0000-0000-000000000001");
+        // PostgreSQL renders `inet` as text with its netmask.
+        assert!(
+            text_at(0, "addr").starts_with("10.0.0.1"),
+            "{tag}: inet 应可读，实际 {}",
+            text_at(0, "addr")
+        );
+        // PostgreSQL renders `text[]` as `{a,b}` (quotes only when needed).
+        let tags = text_at(0, "tags");
+        assert!(
+            tags.contains('a') && tags.contains('b') && tags.starts_with('{'),
+            "{tag}: 数组应以 text 形式返回，实际 {tags}"
+        );
+    }
+
+    // ---- second page continues the ordering without overlapping -----------
+    let page2 = preview_table_data_core(pool, ns, "browse", Some(3), Some(3))
+        .await
+        .expect("browse page 2");
+    assert_eq!(page2.offset, 3);
+    let id_at = |page: &crate::commands::TableData, row: usize| -> i64 {
+        page.rows[row]
+            .iter()
+            .zip(page.columns.iter())
+            .find(|(_, column)| column.name == "id")
+            .and_then(|(cell, _)| cell.text.as_deref())
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_else(|| panic!("{tag}: 无法读取 id"))
+    };
+    assert_eq!(id_at(&page1, 0), 1);
+    assert_eq!(id_at(&page1, 2), 3);
+    assert_eq!(id_at(&page2, 0), 4, "{tag}: 第二页应从第 4 行开始");
+
+    // ---- last page reports no more ---------------------------------------
+    let last = preview_table_data_core(pool, ns, "browse", Some(3), Some(9))
+        .await
+        .expect("browse last page");
+    assert_eq!(last.rows.len(), 1, "{tag}: 最后一页只剩 1 行");
+    assert!(!last.has_more, "{tag}: 最后一页不应还有更多");
+
+    // ---- a limit beyond the row count ------------------------------------
+    let all = preview_table_data_core(pool, ns, "browse", Some(50), Some(0))
+        .await
+        .expect("browse everything");
+    assert_eq!(all.rows.len(), total, "{tag}: 应返回全部 {total} 行");
+    assert!(!all.has_more, "{tag}: 全部返回后不应还有更多");
+
+    // ---- the generated SQL is the one that ran ---------------------------
+    assert!(
+        last.sql.to_uppercase().contains("ORDER BY"),
+        "{tag}: 分页查询必须按主键排序: {}",
+        last.sql
+    );
+
+    let _ = quoted;
+    drop_namespace(pool, dialect, ns).await;
+}
+
+#[tokio::test]
+async fn live_mysql_table_browsing() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    browse_scenario(&pool, Dialect::Mysql, "datasync_live_browse", "mysql 浏览").await;
+}
+
+#[tokio::test]
+async fn live_postgres_table_browsing() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    browse_scenario(&pool, Dialect::Postgres, "datasync_live_browse", "pg 浏览").await;
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must

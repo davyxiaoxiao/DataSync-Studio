@@ -1,6 +1,7 @@
 //! Unit tests for the pure planning logic (no database server needed) plus
 //! live integration tests driven by environment variables.
 
+pub mod contract;
 pub mod live;
 
 use std::collections::HashMap;
@@ -1316,5 +1317,217 @@ fn user_defined_column_types_are_schema_qualified() {
         create_table.sql.contains("\"status\" \"app\".\"mood\""),
         "自定义类型列必须限定 schema，否则 search_path 不含目标 schema 时会解析失败: {}",
         create_table.sql
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Adding a NOT NULL column to a table that already holds rows
+// ---------------------------------------------------------------------------
+
+fn plan_add_column(source: TableStructure, target: TableStructure) -> Vec<crate::schema::ddl::DdlStatement> {
+    let diff = compare_everything(
+        &[source.clone()],
+        &[target],
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let mut sources = HashMap::new();
+    sources.insert(source.name.clone(), source);
+    generate(&diff, &sources, None, Some("dst"), &mut Vec::new())
+}
+
+#[test]
+fn a_not_null_column_without_a_default_gets_a_placeholder_that_is_dropped() {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    let mut source = table("users", vec![id.clone()], &["id"]);
+    let mut required = col("code", "VARCHAR", "character varying(16)");
+    required.nullable = false;
+    source.columns.push(required);
+    let target = table("users", vec![id], &["id"]);
+
+    let plan = plan_add_column(source, target);
+    let categories: Vec<&str> = plan.iter().map(|s| s.category.as_str()).collect();
+    assert_eq!(
+        categories,
+        vec!["add_column", "drop_column_default"],
+        "非空无默认值的列必须先给占位值再删掉默认值: {categories:?}"
+    );
+    assert!(
+        plan[0].sql.contains("NOT NULL DEFAULT ''"),
+        "{}",
+        plan[0].sql
+    );
+    assert!(
+        plan[1]
+            .sql
+            .contains("ALTER TABLE \"dst\".\"users\" ALTER COLUMN \"code\" DROP DEFAULT;"),
+        "{}",
+        plan[1].sql
+    );
+}
+
+#[test]
+fn a_nullable_column_needs_no_placeholder() {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    let base = table("users", vec![id.clone()], &["id"]);
+    let mut source = base.clone();
+    source.columns.push(col("note", "VARCHAR", "character varying(16)"));
+    let plan = plan_add_column(source, base);
+    assert_eq!(plan.len(), 1, "可空列不应产生额外语句");
+    assert!(plan[0].sql.contains("ADD COLUMN \"note\""), "{}", plan[0].sql);
+    assert!(!plan[0].sql.contains("DEFAULT"), "{}", plan[0].sql);
+}
+
+#[test]
+fn a_not_null_column_with_its_own_default_needs_no_placeholder() {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    let base = table("users", vec![id.clone()], &["id"]);
+    let mut source = base.clone();
+    let mut active = col("active", "BOOLEAN", "boolean");
+    active.nullable = false;
+    active.default = Some("true".into());
+    source.columns.push(active);
+
+    let plan = plan_add_column(source, base);
+    assert_eq!(plan.len(), 1, "自带默认值就不需要占位: {:?}", plan.len());
+    assert!(plan[0].sql.contains("DEFAULT true"), "{}", plan[0].sql);
+}
+
+#[test]
+fn placeholder_values_are_type_appropriate() {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    let base = table("users", vec![id.clone()], &["id"]);
+
+    let cases: Vec<(ColumnInfo, &str)> = vec![
+        (
+            {
+                let mut c = col("n", "INT", "integer");
+                c.nullable = false;
+                c
+            },
+            "DEFAULT 0",
+        ),
+        (
+            {
+                let mut c = col("ok", "BOOLEAN", "boolean");
+                c.nullable = false;
+                c
+            },
+            "DEFAULT FALSE",
+        ),
+        (
+            {
+                let mut c = col("at", "TIMESTAMP", "timestamp");
+                c.nullable = false;
+                c
+            },
+            "DEFAULT '1970-01-01 00:00:00'",
+        ),
+        (
+            {
+                let mut c = col("doc", "JSONB", "jsonb");
+                c.nullable = false;
+                c
+            },
+            "DEFAULT '{}'::jsonb",
+        ),
+    ];
+
+    for (column, expected) in cases {
+        let mut source = base.clone();
+        source.columns.push(column.clone());
+        let plan = plan_add_column(source, base.clone());
+        assert!(
+            plan[0].sql.contains(expected),
+            "列 {} 应使用占位值 {expected}: {}",
+            column.name,
+            plan[0].sql
+        );
+    }
+}
+
+#[test]
+fn an_enum_column_uses_its_first_label_as_the_placeholder() {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    let base = table("orders", vec![id.clone()], &["id"]);
+    let mut source = base.clone();
+    let mut status = col("state", "MOOD", "mood");
+    status.nullable = false;
+    status.udt_name = Some("mood".into());
+    source.columns.push(status);
+
+    let diff = compare_everything(
+        &[source.clone()],
+        &[base],
+        &[],
+        &[],
+        &[enum_type("mood", &["draft", "live"])],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let mut sources = HashMap::new();
+    sources.insert(source.name.clone(), source);
+    let plan = generate(&diff, &sources, None, Some("dst"), &mut Vec::new());
+
+    let add_column = plan
+        .iter()
+        .find(|s| s.category == "add_column")
+        .expect("应生成 ADD COLUMN");
+    assert!(
+        add_column.sql.contains("DEFAULT 'draft'"),
+        "枚举列应使用第一个枚举值作为占位: {}",
+        add_column.sql
+    );
+}
+
+#[test]
+fn an_unrepresentable_type_warns_instead_of_guessing() {
+    let mut id = col("id", "INT", "integer");
+    id.nullable = false;
+    let base = table("users", vec![id.clone()], &["id"]);
+    let mut source = base.clone();
+    let mut point = col("loc", "POINT", "point");
+    point.nullable = false;
+    source.columns.push(point);
+
+    let diff = compare_everything(
+        &[source.clone()],
+        &[base],
+        &[],
+        &[],
+        &[],
+        &[],
+        Dialect::Postgres,
+        Dialect::Postgres,
+        "src",
+        "dst",
+        CompareOptions::default(),
+    );
+    let mut sources = HashMap::new();
+    sources.insert(source.name.clone(), source);
+    let mut warnings = Vec::new();
+    let plan = generate(&diff, &sources, None, Some("dst"), &mut warnings);
+
+    assert_eq!(plan.len(), 1, "不应生成无法执行的占位默认值");
+    assert!(!plan[0].sql.contains("DEFAULT"), "{}", plan[0].sql);
+    assert!(
+        warnings.iter().any(|w| w.contains("无法自动生成占位值")),
+        "{warnings:?}"
     );
 }

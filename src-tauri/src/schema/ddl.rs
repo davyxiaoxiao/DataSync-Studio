@@ -42,6 +42,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncSelection {
+    /// Every field is optional on the wire: a partial payload must not make the
+    /// whole request fail to deserialise.
+    #[serde(default)]
     pub tables: Vec<TableSelection>,
     /// Names of the views/ materialised views to apply.
     #[serde(default)]
@@ -151,11 +154,74 @@ struct ColumnDdl {
     warning: Option<String>,
 }
 
+/// A value used only to satisfy `NOT NULL` while a column is added to a table
+/// that may already contain rows. It is dropped again immediately afterwards,
+/// so it never becomes part of the schema.
+///
+/// `None` means "no safe placeholder for this type"; the caller then warns
+/// instead of guessing.
+fn placeholder_default(
+    column: &ColumnInfo,
+    dialect: Dialect,
+    types: &[TypeDiff],
+) -> Option<String> {
+    // A user-defined type is resolved first: an enum column reports its type as
+    // an opaque name, so `kind()` cannot tell it apart from an unknown type.
+    if let Some(udt) = column.udt_name.as_deref() {
+        let label = types
+            .iter()
+            .find(|entry| entry.name == udt)
+            .and_then(|entry| entry.source.as_ref())
+            .and_then(|entry| entry.labels.first());
+        if let Some(label) = label {
+            return Some(dialect.string_literal(label));
+        }
+    }
+
+    match column.kind() {
+        crate::db::value::ColumnKind::Bool => Some(dialect.bool_literal(false).to_string()),
+        crate::db::value::ColumnKind::Int
+        | crate::db::value::ColumnKind::Uint
+        | crate::db::value::ColumnKind::Float
+        | crate::db::value::ColumnKind::Decimal => Some("0".to_string()),
+        crate::db::value::ColumnKind::Date => Some(dialect.string_literal("1970-01-01")),
+        crate::db::value::ColumnKind::Time => Some(dialect.string_literal("00:00:00")),
+        crate::db::value::ColumnKind::DateTime => {
+            Some(dialect.string_literal("1970-01-01 00:00:00"))
+        }
+        crate::db::value::ColumnKind::Json => Some(match dialect {
+            Dialect::Mysql => "(JSON_OBJECT())".to_string(),
+            Dialect::Postgres => "'{}'::jsonb".to_string(),
+        }),
+        crate::db::value::ColumnKind::Bytes => Some(dialect.bytes_literal(&[])),
+        crate::db::value::ColumnKind::Str => {
+            if column.data_type.eq_ignore_ascii_case("UUID") {
+                return Some(dialect.string_literal("00000000-0000-0000-0000-000000000000"));
+            }
+            Some(dialect.string_literal(""))
+        }
+        // An unknown type: better to warn than to invent a value.
+        crate::db::value::ColumnKind::Text => None,
+    }
+}
+
 fn column_definition(
     column: &ColumnInfo,
     target: Dialect,
     schema: Option<&str>,
     source_schema: &str,
+) -> ColumnDdl {
+    column_definition_with_default(column, target, schema, source_schema, None)
+}
+
+/// `override_default` replaces whatever the column declares, and is used for the
+/// throw-away placeholder described on `placeholder_default`.
+fn column_definition_with_default(
+    column: &ColumnInfo,
+    target: Dialect,
+    schema: Option<&str>,
+    source_schema: &str,
+    override_default: Option<&str>,
 ) -> ColumnDdl {
     let q = |name: &str| target.quote(name);
     // Both sides are the same engine, so the declared type is reused verbatim —
@@ -219,7 +285,11 @@ fn column_definition(
         if !column.nullable {
             parts.push("NOT NULL".into());
         }
-        if let Some(default) = render_default(column, target, source_schema, schema) {
+        let rendered = match override_default {
+            Some(value) => Some(value.to_string()),
+            None => render_default(column, target, source_schema, schema),
+        };
+        if let Some(default) = rendered {
             parts.push(format!("DEFAULT {default}"));
         }
         if column.is_auto_increment && target == Dialect::Mysql {
@@ -752,6 +822,7 @@ fn alter_column_statements(
     target: Dialect,
     schema: Option<&str>,
     source_schema: &str,
+    types: &[TypeDiff],
     warnings: &mut Vec<String>,
 ) -> Vec<DdlStatement> {
     let q = |name: &str| target.quote(name);
@@ -798,7 +869,30 @@ fn alter_column_statements(
         };
         match diff.kind {
             ChangeKind::New => {
-                let definition = column_definition(column, target, schema, source_schema);
+                // A NOT NULL column with no default cannot be added to a table
+                // that already holds rows unless a value is supplied for them.
+                // A placeholder default is used and then dropped again.
+                let needs_placeholder = !column.nullable
+                    && render_default(column, target, source_schema, schema).is_none();
+                let placeholder = if needs_placeholder {
+                    placeholder_default(column, target, types)
+                } else {
+                    None
+                };
+                if needs_placeholder && placeholder.is_none() {
+                    warnings.push(format!(
+                        "表 {}：列 {} 为非空且无默认值，且其类型无法自动生成占位值；若目标表已有数据，该语句会被服务端拒绝",
+                        table.name, column.name
+                    ));
+                }
+
+                let definition = column_definition_with_default(
+                    column,
+                    target,
+                    schema,
+                    source_schema,
+                    placeholder.as_deref(),
+                );
                 if let Some(warning) = definition.warning {
                     warnings.push(format!("表 {}：{warning}", table.name));
                 }
@@ -817,6 +911,22 @@ fn alter_column_statements(
                     object: column.name.clone(),
                     sql,
                 });
+                if let Some(value) = placeholder {
+                    // The placeholder exists only to backfill existing rows.
+                    warnings.push(format!(
+                        "表 {}：为把非空列 {} 加到已有数据的表上，先用占位默认值 {value} 回填了现有行，随后已删除该默认值；请按需用数据同步修正这些值",
+                        table.name, column.name
+                    ));
+                    out.push(DdlStatement {
+                        table: table.name.clone(),
+                        category: "drop_column_default".into(),
+                        object: column.name.clone(),
+                        sql: format!(
+                            "ALTER TABLE {tref} ALTER COLUMN {} DROP DEFAULT;",
+                            q(&column.name)
+                        ),
+                    });
+                }
                 if target == Dialect::Postgres {
                     if let Some(comment) = &column.comment {
                         out.push(DdlStatement {
@@ -1183,6 +1293,7 @@ pub fn generate(
                     target,
                     target_schema,
                     &diff.source_namespace,
+                    &diff.types,
                     warnings,
                 ));
 

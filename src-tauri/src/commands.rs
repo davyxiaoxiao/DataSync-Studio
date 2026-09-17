@@ -198,30 +198,30 @@ pub struct TableData {
     pub sql: String,
 }
 
-#[tauri::command]
-pub async fn preview_table_data(
-    state: State<'_, AppState>,
-    connection_id: String,
-    namespace: String,
-    table: String,
+/// Engine-agnostic core of the table data browser. Shared by the command and by
+/// the live integration tests.
+pub(crate) async fn preview_table_data_core(
+    pool: &Pool,
+    namespace: &str,
+    table: &str,
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> AppResult<TableData> {
-    let pool = pool_for(&state, &connection_id).await?;
-    let structure = introspect::load_table(&pool, &namespace, &table).await?;
+    let structure = introspect::load_table(pool, namespace, table).await?;
     let limit = limit.unwrap_or(200).clamp(1, 5000);
     let offset = offset.unwrap_or(0);
     let plan = build_read_plan(
         pool.dialect(),
-        &namespace,
-        &table,
+        namespace,
+        table,
         &structure,
         &structure.primary_key,
         Some(limit + 1),
         Some(offset),
     );
     let started = Instant::now();
-    let mut rows = read_rows(&pool, &plan).await?;
+    // One extra row is fetched so `has_more` is known without a second query.
+    let mut rows = read_rows(pool, &plan).await?;
     let has_more = rows.len() as u64 > limit;
     if has_more {
         rows.truncate(limit as usize);
@@ -252,6 +252,19 @@ pub async fn preview_table_data(
         elapsed_ms: started.elapsed().as_millis() as u64,
         sql: plan.select_sql,
     })
+}
+
+#[tauri::command]
+pub async fn preview_table_data(
+    state: State<'_, AppState>,
+    connection_id: String,
+    namespace: String,
+    table: String,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> AppResult<TableData> {
+    let pool = pool_for(&state, &connection_id).await?;
+    preview_table_data_core(&pool, &namespace, &table, limit, offset).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,7 +1037,8 @@ pub struct ApplyDataRequest {
     pub insert: bool,
     #[serde(default = "default_true")]
     pub update: bool,
-    #[serde(default = "default_true")]
+    /// Defaults to *off*: a partial request must never delete rows silently.
+    #[serde(default)]
     pub delete: bool,
     #[serde(default = "default_true")]
     pub use_transaction: bool,
