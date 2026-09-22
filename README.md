@@ -28,9 +28,20 @@ pnpm tauri dev
 # 打包 .app，产物在 src-tauri/target/release/bundle/macos/
 pnpm tauri build
 
-# 需要 DMG 安装包时（DMG 打包依赖 Finder 自动化，需在正常桌面会话下运行）
-pnpm tauri build --bundles dmg
+# 再打一个 DMG 安装包（含 /Applications 快捷方式）
+./scripts/package-dmg.sh
 ```
+
+产物：
+
+```
+src-tauri/target/release/bundle/macos/DataSync Studio.app      # 可直接运行
+src-tauri/target/release/bundle/dmg/DataSync Studio_0.1.0_arm64.dmg
+```
+
+> Tauri 自带的 `tauri build --bundles dmg` 会用 Finder AppleScript 排版窗口，
+> 在没有可控 Finder 的会话（远程 shell、CI、沙箱）里必然失败。
+> `scripts/package-dmg.sh` 改用 `hdiutil`，不依赖 Finder，因此到处都能跑。
 
 > 如果本机 pnpm / cargo 的全局缓存目录不可写，可先 `source dev-env.sh`，
 > 它会把所有工具缓存重定向到仓库内的 `.cache/`。
@@ -271,4 +282,6 @@ PostgreSQL enum/domain 类型同步、数据新增/更新/删除同步、外键�
 - 不支持删除 PostgreSQL 枚举值、修改域的基础类型（引擎本身不支持），会告警提示手工处理
 - MySQL 的 `SET` 类型仍按普通文本处理
 - 分区表按普通表处理
-- `pnpm tauri build` 默认只产出 `.app`；DMG 需要 Finder 自动化权限，故未列为默认目标
+- 未做公证（notarization）：别人首次打开可能被 Gatekeeper 拦截，右键「打开」即可，
+  或 `xattr -d com.apple.quarantine "/Applications/DataSync Studio.app"`
+- 应用为 ad-hoc 签名（本机可用，不满足分发要求；正式分发需要开发者证书 + 公证）
