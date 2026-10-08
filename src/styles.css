@@ -1382,3 +1382,23 @@ table.grid td.editing input {
 table.grid.designer tr.fk-index td {
   background: var(--bg-subtle);
 }
+
+/* ---------------------------------------------------- filter condition tree */
+
+.filter-group {
+  border-left: 2px solid var(--border);
+  padding-left: 10px;
+  margin-left: 2px;
+}
+
+.filter-group.nested {
+  border-left-color: var(--accent);
+  background: var(--bg-subtle);
+  border-radius: 0 6px 6px 0;
+  padding: 6px 10px;
+  margin: 4px 0;
+}
+
+.filter-row {
+  padding: 2px 0;
+}

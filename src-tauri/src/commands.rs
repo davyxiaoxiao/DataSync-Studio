@@ -16,7 +16,7 @@ use crate::data::{
 use crate::data::plan::DataPlan;
 use crate::db::value::{ColumnMeta, Value};
 use crate::data::view::{
-    build_cell_update, build_grid_query, CellEdit, FilterCondition, RowKeyValue, SortSpec,
+    build_cell_update, build_grid_query, CellEdit, FilterGroup, RowKeyValue, SortSpec,
 };
 use crate::data::import::{
     run_import, suggest_mapping, ColumnMapping, ImportOptions, ImportOutcome,
@@ -29,13 +29,13 @@ use crate::jobs::ProgressReporter;
 use crate::schema::model::foreign_key_covered_by;
 use crate::schema::ddl::{
     generate, normalize_designed_columns, plan_drop_tables, rename_column_ddl,
-    merge_mysql_index_statements, rename_table_ddl, validate_indexes, DdlStatement,
-    SyncSelection,
+    merge_mysql_index_statements, rename_table_ddl, validate_foreign_keys, validate_indexes,
+    DdlStatement, SyncSelection,
 };
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
 use crate::schema::model::{
-    ColumnInfo, IndexInfo, NamespaceInfo, TableStructure, TableSummary,
+    ColumnInfo, ForeignKeyInfo, IndexInfo, NamespaceInfo, TableStructure, TableSummary,
 };
 use crate::state::{AppState, SchemaCompare};
 use crate::store::ConnectionConfig;
@@ -222,7 +222,7 @@ pub(crate) async fn preview_table_data_core(
     table: &str,
     limit: Option<u64>,
     offset: Option<u64>,
-    filters: &[FilterCondition],
+    filters: &FilterGroup,
     sort: &[SortSpec],
 ) -> AppResult<TableData> {
     let structure = introspect::load_table(pool, namespace, table).await?;
@@ -308,7 +308,7 @@ pub async fn preview_table_data(
     table: String,
     limit: Option<u64>,
     offset: Option<u64>,
-    filters: Option<Vec<FilterCondition>>,
+    filters: Option<FilterGroup>,
     sort: Option<Vec<SortSpec>>,
 ) -> AppResult<TableData> {
     let pool = pool_for(&state, &connection_id).await?;
@@ -1561,6 +1561,10 @@ pub struct AlterTableRequest {
     /// so a caller that only edits columns cannot disturb them.
     #[serde(default)]
     pub indexes: Option<Vec<IndexInfo>>,
+    /// The complete desired foreign key list, with the same "omitted means leave
+    /// alone" rule as `indexes`.
+    #[serde(default)]
+    pub foreign_keys: Option<Vec<ForeignKeyInfo>>,
     /// Columns whose name was edited. Sent explicitly so a rename becomes
     /// `RENAME COLUMN` instead of a drop followed by an add, which would throw
     /// the data away.
@@ -1588,6 +1592,7 @@ pub(crate) async fn plan_alter_table(
     table: &str,
     columns: &[ColumnInfo],
     indexes: Option<&[IndexInfo]>,
+    foreign_keys: Option<&[ForeignKeyInfo]>,
     renames: &[ColumnRename],
 ) -> AppResult<(Vec<DdlStatement>, Vec<String>)> {
     let target = pool.dialect();
@@ -1650,6 +1655,39 @@ pub(crate) async fn plan_alter_table(
         }
         validate_indexes(&indexes, &desired.columns)?;
         desired.indexes = indexes;
+    }
+
+    // Foreign keys are handled the same way: submitted or untouched.
+    if let Some(submitted) = foreign_keys {
+        let mut foreign_keys = submitted.to_vec();
+        for foreign_key in &mut foreign_keys {
+            foreign_key.name = foreign_key.name.trim().to_string();
+            foreign_key.ref_table = foreign_key.ref_table.trim().to_string();
+            foreign_key.columns = foreign_key
+                .columns
+                .iter()
+                .map(|column| column.trim().to_string())
+                .filter(|column| !column.is_empty())
+                .collect();
+            foreign_key.ref_columns = foreign_key
+                .ref_columns
+                .iter()
+                .map(|column| column.trim().to_string())
+                .filter(|column| !column.is_empty())
+                .collect();
+            // An empty schema means "the schema this table lives in".
+            if foreign_key
+                .ref_schema
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                foreign_key.ref_schema = Some(namespace.to_string());
+            }
+        }
+        validate_foreign_keys(&foreign_keys, &desired.columns)?;
+        desired.foreign_keys = foreign_keys;
     }
 
     // Renames are applied to the *current* view first, so the comparison does
@@ -1719,6 +1757,8 @@ pub(crate) async fn plan_alter_table(
         "column_comment",
         "create_index",
         "drop_index",
+        "add_foreign_key",
+        "drop_foreign_key",
         // A column being added with a placeholder default is dropped right after
         "drop_column_default",
     ];
@@ -1751,6 +1791,7 @@ pub async fn preview_alter_table(
         &table,
         &columns,
         None,
+        None,
         &renames.unwrap_or_default(),
     )
     .await?;
@@ -1774,6 +1815,7 @@ pub async fn apply_alter_table(
         &request.table,
         &request.columns,
         request.indexes.as_deref(),
+        request.foreign_keys.as_deref(),
         &request.renames,
     )
     .await;

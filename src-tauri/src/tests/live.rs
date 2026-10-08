@@ -20,7 +20,9 @@ use crate::commands::{
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
-use crate::data::view::{build_cell_update, CellEdit, FilterCondition, FilterOp, RowKeyValue, SortSpec};
+use crate::data::view::{
+    build_cell_update, CellEdit, FilterCondition, FilterGroup, FilterOp, RowKeyValue, SortSpec,
+};
 use crate::excel;
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
@@ -1377,7 +1379,7 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     }
 
     // ---- first page -------------------------------------------------------
-    let page1 = preview_table_data_core(pool, ns, "browse", Some(3), Some(0), &[], &[])
+    let page1 = preview_table_data_core(pool, ns, "browse", Some(3), Some(0), &FilterGroup::default(), &[])
         .await
         .expect("browse page 1");
     assert_eq!(page1.rows.len(), 3, "{tag}: 首页应有 3 行");
@@ -1464,7 +1466,7 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     }
 
     // ---- second page continues the ordering without overlapping -----------
-    let page2 = preview_table_data_core(pool, ns, "browse", Some(3), Some(3), &[], &[])
+    let page2 = preview_table_data_core(pool, ns, "browse", Some(3), Some(3), &FilterGroup::default(), &[])
         .await
         .expect("browse page 2");
     assert_eq!(page2.offset, 3);
@@ -1482,14 +1484,14 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     assert_eq!(id_at(&page2, 0), 4, "{tag}: 第二页应从第 4 行开始");
 
     // ---- last page reports no more ---------------------------------------
-    let last = preview_table_data_core(pool, ns, "browse", Some(3), Some(9), &[], &[])
+    let last = preview_table_data_core(pool, ns, "browse", Some(3), Some(9), &FilterGroup::default(), &[])
         .await
         .expect("browse last page");
     assert_eq!(last.rows.len(), 1, "{tag}: 最后一页只剩 1 行");
     assert!(!last.has_more, "{tag}: 最后一页不应还有更多");
 
     // ---- a limit beyond the row count ------------------------------------
-    let all = preview_table_data_core(pool, ns, "browse", Some(50), Some(0), &[], &[])
+    let all = preview_table_data_core(pool, ns, "browse", Some(50), Some(0), &FilterGroup::default(), &[])
         .await
         .expect("browse everything");
     assert_eq!(all.rows.len(), total, "{tag}: 应返回全部 {total} 行");
@@ -1912,6 +1914,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         "child",
         &desired,
         None,
+        None,
         &[ColumnRename {
             from: "note".into(),
             to: "remark".into(),
@@ -1959,7 +1962,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         .columns;
 
     // Without a submitted index list the planner must leave them alone.
-    let (untouched, _) = plan_alter_table(pool, ns, "child", &desired_columns, None, &[])
+    let (untouched, _) = plan_alter_table(pool, ns, "child", &desired_columns, None, None, &[])
         .await
         .expect("plan without indexes");
     assert!(
@@ -1989,6 +1992,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         "child",
         &desired_columns,
         Some(&wanted),
+        None,
         &[],
     )
     .await
@@ -2040,6 +2044,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         "child",
         &desired_columns,
         Some(&keep_wide),
+        None,
         &[],
     )
     .await
@@ -2067,6 +2072,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         "child",
         &desired_columns,
         Some(&[]),
+        None,
         &[],
     )
     .await
@@ -2090,13 +2096,109 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         index_type: None,
         required_by_foreign_key: false,
     }];
-    let error = plan_alter_table(pool, ns, "child", &desired_columns, Some(&bad), &[])
+    let error = plan_alter_table(pool, ns, "child", &desired_columns, Some(&bad), None, &[])
         .await
         .unwrap_err();
     assert!(
         error.to_string().contains("不存在的字段"),
         "{tag}: {error}"
     );
+
+    // ---- 1c. foreign keys: add, then remove --------------------------------
+    // `parent` exists in the same namespace, so a key can point at it.
+    let before_fk = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload child");
+    let fk_columns = before_fk.columns.clone();
+    // The pre-existing key stays, so the later drop-table phase still has
+    // something to release.
+    let existing_fks = before_fk.foreign_keys.clone();
+    assert_eq!(existing_fks.len(), 1, "{tag}: 前提是 child 上已有一个外键");
+    let mut wanted_fk = existing_fks.clone();
+    wanted_fk.push(crate::schema::model::ForeignKeyInfo {
+        name: "fk_child_parent_remark".into(),
+        columns: vec!["parent_id".into()],
+        ref_schema: Some(ns.to_string()),
+        ref_table: "parent".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "CASCADE".into(),
+    });
+    let (plan, _) = plan_alter_table(
+        pool,
+        ns,
+        "child",
+        &fk_columns,
+        None,
+        Some(&wanted_fk),
+        &[],
+    )
+    .await
+    .expect("plan foreign key");
+    let added = plan
+        .iter()
+        .filter(|s| s.category == "add_foreign_key")
+        .count();
+    assert_eq!(added, 1, "{tag}: 应新增 1 个外键");
+    run_plan(pool, plan.into_iter().map(|s| s.sql).collect()).await;
+
+    let after = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload after fk");
+    let keys: Vec<(&str, &str, &str)> = after
+        .foreign_keys
+        .iter()
+        .map(|k| (k.name.as_str(), k.ref_table.as_str(), k.on_delete.as_str()))
+        .collect();
+    assert!(
+        keys.iter().any(|(name, table, on_delete)| *name == "fk_child_parent_remark"
+            && *table == "parent"
+            && on_delete.eq_ignore_ascii_case("CASCADE")),
+        "{tag}: 外键应已建立且动作保留: {keys:?}"
+    );
+
+    // Dropping it is a plain removal; the original key is submitted unchanged.
+    let (plan, _) = plan_alter_table(
+        pool,
+        ns,
+        "child",
+        &fk_columns,
+        None,
+        Some(&existing_fks),
+        &[],
+    )
+    .await
+    .expect("plan fk drop");
+    assert!(
+        plan.iter().any(|s| s.category == "drop_foreign_key"),
+        "{tag}: 应删除外键"
+    );
+    run_plan(pool, plan.into_iter().map(|s| s.sql).collect()).await;
+    let after = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload after fk drop");
+    assert!(
+        !after
+            .foreign_keys
+            .iter()
+            .any(|k| k.name == "fk_child_parent_remark"),
+        "{tag}: 外键应已删除"
+    );
+
+    // Submitting a mismatched pair count is refused before anything runs.
+    let bad = vec![crate::schema::model::ForeignKeyInfo {
+        name: "fk_bad".into(),
+        columns: vec!["parent_id".into(), "remark".into()],
+        ref_schema: Some(ns.to_string()),
+        ref_table: "parent".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    }];
+    let error = plan_alter_table(pool, ns, "child", &fk_columns, None, Some(&bad), &[])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("数量不一致"), "{tag}: {error}");
 
     // ---- 2. rename the table ----------------------------------------------
     let sql = vec![crate::schema::ddl::rename_table_ddl(
@@ -2662,6 +2764,7 @@ async fn grid_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
 
     let page = |filters: Vec<FilterCondition>, sort: Vec<SortSpec>, limit: u64, offset: u64| {
         let ns = ns.to_string();
+        let filters = FilterGroup::all_of(filters);
         async move {
             preview_table_data_core(pool, &ns, "grid", Some(limit), Some(offset), &filters, &sort)
                 .await
@@ -2734,7 +2837,7 @@ async fn grid_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
         "grid",
         Some(10),
         Some(0),
-        &[filter("score", FilterOp::Eq, Some("abc"))],
+        &FilterGroup::all_of(vec![filter("score", FilterOp::Eq, Some("abc"))]),
         &[],
     )
     .await

@@ -59,6 +59,50 @@ pub struct FilterCondition {
     pub value: Option<String>,
 }
 
+/// How the members of a condition group are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Combinator {
+    #[default]
+    And,
+    Or,
+}
+
+/// A group of search conditions, combined with `AND` or `OR`.
+///
+/// Groups nest, which is what makes `a = 1 AND (b = 2 OR c = 3)` expressible.
+/// An empty group is the default and filters nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterGroup {
+    #[serde(default)]
+    pub combinator: Combinator,
+    #[serde(default)]
+    pub children: Vec<FilterNode>,
+}
+
+/// One member of a group: either a condition or a nested group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FilterNode {
+    Condition { condition: FilterCondition },
+    Group { group: FilterGroup },
+}
+
+impl FilterGroup {
+    /// A root group holding conditions joined by `AND`, the common case.
+    #[allow(dead_code)]
+    pub fn all_of(conditions: Vec<FilterCondition>) -> Self {
+        Self {
+            combinator: Combinator::And,
+            children: conditions
+                .into_iter()
+                .map(|condition| FilterNode::Condition { condition })
+                .collect(),
+        }
+    }
+}
+
 /// One level of the grid's sort order.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,21 +214,66 @@ fn condition_sql(
     Ok(clause)
 }
 
+/// Nesting limit. A hand-built UI cannot reach it, and a crafted payload should
+/// not be able to build an arbitrarily deep expression.
+const MAX_DEPTH: usize = 8;
+
+/// Render a group, or `None` when it holds nothing usable.
+///
+/// An empty group is not `FALSE`: a group the user has not filled in yet simply
+/// contributes no condition, so it is dropped rather than turned into invalid SQL.
+fn group_sql(
+    dialect: Dialect,
+    structure: &TableStructure,
+    group: &FilterGroup,
+    depth: usize,
+) -> AppResult<Option<String>> {
+    if depth > MAX_DEPTH {
+        return Err(AppError::msg(format!(
+            "搜索条件嵌套超过 {MAX_DEPTH} 层"
+        )));
+    }
+    let mut parts = Vec::new();
+    for child in &group.children {
+        let rendered = match child {
+            FilterNode::Condition { condition } => {
+                Some(condition_sql(dialect, structure, condition)?)
+            }
+            FilterNode::Group { group } => group_sql(dialect, structure, group, depth + 1)?,
+        };
+        if let Some(rendered) = rendered {
+            parts.push(rendered);
+        }
+    }
+    match parts.len() {
+        0 => Ok(None),
+        // A single member needs no parentheses or joining.
+        1 => Ok(parts.pop()),
+        _ => {
+            let joiner = match group.combinator {
+                Combinator::And => " AND ",
+                Combinator::Or => " OR ",
+            };
+            let joined = parts.join(joiner);
+            // Nested groups need parentheses for precedence; the outermost one
+            // is already delimited by WHERE, so they would just be noise.
+            Ok(Some(if depth == 0 {
+                joined
+            } else {
+                format!("({joined})")
+            }))
+        }
+    }
+}
+
 /// Combine the search conditions into a `WHERE` clause, or `None` when there is
 /// nothing to filter on.
 pub fn build_where(
     dialect: Dialect,
     structure: &TableStructure,
-    filters: &[FilterCondition],
+    filters: &FilterGroup,
 ) -> AppResult<Option<String>> {
-    if filters.is_empty() {
-        return Ok(None);
-    }
-    let clauses = filters
-        .iter()
-        .map(|filter| condition_sql(dialect, structure, filter))
-        .collect::<AppResult<Vec<String>>>()?;
-    Ok(Some(clauses.join(" AND ")))
+    group_sql(dialect, structure, filters, 0)
 }
 
 /// Build the `ORDER BY` clause.
@@ -366,7 +455,7 @@ pub fn build_grid_query(
     namespace: &str,
     table: &str,
     structure: &TableStructure,
-    filters: &[FilterCondition],
+    filters: &FilterGroup,
     sort: &[SortSpec],
     limit: u64,
     offset: u64,
@@ -446,11 +535,18 @@ mod tests {
         }
     }
 
+    /// Flat conditions are the common case, so the helper wraps them in an
+    /// `AND` root group; the nesting tests below build their own tree.
     fn where_of(dialect: Dialect, filters: &[FilterCondition]) -> String {
-        build_where(dialect, &users(), filters)
+        where_of_group(dialect, &FilterGroup::all_of(filters.to_vec()))
+    }
+
+    fn where_of_group(dialect: Dialect, group: &FilterGroup) -> String {
+        build_where(dialect, &users(), group)
             .unwrap()
             .unwrap_or_else(|| "<none>".to_string())
     }
+
 
     #[test]
     fn conditions_are_combined_with_and() {
@@ -466,7 +562,10 @@ mod tests {
 
     #[test]
     fn no_conditions_means_no_where_clause() {
-        assert_eq!(build_where(Dialect::Mysql, &users(), &[]).unwrap(), None);
+        assert_eq!(
+            build_where(Dialect::Mysql, &users(), &FilterGroup::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -480,7 +579,11 @@ mod tests {
             "`created_at` < '2024-03-05 00:00:00'"
         );
         // An unparsable value is refused rather than sent to the server.
-        let error = build_where(Dialect::Mysql, &users(), &[filter("age", FilterOp::Eq, Some("abc"))])
+        let error = build_where(
+            Dialect::Mysql,
+            &users(),
+            &FilterGroup::all_of(vec![filter("age", FilterOp::Eq, Some("abc"))]),
+        )
             .unwrap_err();
         assert!(error.to_string().contains("不是整数"), "{error}");
     }
@@ -519,7 +622,11 @@ mod tests {
             "\"name\" IS NOT NULL"
         );
         // An empty value elsewhere is a mistake worth reporting.
-        let error = build_where(Dialect::Mysql, &users(), &[filter("name", FilterOp::Eq, Some("  "))])
+        let error = build_where(
+            Dialect::Mysql,
+            &users(),
+            &FilterGroup::all_of(vec![filter("name", FilterOp::Eq, Some("  "))]),
+        )
             .unwrap_err();
         assert!(error.to_string().contains("缺少值"), "{error}");
     }
@@ -528,7 +635,11 @@ mod tests {
     fn an_empty_value_with_a_comparison_points_at_the_null_operator() {
         // `= NULL` never matches, so silently producing it would look like
         // "the table is empty".
-        let error = build_where(Dialect::Mysql, &users(), &[filter("name", FilterOp::Eq, Some(""))])
+        let error = build_where(
+            Dialect::Mysql,
+            &users(),
+            &FilterGroup::all_of(vec![filter("name", FilterOp::Eq, Some(""))]),
+        )
             .unwrap_err();
         assert!(error.to_string().contains("缺少值"), "{error}");
     }
@@ -539,14 +650,22 @@ mod tests {
             where_of(Dialect::Mysql, &[filter("age", FilterOp::In, Some("1, 2 ,3"))]),
             "`age` IN (1, 2, 3)"
         );
-        let error = build_where(Dialect::Mysql, &users(), &[filter("age", FilterOp::In, Some("1,x"))])
+        let error = build_where(
+            Dialect::Mysql,
+            &users(),
+            &FilterGroup::all_of(vec![filter("age", FilterOp::In, Some("1,x"))]),
+        )
             .unwrap_err();
         assert!(error.to_string().contains("不是整数"), "{error}");
     }
 
     #[test]
     fn an_unknown_column_is_reported() {
-        let error = build_where(Dialect::Mysql, &users(), &[filter("nope", FilterOp::Eq, Some("1"))])
+        let error = build_where(
+            Dialect::Mysql,
+            &users(),
+            &FilterGroup::all_of(vec![filter("nope", FilterOp::Eq, Some("1"))]),
+        )
             .unwrap_err();
         assert!(error.to_string().contains("没有字段"), "{error}");
         // Casing that differs from the server's is still accepted.
@@ -595,7 +714,7 @@ mod tests {
             "app",
             "users",
             &users(),
-            &[filter("name", FilterOp::Contains, Some("am"))],
+            &FilterGroup::all_of(vec![filter("name", FilterOp::Contains, Some("am"))]),
             &[SortSpec {
                 column: "name".into(),
                 descending: false,
@@ -625,7 +744,7 @@ mod tests {
             "app",
             "users",
             &structure,
-            &[],
+            &FilterGroup::all_of(vec![]),
             &[],
             10,
             0,
@@ -740,5 +859,197 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("缺少主键字段"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    #[test]
+    fn or_joins_the_members_of_its_group() {
+        let sql = render(
+            Dialect::Mysql,
+            &FilterGroup {
+                combinator: Combinator::Or,
+                children: vec![
+                    node("name", FilterOp::Eq, Some("amy")),
+                    node("name", FilterOp::Eq, Some("bob")),
+                ],
+            },
+        );
+        assert_eq!(sql, "`name` = 'amy' OR `name` = 'bob'");
+    }
+
+    #[test]
+    fn nesting_produces_parentheses() {
+        // a = 1 AND (b = 2 OR c = 3)
+        let sql = render(
+            Dialect::Postgres,
+            &FilterGroup {
+                combinator: Combinator::And,
+                children: vec![
+                    node("id", FilterOp::Eq, Some("1")),
+                    FilterNode::Group {
+                        group: FilterGroup {
+                            combinator: Combinator::Or,
+                            children: vec![
+                                node("name", FilterOp::Eq, Some("b")),
+                                node("age", FilterOp::Eq, Some("3")),
+                            ],
+                        },
+                    },
+                ],
+            },
+        );
+        assert_eq!(sql, "\"id\" = 1 AND (\"name\" = 'b' OR \"age\" = 3)");
+    }
+
+    #[test]
+    fn a_precedence_trap_needs_its_parentheses() {
+        // Without grouping, `a OR b AND c` would not mean `(a OR b) AND c`.
+        let without = render(
+            Dialect::Mysql,
+            &FilterGroup {
+                combinator: Combinator::And,
+                children: vec![
+                    node("id", FilterOp::Eq, Some("1")),
+                    node("age", FilterOp::Ge, Some("18")),
+                ],
+            },
+        );
+        assert_eq!(without, "`id` = 1 AND `age` >= 18");
+
+        let nested = render(
+            Dialect::Mysql,
+            &FilterGroup {
+                combinator: Combinator::Or,
+                children: vec![
+                    node("id", FilterOp::Eq, Some("1")),
+                    FilterNode::Group {
+                        group: FilterGroup {
+                            combinator: Combinator::And,
+                            children: vec![
+                                node("age", FilterOp::Ge, Some("18")),
+                                node("name", FilterOp::Eq, Some("amy")),
+                            ],
+                        },
+                    },
+                ],
+            },
+        );
+        // The AND group must keep its own parentheses, or the OR would swallow it.
+        assert_eq!(nested, "`id` = 1 OR (`age` >= 18 AND `name` = 'amy')");
+    }
+
+    #[test]
+    fn empty_groups_filter_nothing() {
+        // A half-filled builder must not turn into a condition that matches
+        // nothing, nor into invalid SQL.
+        assert_eq!(render(Dialect::Mysql, &FilterGroup::default()), "<none>");
+        let sql = render(
+            Dialect::Mysql,
+            &FilterGroup {
+                combinator: Combinator::And,
+                children: vec![
+                    node("id", FilterOp::Eq, Some("1")),
+                    FilterNode::Group {
+                        group: FilterGroup::default(),
+                    },
+                ],
+            },
+        );
+        assert_eq!(sql, "`id` = 1", "空分组应被忽略，且单条件不需要括号");
+    }
+
+    #[test]
+    fn a_single_member_group_needs_no_parentheses() {
+        let sql = render(
+            Dialect::Mysql,
+            &FilterGroup {
+                combinator: Combinator::Or,
+                children: vec![node("id", FilterOp::Eq, Some("1"))],
+            },
+        );
+        assert_eq!(sql, "`id` = 1");
+    }
+
+    #[test]
+    fn nesting_depth_is_bounded() {
+        let mut group = FilterGroup {
+            combinator: Combinator::Or,
+            children: vec![node("id", FilterOp::Eq, Some("1"))],
+        };
+        for _ in 0..12 {
+            group = FilterGroup {
+                combinator: Combinator::And,
+                children: vec![
+                    node("id", FilterOp::Eq, Some("1")),
+                    FilterNode::Group { group },
+                ],
+            };
+        }
+        let error = build_where(Dialect::Mysql, &table_fixture(), &group).unwrap_err();
+        assert!(error.to_string().contains("嵌套"), "{error}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    use crate::schema::model::{ColumnInfo, TableStructure};
+
+    pub fn table_fixture() -> TableStructure {
+        let column = |name: &str, data_type: &str| ColumnInfo {
+            name: name.into(),
+            ordinal: 1,
+            data_type: data_type.into(),
+            full_type: data_type.into(),
+            nullable: true,
+            default: None,
+            is_auto_increment: false,
+            auto_kind: None,
+            is_generated: false,
+            generation_expression: None,
+            generation_kind: None,
+            is_unsigned: false,
+            comment: None,
+            charset: None,
+            collation: None,
+            udt_name: None,
+        };
+        TableStructure {
+            name: "users".into(),
+            comment: None,
+            engine: None,
+            charset: None,
+            collation: None,
+            primary_key: vec!["id".into()],
+            columns: vec![
+                column("id", "int"),
+                column("name", "varchar"),
+                column("age", "int"),
+            ],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    pub fn node(column: &str, operator: FilterOp, value: Option<&str>) -> FilterNode {
+        FilterNode::Condition {
+            condition: FilterCondition {
+                column: column.into(),
+                operator,
+                value: value.map(str::to_string),
+            },
+        }
+    }
+
+    /// Render a group, or `<none>` when it filters nothing.
+    pub fn render(dialect: Dialect, group: &FilterGroup) -> String {
+        build_where(dialect, &table_fixture(), group)
+            .unwrap()
+            .unwrap_or_else(|| "<none>".to_string())
     }
 }

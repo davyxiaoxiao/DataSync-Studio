@@ -4,7 +4,8 @@ import type {
   CellUpdateResult,
   ColumnMapping,
   ColumnPair,
-  FilterCondition,
+  FilterGroup,
+  ForeignKeyInfo,
   ExcelImportPlan,
   ExcelSheetPreview,
   ImportOutcome,
@@ -75,7 +76,7 @@ export const api = {
     table: string,
     limit = 200,
     offset = 0,
-    filters: FilterCondition[] = [],
+    filters: FilterGroup | null = null,
     sort: SortSpec[] = [],
   ) =>
     invoke<TableData>("preview_table_data", {
@@ -224,6 +225,7 @@ export const api = {
     columns: ColumnInfo[],
     renames: ColumnRename[] = [],
     indexes?: IndexInfo[],
+    foreignKeys?: ForeignKeyInfo[],
   ) =>
     invoke<SchemaSqlPreview>("preview_alter_table", {
       connectionId,
@@ -232,6 +234,7 @@ export const api = {
       columns,
       renames,
       indexes,
+      foreignKeys,
     }),
 
   applyAlterTable: (request: {
@@ -241,6 +244,7 @@ export const api = {
     columns: ColumnInfo[];
     renames?: ColumnRename[];
     indexes?: IndexInfo[];
+    foreignKeys?: ForeignKeyInfo[];
     jobId?: string;
   }) => invoke<SyncRunResult>("apply_alter_table", { request }),
 };

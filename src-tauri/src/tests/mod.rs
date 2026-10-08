@@ -13,7 +13,8 @@ use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
 use crate::schema::ddl::{
     family_from_declared_type, generate, normalize_designed_columns, plan_drop_tables,
-    rename_column_ddl, rename_table_ddl, validate_indexes, SyncSelection, TableSelection,
+    rename_column_ddl, rename_table_ddl, validate_foreign_keys, validate_indexes, SyncSelection,
+    TableSelection,
 };
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions};
 use crate::schema::model::{
@@ -1889,4 +1890,53 @@ fn only_one_index_per_foreign_key_is_treated_as_required() {
         1,
         "每个外键只应保留一个支撑索引"
     );
+}
+
+#[test]
+fn foreign_keys_are_validated_before_they_reach_the_server() {
+    let columns = vec![
+        col("id", "INT", "integer"),
+        col("parent_id", "INT", "integer"),
+    ];
+    let key = |name: &str, columns: &[&str], ref_columns: &[&str]| ForeignKeyInfo {
+        name: name.into(),
+        columns: columns.iter().map(|c| (*c).to_string()).collect(),
+        ref_schema: Some("app".into()),
+        ref_table: "parent".into(),
+        ref_columns: ref_columns.iter().map(|c| (*c).to_string()).collect(),
+        on_update: "NO ACTION".into(),
+        on_delete: "CASCADE".into(),
+    };
+
+    assert!(validate_foreign_keys(&[key("fk_parent", &["parent_id"], &["id"])], &columns).is_ok());
+
+    assert!(validate_foreign_keys(&[key("  ", &["parent_id"], &["id"])], &columns).is_err());
+    // Two keys sharing a name collide in both engines.
+    let error = validate_foreign_keys(
+        &[
+            key("fk_a", &["parent_id"], &["id"]),
+            key("FK_A", &["id"], &["id"]),
+        ],
+        &columns,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("重复"), "{error}");
+    assert!(validate_foreign_keys(&[key("fk_a", &[], &[])], &columns).is_err());
+
+    // A mismatched column count is the classic mistake: both engines reject it,
+    // and the message should say which side is short.
+    let error =
+        validate_foreign_keys(&[key("fk_a", &["parent_id", "id"], &["id"])], &columns).unwrap_err();
+    assert!(error.to_string().contains("数量不一致"), "{error}");
+
+    // The referencing column has to be on this table.
+    let error =
+        validate_foreign_keys(&[key("fk_a", &["nope"], &["id"])], &columns).unwrap_err();
+    assert!(error.to_string().contains("不存在的字段"), "{error}");
+
+    // The referenced table is required.
+    let mut missing = key("fk_a", &["parent_id"], &["id"]);
+    missing.ref_table = "  ".into();
+    let error = validate_foreign_keys(&[missing], &columns).unwrap_err();
+    assert!(error.to_string().contains("引用表"), "{error}");
 }

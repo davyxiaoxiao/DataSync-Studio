@@ -282,6 +282,18 @@ export interface FilterCondition {
   value?: string | null;
 }
 
+export type Combinator = "and" | "or";
+
+/** A group of search conditions; groups nest, so parentheses are expressible. */
+export interface FilterGroup {
+  combinator: Combinator;
+  children: FilterNode[];
+}
+
+export type FilterNode =
+  | { kind: "condition"; condition: FilterCondition }
+  | { kind: "group"; group: FilterGroup };
+
 export interface SortSpec {
   column: string;
   descending: boolean;

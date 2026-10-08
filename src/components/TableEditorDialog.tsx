@@ -2,7 +2,21 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { useJobProgress } from "../jobs";
 import { useStore } from "../store";
-import type { ColumnInfo, DdlStatement, IndexInfo, SyncRunResult } from "../types";
+import type {
+  ColumnInfo,
+  DdlStatement,
+  ForeignKeyInfo,
+  IndexInfo,
+  SyncRunResult,
+} from "../types";
+import {
+  ForeignKeyList,
+  newForeignKey,
+  toWireForeignKeys,
+  validateForeignKeys,
+  fkKey,
+  type EditableForeignKey,
+} from "./ForeignKeyList";
 import { RunResultPanel } from "./RunResultPanel";
 import { SqlPreviewModal } from "./SqlPreviewModal";
 import { IconArrowDown, IconArrowUp, IconPlus, IconTrash, IconWarn } from "./Icons";
@@ -100,7 +114,7 @@ function blankColumn(ordinal: number): ColumnInfo {
   };
 }
 
-type Tab = "columns" | "indexes";
+type Tab = "columns" | "indexes" | "foreignKeys";
 
 /**
  * Table editor.
@@ -124,6 +138,7 @@ export function TableEditorDialog({
   const [tab, setTab] = useState<Tab>("columns");
   const [columns, setColumns] = useState<EditableColumn[]>([]);
   const [indexes, setIndexes] = useState<EditableIndex[]>([]);
+  const [foreignKeys, setForeignKeys] = useState<EditableForeignKey[]>([]);
   const [primaryKey, setPrimaryKey] = useState<string[]>([]);
   const [indexType, setIndexType] = useState<Map<string, string | null>>(new Map());
   const [loading, setLoading] = useState(true);
@@ -160,6 +175,25 @@ export function TableEditorDialog({
         );
         setIndexType(
           new Map(structure.indexes.map((entry) => [entry.name, entry.indexType ?? null])),
+        );
+        setForeignKeys(
+          (structure.foreignKeys ?? []).map((entry: ForeignKeyInfo) => {
+            const pairs = entry.columns.map((column, index) => ({
+              key: fkKey(),
+              column,
+              refColumn: entry.refColumns[index] ?? "",
+            }));
+            return {
+              key: fkKey(),
+              name: entry.name,
+              refSchema: entry.refSchema ?? namespace,
+              refTable: entry.refTable,
+              pairs: pairs.length > 0 ? pairs : [{ key: fkKey(), column: "", refColumn: "" }],
+              onDelete: entry.onDelete || "NO ACTION",
+              onUpdate: entry.onUpdate || "NO ACTION",
+              existing: true,
+            };
+          }),
         );
       } catch (error) {
         if (!cancelled) setLoadError(errorMessage(error));
@@ -240,6 +274,11 @@ export function TableEditorDialog({
     [columns],
   );
 
+  const foreignKeyPayload = useMemo(
+    () => toWireForeignKeys(foreignKeys),
+    [foreignKeys],
+  );
+
   /// Renaming is reported explicitly: without it the backend would see a drop
   /// plus an add and the column's data would be lost.
   const renames = useMemo(
@@ -281,8 +320,8 @@ export function TableEditorDialog({
     }
     if (indexPayload.some((entry) => primaryKey.includes(entry.name)))
       return "索引名不能与主键同名";
-    return null;
-  }, [payload, indexPayload, primaryKey]);
+    return validateForeignKeys(foreignKeys, names.filter((name) => name !== ""));
+  }, [payload, indexPayload, primaryKey, foreignKeys]);
 
   const doPreview = async () => {
     setPreviewing(true);
@@ -294,6 +333,7 @@ export function TableEditorDialog({
         payload,
         renames,
         indexPayload,
+        foreignKeyPayload,
       );
       setPreview(outcome.statements);
       setWarnings(outcome.warnings);
@@ -318,6 +358,7 @@ export function TableEditorDialog({
         columns: payload,
         renames,
         indexes: indexPayload,
+        foreignKeys: foreignKeyPayload,
         jobId,
       });
       setResult(outcome);
@@ -364,6 +405,7 @@ export function TableEditorDialog({
             [
               ["columns", `表字段 (${columns.length})`],
               ["indexes", `表索引 (${indexes.length})`],
+              ["foreignKeys", `外键 (${foreignKeys.length})`],
             ] as [Tab, string][]
           ).map(([value, label]) => (
             <button
@@ -378,7 +420,9 @@ export function TableEditorDialog({
           <span className="faint" style={{ alignSelf: "center", paddingRight: 10 }}>
             {tab === "columns"
               ? "行顺序即字段顺序（MySQL 会据此使用 AFTER 定位）"
-              : "索引列的顺序会影响查询能否命中"}
+              : tab === "indexes"
+                ? "索引列的顺序会影响查询能否命中"
+                : "外键的两端字段数量必须一致"}
           </span>
         </div>
 
@@ -395,10 +439,10 @@ export function TableEditorDialog({
               <div style={{ padding: "8px 12px", borderBottom: "1px solid var(--border)" }} className="row">
                 <button
                   className="btn small"
+                  disabled={tab === "foreignKeys"}
                   onClick={
-                    tab === "columns"
-                      ? add
-                      : () =>
+                    tab === "indexes"
+                      ? () =>
                           setIndexes((prev) => [
                             ...prev,
                             {
@@ -410,12 +454,32 @@ export function TableEditorDialog({
                               fkBacked: false,
                             },
                           ])
+                      : add
                   }
                 >
-                  <IconPlus size={11} /> {tab === "columns" ? "添加字段" : "添加索引"}
+                  <IconPlus size={11} />{" "}
+                  {tab === "columns" ? "添加字段" : tab === "indexes" ? "添加索引" : "外键"}
                 </button>
+                {tab === "foreignKeys" && (
+                  <button
+                    className="btn small"
+                    disabled={columnNames.length === 0}
+                    onClick={() =>
+                      setForeignKeys((prev) => [
+                        ...prev,
+                        newForeignKey(columnNames, namespace),
+                      ])
+                    }
+                  >
+                    <IconPlus size={11} /> 添加外键
+                  </button>
+                )}
                 <span className="faint">
-                  {tab === "columns" ? `${columns.length} 个字段` : `${indexes.length} 个索引`}
+                  {tab === "columns"
+                    ? `${columns.length} 个字段`
+                    : tab === "indexes"
+                      ? `${indexes.length} 个索引`
+                      : `${foreignKeys.length} 个外键`}
                 </span>
                 {renames.length > 0 && (
                   <span className="badge purple">
@@ -773,6 +837,17 @@ export function TableEditorDialog({
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+              {tab === "foreignKeys" && (
+                <div style={{ overflow: "auto", flex: 1 }}>
+                  <ForeignKeyList
+                    value={foreignKeys}
+                    onChange={setForeignKeys}
+                    columnNames={columnNames}
+                    schema={namespace}
+                    disabled={busy}
+                  />
                 </div>
               )}
             </>

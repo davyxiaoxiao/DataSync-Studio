@@ -1863,3 +1863,57 @@ pub fn merge_mysql_index_statements(
     }
     out
 }
+
+/// Validate foreign keys submitted by the table editor.
+///
+/// The mistakes worth catching before the server sees them: a missing name, two
+/// keys sharing a name, a key with no columns, a column that is not on the table,
+/// and a column count that does not match the referenced key.
+pub fn validate_foreign_keys(
+    foreign_keys: &[ForeignKeyInfo],
+    columns: &[ColumnInfo],
+) -> AppResult<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for foreign_key in foreign_keys {
+        let name = foreign_key.name.trim();
+        if name.is_empty() {
+            return Err(AppError::msg("外键名不能为空"));
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(AppError::msg(format!("外键名 {name} 重复")));
+        }
+        if foreign_key.columns.is_empty() {
+            return Err(AppError::msg(format!("外键 {name} 没有指定任何字段")));
+        }
+        if foreign_key.columns.len() != foreign_key.ref_columns.len() {
+            return Err(AppError::msg(format!(
+                "外键 {name} 的两端字段数量不一致：{} 个引用 {} 个",
+                foreign_key.columns.len(),
+                foreign_key.ref_columns.len()
+            )));
+        }
+        if foreign_key.ref_table.trim().is_empty() {
+            return Err(AppError::msg(format!("外键 {name} 没有指定引用表")));
+        }
+        for entry in &foreign_key.columns {
+            let column = entry.trim();
+            if column.is_empty() {
+                return Err(AppError::msg(format!("外键 {name} 有空字段名")));
+            }
+            if !columns
+                .iter()
+                .any(|candidate| candidate.name.eq_ignore_ascii_case(column))
+            {
+                return Err(AppError::msg(format!(
+                    "外键 {name} 引用了本表不存在的字段 {column}"
+                )));
+            }
+        }
+        for entry in &foreign_key.ref_columns {
+            if entry.trim().is_empty() {
+                return Err(AppError::msg(format!("外键 {name} 有空的目标字段名")));
+            }
+        }
+    }
+    Ok(())
+}

@@ -1,14 +1,21 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorMessage } from "../api";
 import type {
   Cell,
   ColumnMeta,
-  FilterCondition,
-  FilterOp,
+  FilterGroup,
   RowKeyValue,
   SortSpec,
   TableData,
 } from "../types";
+import {
+  FilterBuilder,
+  countConditions,
+  newDraftCondition,
+  newDraftGroup,
+  toWireGroup,
+  type DraftGroup,
+} from "../components/FilterBuilder";
 
 interface Props {
   connectionId: string;
@@ -18,55 +25,6 @@ interface Props {
 }
 
 const PAGE_SIZE = 200;
-
-const OP_LABELS: Record<FilterOp, string> = {
-  eq: "=",
-  ne: "≠",
-  gt: ">",
-  ge: "≥",
-  lt: "<",
-  le: "≤",
-  contains: "包含",
-  startsWith: "开头是",
-  endsWith: "结尾是",
-  in: "在列表中",
-  isNull: "为 NULL",
-  notNull: "不为 NULL",
-};
-
-/// Operators that only make sense on text.
-const TEXT_ONLY: FilterOp[] = ["contains", "startsWith", "endsWith"];
-
-const ALL_OPS: FilterOp[] = [
-  "eq",
-  "ne",
-  "gt",
-  "ge",
-  "lt",
-  "le",
-  "contains",
-  "startsWith",
-  "endsWith",
-  "in",
-  "isNull",
-  "notNull",
-];
-
-function operatorsFor(kind: string | undefined): FilterOp[] {
-  const text = kind === "str" || kind === "text" || kind === "json";
-  return text ? ALL_OPS : ALL_OPS.filter((op) => !TEXT_ONLY.includes(op));
-}
-
-function needsValue(operator: FilterOp): boolean {
-  return operator !== "isNull" && operator !== "notNull";
-}
-
-/** A filter row being edited; the value is always a string in the form. */
-interface DraftFilter {
-  column: string;
-  operator: FilterOp;
-  value: string;
-}
 
 const cellText = (cell: Cell | undefined): string => cell?.text ?? "";
 
@@ -79,8 +37,8 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
   const [showFilters, setShowFilters] = useState(false);
   // Draft rows are only turned into a query when 查询 is pressed, so typing a
   // value does not fire a request per keystroke.
-  const [draft, setDraft] = useState<DraftFilter[]>([]);
-  const [filters, setFilters] = useState<FilterCondition[]>([]);
+  const [draft, setDraft] = useState<DraftGroup>(() => newDraftGroup());
+  const [filters, setFilters] = useState<FilterGroup | null>(null);
   const [sort, setSort] = useState<SortSpec[]>([]);
   const [editing, setEditing] = useState<{ row: number; column: number } | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -136,32 +94,25 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
   const rows = data?.rows ?? [];
   const hasKey = (data?.primaryKey.length ?? 0) > 0;
 
-  const addDraft = () => {
-    const first = columns[0];
-    setDraft((prev) => [
-      ...prev,
-      { column: first?.name ?? "", operator: "eq", value: "" },
-    ]);
+  const openFilters = () => {
     setShowFilters(true);
+    // A fresh tree starts with one empty row so there is something to type into.
+    if (countConditions(draft) === 0 && draft.children.length === 0) {
+      setDraft((prev) => ({
+        ...prev,
+        children: [newDraftCondition(columns[0]?.name ?? "")],
+      }));
+    }
   };
 
   const applyFilters = () => {
-    // Rows with neither a value nor a value-less operator are still being
-    // typed, so they are left out rather than turned into a broken condition.
-    const applied: FilterCondition[] = draft
-      .filter((entry) => entry.column && (!needsValue(entry.operator) || entry.value !== ""))
-      .map((entry) => ({
-        column: entry.column,
-        operator: entry.operator,
-        value: needsValue(entry.operator) ? entry.value : null,
-      }));
-    setFilters(applied);
+    setFilters(toWireGroup(draft));
     setEditing(null);
   };
 
   const clearFilters = () => {
-    setDraft([]);
-    setFilters([]);
+    setDraft(newDraftGroup());
+    setFilters(null);
     setEditing(null);
   };
 
@@ -242,11 +193,9 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
     }
   };
 
-  const filtered = filters.length > 0;
+  const filtered = filters !== null;
   const pageStart = rows.length === 0 ? 0 : offset + 1;
   const pageEnd = offset + rows.length;
-
-  const draftColumns = useMemo(() => columns.map((column) => column), [columns]);
 
   return (
     <div className="panel">
@@ -266,12 +215,9 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
           <div className="grow" />
           <button
             className="btn small"
-            onClick={() => {
-              setShowFilters((value) => !value);
-              if (!showFilters && draft.length === 0) addDraft();
-            }}
+            onClick={() => (showFilters ? setShowFilters(false) : openFilters())}
           >
-            搜索条件{filters.length > 0 ? ` (${filters.length})` : ""}
+            搜索条件{filters ? ` (${countConditions(draft)})` : ""}
           </button>
           <button className="btn small" onClick={() => setShowSql((value) => !value)}>
             {showSql ? "隐藏 SQL" : "查看 SQL"}
@@ -282,98 +228,14 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
         </div>
 
         {showFilters && (
-          <div style={{ marginTop: 8 }}>
-            {draft.map((entry, index) => {
-              const meta = draftColumns.find((column) => column.name === entry.column);
-              return (
-                <div className="row" key={index} style={{ gap: 6, marginBottom: 6 }}>
-                  <select
-                    value={entry.column}
-                    style={{ width: 170 }}
-                    onChange={(event) =>
-                      setDraft((prev) =>
-                        prev.map((item, position) =>
-                          position === index
-                            ? { ...item, column: event.target.value }
-                            : item,
-                        ),
-                      )
-                    }
-                  >
-                    {draftColumns.map((column) => (
-                      <option key={column.name} value={column.name}>
-                        {column.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    value={entry.operator}
-                    style={{ width: 110 }}
-                    onChange={(event) =>
-                      setDraft((prev) =>
-                        prev.map((item, position) =>
-                          position === index
-                            ? { ...item, operator: event.target.value as FilterOp }
-                            : item,
-                        ),
-                      )
-                    }
-                  >
-                    {operatorsFor(meta?.kind).map((op) => (
-                      <option key={op} value={op}>
-                        {OP_LABELS[op]}
-                      </option>
-                    ))}
-                  </select>
-                  {needsValue(entry.operator) ? (
-                    <input
-                      type="text"
-                      value={entry.value}
-                      placeholder={entry.operator === "in" ? "用逗号分隔多个值" : "值"}
-                      style={{ width: 220 }}
-                      onChange={(event) =>
-                        setDraft((prev) =>
-                          prev.map((item, position) =>
-                            position === index
-                              ? { ...item, value: event.target.value }
-                              : item,
-                          ),
-                        )
-                      }
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") applyFilters();
-                      }}
-                    />
-                  ) : (
-                    <span className="faint" style={{ width: 220 }}>
-                      无需填写值
-                    </span>
-                  )}
-                  <button
-                    className="icon-btn"
-                    title="删除该条件"
-                    onClick={() => setDraft((prev) => prev.filter((_, p) => p !== index))}
-                  >
-                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6">
-                      <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
-                    </svg>
-                  </button>
-                </div>
-              );
-            })}
-            <div className="row" style={{ gap: 6 }}>
-              <button className="btn small" onClick={addDraft}>
-                添加条件
-              </button>
-              <button className="btn primary small" onClick={applyFilters} disabled={loading}>
-                查询
-              </button>
-              <button className="btn small" onClick={clearFilters} disabled={loading}>
-                清除
-              </button>
-              <span className="faint">多个条件之间是「并且」</span>
-            </div>
-          </div>
+          <FilterBuilder
+            columns={columns}
+            value={draft}
+            onChange={setDraft}
+            onApply={applyFilters}
+            onClear={clearFilters}
+            busy={loading}
+          />
         )}
 
         {showSql && data && (
