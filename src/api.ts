@@ -9,6 +9,7 @@ import type {
   ExcelSheetPreview,
   ImportOutcome,
   ImportStrategy,
+  IndexInfo,
   CompareSchemaResult,
   ConnectionConfig,
   ConnectionInfo,
@@ -222,6 +223,7 @@ export const api = {
     table: string,
     columns: ColumnInfo[],
     renames: ColumnRename[] = [],
+    indexes?: IndexInfo[],
   ) =>
     invoke<SchemaSqlPreview>("preview_alter_table", {
       connectionId,
@@ -229,6 +231,7 @@ export const api = {
       table,
       columns,
       renames,
+      indexes,
     }),
 
   applyAlterTable: (request: {
@@ -237,6 +240,7 @@ export const api = {
     table: string;
     columns: ColumnInfo[];
     renames?: ColumnRename[];
+    indexes?: IndexInfo[];
     jobId?: string;
   }) => invoke<SyncRunResult>("apply_alter_table", { request }),
 };

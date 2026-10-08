@@ -1322,3 +1322,63 @@ table.grid td.editing input {
   background: transparent;
   outline: none;
 }
+
+/* ------------------------------------------------------- table editor tabs */
+
+.modal-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle);
+  flex: none;
+}
+
+.modal-tab {
+  border: none;
+  background: transparent;
+  padding: 8px 14px;
+  font: inherit;
+  color: var(--text-muted);
+  cursor: default;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.modal-tab:hover {
+  color: var(--text);
+}
+
+.modal-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 500;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 2px 1px 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #fff;
+}
+
+.chip select {
+  border: none;
+  background: transparent;
+  font-size: 11px;
+  height: 20px;
+  padding: 0 2px;
+  max-width: 130px;
+}
+
+.chip select:focus {
+  outline: none;
+}
+
+table.grid.designer tr.fk-index td {
+  background: var(--bg-subtle);
+}

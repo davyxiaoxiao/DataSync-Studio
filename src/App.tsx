@@ -6,7 +6,7 @@ import { DropTablesDialog } from "./components/DropTablesDialog";
 import { ExcelImportDialog } from "./components/ExcelImportDialog";
 import { LogPanel } from "./components/LogPanel";
 import { Sidebar, type TableRef } from "./components/Sidebar";
-import { TableDesignerDialog } from "./components/TableDesignerDialog";
+import { TableEditorDialog } from "./components/TableEditorDialog";
 import { TabBar } from "./components/TabBar";
 import { Toolbar } from "./components/Toolbar";
 import { StoreProvider, useStore } from "./store";
@@ -287,7 +287,7 @@ function Shell() {
       )}
 
       {tableAction?.kind === "designer" && (
-        <TableDesignerDialog
+        <TableEditorDialog
           connectionId={tableAction.ref.connectionId}
           namespace={tableAction.ref.namespace}
           table={tableAction.ref.table}

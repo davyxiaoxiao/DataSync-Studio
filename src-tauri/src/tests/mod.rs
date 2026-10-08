@@ -13,7 +13,7 @@ use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
 use crate::schema::ddl::{
     family_from_declared_type, generate, normalize_designed_columns, plan_drop_tables,
-    rename_column_ddl, rename_table_ddl, SyncSelection, TableSelection,
+    rename_column_ddl, rename_table_ddl, validate_indexes, SyncSelection, TableSelection,
 };
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions};
 use crate::schema::model::{
@@ -179,6 +179,7 @@ fn create_table_ddl_mysql_inlines_indexes_but_defers_foreign_keys() {
         columns: vec!["email".into()],
         is_unique: true,
         index_type: Some("BTREE".into()),
+        required_by_foreign_key: false,
     });
     structure.foreign_keys.push(ForeignKeyInfo {
         name: "fk_org".into(),
@@ -237,6 +238,7 @@ fn create_table_ddl_postgres_splits_indexes_and_comments() {
         columns: vec!["email".into()],
         is_unique: false,
         index_type: Some("btree".into()),
+        required_by_foreign_key: false,
     });
 
     let source = vec![structure.clone()];
@@ -1779,5 +1781,112 @@ fn column_rename_uses_a_data_preserving_statement() {
             "app",
         ),
         "ALTER TABLE `app`.`child` CHANGE `note` `remark` varchar(32);"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Index editing
+// ---------------------------------------------------------------------------
+
+fn index(name: &str, columns: &[&str], unique: bool) -> IndexInfo {
+    IndexInfo {
+        name: name.into(),
+        columns: columns.iter().map(|c| (*c).to_string()).collect(),
+        is_unique: unique,
+        index_type: None,
+        required_by_foreign_key: false,
+    }
+}
+
+#[test]
+fn index_definitions_are_validated_before_they_reach_the_server() {
+    let columns = vec![
+        col("id", "INT", "integer"),
+        col("email", "VARCHAR", "character varying(64)"),
+    ];
+
+    assert!(validate_indexes(&[index("idx_email", &["email"], true)], &columns).is_ok());
+
+    // A nameless index cannot be referenced again, and both engines reject it.
+    assert!(validate_indexes(&[index("  ", &["email"], false)], &columns).is_err());
+    // Two indexes sharing a name collide.
+    let error = validate_indexes(
+        &[index("idx_a", &["email"], false), index("IDX_A", &["id"], false)],
+        &columns,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("重复"), "{error}");
+    // An index with no columns is meaningless.
+    assert!(validate_indexes(&[index("idx_a", &[], false)], &columns).is_err());
+    // A column that is not on the table is the mistake most worth catching early.
+    let error = validate_indexes(&[index("idx_a", &["nope"], false)], &columns).unwrap_err();
+    assert!(error.to_string().contains("不存在的字段"), "{error}");
+    // Casing that differs from the server's is still accepted.
+    assert!(validate_indexes(&[index("idx_a", &["EMAIL"], false)], &columns).is_ok());
+    // A functional index keeps its expression; the server checks it.
+    assert!(validate_indexes(&[index("idx_lower", &["lower(email)"], false)], &columns).is_ok());
+}
+
+#[test]
+fn only_one_index_per_foreign_key_is_treated_as_required() {
+    // A key needs *some* index, not a specific one. Marking every candidate
+    // would make perfectly droppable indexes look locked, and the apply would
+    // keep an index the user deliberately removed.
+    let mut structure = table(
+        "child",
+        vec![col("parent_id", "INT", "integer"), col("remark", "VARCHAR", "varchar(32)")],
+        &[],
+    );
+    structure.foreign_keys.push(ForeignKeyInfo {
+        name: "fk_child_parent".into(),
+        columns: vec!["parent_id".into()],
+        ref_schema: None,
+        ref_table: "parent".into(),
+        ref_columns: vec!["id".into()],
+        on_update: "NO ACTION".into(),
+        on_delete: "NO ACTION".into(),
+    });
+    // Two indexes could each support the key.
+    structure.indexes = vec![
+        IndexInfo {
+            name: "fk_child_parent".into(),
+            columns: vec!["parent_id".into()],
+            is_unique: false,
+            index_type: None,
+            required_by_foreign_key: false,
+        },
+        IndexInfo {
+            name: "uq_pid_remark".into(),
+            columns: vec!["parent_id".into(), "remark".into()],
+            is_unique: true,
+            index_type: None,
+            required_by_foreign_key: false,
+        },
+        IndexInfo {
+            name: "idx_remark".into(),
+            columns: vec!["remark".into()],
+            is_unique: false,
+            index_type: None,
+            required_by_foreign_key: false,
+        },
+    ];
+    structure.mark_foreign_key_indexes();
+
+    // The index named after the constraint is the survivor.
+    assert!(structure.indexes[0].required_by_foreign_key, "外键同名索引应被保留");
+    assert!(!structure.indexes[1].required_by_foreign_key, "另一个候选索引可自由删除");
+    assert!(!structure.indexes[2].required_by_foreign_key, "与主键列无关的索引不受影响");
+
+    // With no same-named index, one candidate is still chosen.
+    structure.indexes.remove(0);
+    structure.mark_foreign_key_indexes();
+    assert_eq!(
+        structure
+            .indexes
+            .iter()
+            .filter(|index| index.required_by_foreign_key)
+            .count(),
+        1,
+        "每个外键只应保留一个支撑索引"
     );
 }

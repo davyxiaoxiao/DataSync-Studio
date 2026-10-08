@@ -147,10 +147,13 @@ fn non_empty(value: Option<&String>) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 pub async fn load_table(pool: &Pool, namespace: &str, table: &str) -> AppResult<TableStructure> {
-    match pool {
-        Pool::MySql(_) => load_mysql_table(pool, namespace, table).await,
-        Pool::Postgres(_) => load_pg_table(pool, namespace, table).await,
-    }
+    let mut structure = match pool {
+        Pool::MySql(_) => load_mysql_table(pool, namespace, table).await?,
+        Pool::Postgres(_) => load_pg_table(pool, namespace, table).await?,
+    };
+    // Which indexes exist only because a foreign key needs them.
+    structure.mark_foreign_key_indexes();
+    Ok(structure)
 }
 
 async fn load_mysql_table(pool: &Pool, schema: &str, table: &str) -> AppResult<TableStructure> {
@@ -331,6 +334,7 @@ fn group_mysql_indexes(rows: Vec<Vec<String>>) -> (Vec<String>, Vec<IndexInfo>) 
                     columns: Vec::new(),
                     is_unique: row.get(1).map(|v| v == "0").unwrap_or(false),
                     index_type: non_empty(row.get(4)),
+                    required_by_foreign_key: false,
                 },
             );
         }
@@ -541,6 +545,7 @@ async fn load_pg_table(pool: &Pool, schema: &str, table: &str) -> AppResult<Tabl
                     columns: Vec::new(),
                     is_unique: row.get(1).map(|v| as_bool(v)).unwrap_or(false),
                     index_type: non_empty(row.get(2)),
+                    required_by_foreign_key: false,
                 },
             );
         }

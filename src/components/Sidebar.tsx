@@ -186,7 +186,7 @@ export function Sidebar({
             table: ref.table,
           }),
       },
-      { label: "编辑字段…", disabled: many, run: () => onEditTable(ref) },
+      { label: "编辑表…", disabled: many, run: () => onEditTable(ref) },
       { label: "重命名…", disabled: many, run: () => onRenameTable(ref) },
       {
         label: many ? `删除选中的 ${targets.length} 张表` : "删除表",

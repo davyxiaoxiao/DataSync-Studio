@@ -72,6 +72,8 @@ export interface IndexInfo {
   columns: string[];
   isUnique: boolean;
   indexType?: string | null;
+  /** Exists because a foreign key needs it; not user-managed. */
+  requiredByForeignKey?: boolean;
 }
 
 export interface ForeignKeyInfo {

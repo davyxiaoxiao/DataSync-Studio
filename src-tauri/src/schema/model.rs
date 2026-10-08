@@ -36,6 +36,50 @@ pub struct ColumnInfo {
     pub udt_name: Option<String>,
 }
 
+/// Whether an index can support a foreign key.
+///
+/// MySQL requires the key's columns to be a prefix of the index, which is also
+/// the rule for "this index exists because of that key".
+pub fn foreign_key_covered_by(key: &[String], index: &[String]) -> bool {
+    !key.is_empty()
+        && key.len() <= index.len()
+        && key
+            .iter()
+            .zip(index.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+impl TableStructure {
+    /// The indexes that are the ones kept for each foreign key.
+    ///
+    /// The key needs *some* index, not a specific one, so exactly one index is
+    /// chosen per key — preferring the one named after the constraint, which is
+    /// what MySQL creates automatically. Everything else stays editable.
+    pub fn mark_foreign_key_indexes(&mut self) {
+        let mut keepers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for foreign_key in &self.foreign_keys {
+            let mut candidates: Vec<&IndexInfo> = self
+                .indexes
+                .iter()
+                .filter(|index| foreign_key_covered_by(&foreign_key.columns, &index.columns))
+                .collect();
+            candidates.sort_by_key(|index| {
+                if index.name.eq_ignore_ascii_case(&foreign_key.name) {
+                    0
+                } else {
+                    1
+                }
+            });
+            if let Some(keeper) = candidates.first() {
+                keepers.insert(keeper.name.to_ascii_lowercase());
+            }
+        }
+        for index in &mut self.indexes {
+            index.required_by_foreign_key = keepers.contains(&index.name.to_ascii_lowercase());
+        }
+    }
+}
+
 impl ColumnInfo {
     /// Type text used for change detection: lower case, collapsed whitespace and
     /// with MySQL integer display widths removed (`int(11)` -> `int`).
@@ -139,6 +183,14 @@ pub struct IndexInfo {
     pub columns: Vec<String>,
     pub is_unique: bool,
     pub index_type: Option<String>,
+    /// True when a foreign key depends on this index.
+    ///
+    /// MySQL creates such an index automatically (naming it after the
+    /// constraint) and refuses to drop it while the key exists. It is a
+    /// consequence of the constraint rather than something to manage, so the
+    /// table editor shows it as read-only and the planner keeps it.
+    #[serde(default)]
+    pub required_by_foreign_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

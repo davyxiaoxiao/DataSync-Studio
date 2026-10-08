@@ -1911,6 +1911,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         ns,
         "child",
         &desired,
+        None,
         &[ColumnRename {
             from: "note".into(),
             to: "remark".into(),
@@ -1950,6 +1951,152 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
     // The decisive check: renaming kept the data.
     let kept = scalar_text(pool, ns, "child", "remark", dialect).await;
     assert_eq!(kept, "keep-me", "{tag}: 重命名必须保留数据");
+
+    // ---- 1b. indexes: add, then remove -------------------------------------
+    let desired_columns = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload child")
+        .columns;
+
+    // Without a submitted index list the planner must leave them alone.
+    let (untouched, _) = plan_alter_table(pool, ns, "child", &desired_columns, None, &[])
+        .await
+        .expect("plan without indexes");
+    assert!(
+        !untouched
+            .iter()
+            .any(|s| s.category == "create_index" || s.category == "drop_index"),
+        "{tag}: 未提交索引列表时不应改动索引"
+    );
+
+    let new_index = |name: &str, columns: &[&str], is_unique: bool| crate::schema::model::IndexInfo {
+        name: name.into(),
+        columns: columns.iter().map(|c| (*c).to_string()).collect(),
+        is_unique,
+        index_type: None,
+        required_by_foreign_key: false,
+    };
+    // Deliberately replaces the index MySQL created for the foreign key with a
+    // wider one that also covers `parent_id`. On MySQL the drop and the add have
+    // to travel in the same ALTER, otherwise the drop is refused.
+    let wanted = vec![
+        new_index("idx_child_remark", &["remark"], false),
+        new_index("uq_child_pid_remark", &["parent_id", "remark"], true),
+    ];
+    let (plan, warnings) = plan_alter_table(
+        pool,
+        ns,
+        "child",
+        &desired_columns,
+        Some(&wanted),
+        &[],
+    )
+    .await
+    .expect("plan indexes");
+    // MySQL merges the index changes into one ALTER TABLE, so the count comes
+    // from the specifications rather than from the number of statements.
+    let created: usize = plan
+        .iter()
+        .filter_map(|s| match s.category.as_str() {
+            "alter_indexes" => Some(s.sql.matches("ADD ").count()),
+            "create_index" => Some(1),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(
+        created,
+        2,
+        "{tag}: 应创建 2 个索引: {:?}",
+        plan.iter().map(|s| &s.sql).collect::<Vec<_>>()
+    );
+    let _ = &warnings;
+    run_plan(pool, plan.into_iter().map(|s| s.sql).collect()).await;
+
+    let after = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload after indexes");
+    let names: Vec<&str> = after.indexes.iter().map(|i| i.name.as_str()).collect();
+    assert!(
+        names.contains(&"idx_child_remark") && names.contains(&"uq_child_pid_remark"),
+        "{tag}: 索引应已存在: {names:?}"
+    );
+    let unique = after
+        .indexes
+        .iter()
+        .find(|i| i.name == "uq_child_pid_remark")
+        .expect("unique index");
+    assert!(unique.is_unique, "{tag}: 唯一索引应保持唯一");
+    assert_eq!(
+        unique.columns,
+        vec!["parent_id".to_string(), "remark".to_string()],
+        "{tag}: 复合索引的列顺序必须保留"
+    );
+
+    // Dropping an index the keys do not need is a plain removal.
+    let keep_wide = vec![new_index("uq_child_pid_remark", &["parent_id", "remark"], true)];
+    let (plan, _) = plan_alter_table(
+        pool,
+        ns,
+        "child",
+        &desired_columns,
+        Some(&keep_wide),
+        &[],
+    )
+    .await
+    .expect("plan index drop");
+    let dropped: Vec<&str> = plan
+        .iter()
+        .filter(|s| s.category == "drop_index" || s.category == "alter_indexes")
+        .filter(|s| s.sql.contains("DROP INDEX"))
+        .map(|s| s.object.as_str())
+        .collect();
+    assert!(!dropped.is_empty(), "{tag}: 应删除被移除的索引");
+    run_plan(pool, plan.into_iter().map(|s| s.sql).collect()).await;
+
+    let after = crate::schema::introspect::load_table(pool, ns, "child")
+        .await
+        .expect("reload after drop");
+    let names: Vec<&str> = after.indexes.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, vec!["uq_child_pid_remark"], "{tag}: 只应剩一个索引");
+
+    // The remaining index supports the foreign key, so it must be protected
+    // even though the caller left it out of the list.
+    let (plan, warnings) = plan_alter_table(
+        pool,
+        ns,
+        "child",
+        &desired_columns,
+        Some(&[]),
+        &[],
+    )
+    .await
+    .expect("plan removing everything");
+    assert!(
+        !plan
+            .iter()
+            .any(|s| s.sql.contains("DROP INDEX") && s.sql.contains("uq_child_pid_remark")),
+        "{tag}: 外键唯一的支撑索引不得被删除"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("支撑索引")),
+        "{tag}: 应说明为何保留: {warnings:?}"
+    );
+
+    // Index definitions are validated before anything is executed.
+    let bad = vec![crate::schema::model::IndexInfo {
+        name: "idx_bad".into(),
+        columns: vec!["does_not_exist".into()],
+        is_unique: false,
+        index_type: None,
+        required_by_foreign_key: false,
+    }];
+    let error = plan_alter_table(pool, ns, "child", &desired_columns, Some(&bad), &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("不存在的字段"),
+        "{tag}: {error}"
+    );
 
     // ---- 2. rename the table ----------------------------------------------
     let sql = vec![crate::schema::ddl::rename_table_ddl(

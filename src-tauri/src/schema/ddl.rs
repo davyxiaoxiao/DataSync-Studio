@@ -1751,3 +1751,115 @@ pub fn rename_table_ddl(table: &str, new_name: &str, target: Dialect, schema: Op
         Dialect::Postgres => format!("ALTER TABLE {from} RENAME TO {};", target.quote(new_name)),
     }
 }
+
+/// Validate index definitions submitted by the table editor.
+///
+/// Catches the mistakes that would otherwise surface as a server error halfway
+/// through a batch: a missing name, two indexes sharing a name, an index with no
+/// columns, or a column that no longer exists.
+pub fn validate_indexes(
+    indexes: &[IndexInfo],
+    columns: &[ColumnInfo],
+) -> AppResult<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for index in indexes {
+        let name = index.name.trim();
+        if name.is_empty() {
+            return Err(AppError::msg("索引名不能为空"));
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(AppError::msg(format!("索引名 {name} 重复")));
+        }
+        if index.columns.is_empty() {
+            return Err(AppError::msg(format!("索引 {name} 没有指定任何列")));
+        }
+        for entry in &index.columns {
+            // A functional index keeps its expression verbatim and is checked by
+            // the server; only plain column names are validated here.
+            if entry.contains('(') {
+                continue;
+            }
+            let column = entry.trim();
+            if column.is_empty() {
+                return Err(AppError::msg(format!("索引 {name} 有空的列名")));
+            }
+            if !columns
+                .iter()
+                .any(|candidate| candidate.name.eq_ignore_ascii_case(column))
+            {
+                return Err(AppError::msg(format!(
+                    "索引 {name} 引用了不存在的字段 {column}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Combine index changes into a single `ALTER TABLE` on MySQL.
+///
+/// MySQL validates foreign keys at the *end* of a statement, so replacing the
+/// index that supports a key with a different one only works when the drop and
+/// the add travel together: as two statements the drop fails with
+/// "Cannot drop index … needed in a foreign key constraint".
+///
+/// The merged form also keeps a same-named "modify" (drop then add) valid, which
+/// is why the drops come first inside the statement.
+pub fn merge_mysql_index_statements(
+    table: &str,
+    schema: Option<&str>,
+    statements: Vec<DdlStatement>,
+) -> Vec<DdlStatement> {
+    fn is_index(statement: &DdlStatement) -> bool {
+        statement.category == "create_index" || statement.category == "drop_index"
+    }
+
+    if statements.iter().filter(|s| is_index(s)).count() < 2 {
+        return statements;
+    }
+    let prefix = format!("ALTER TABLE {} ", Dialect::Mysql.qualified(schema, table));
+    let Some(sample) = statements.iter().find(|s| is_index(s)) else {
+        return statements;
+    };
+    // Only statements this planner produced can be rewritten safely.
+    if !sample.sql.starts_with(&prefix) {
+        return statements;
+    }
+
+    let mut drops = Vec::new();
+    let mut adds = Vec::new();
+    for statement in &statements {
+        if !is_index(statement) {
+            continue;
+        }
+        let Some(spec) = statement.sql.strip_prefix(&prefix) else {
+            return statements;
+        };
+        let spec = spec.trim().trim_end_matches(';').to_string();
+        if statement.category == "drop_index" {
+            drops.push(spec);
+        } else {
+            adds.push(spec);
+        }
+    }
+    drops.extend(adds);
+
+    let mut out = Vec::with_capacity(statements.len());
+    let mut merged = false;
+    for statement in statements {
+        if is_index(&statement) {
+            if !merged {
+                merged = true;
+                out.push(DdlStatement {
+                    table: statement.table.clone(),
+                    category: "alter_indexes".into(),
+                    object: table.to_string(),
+                    sql: format!("{prefix}{};", drops.join(", ")),
+                });
+            }
+            continue;
+        }
+        out.push(statement);
+    }
+    out
+}

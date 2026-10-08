@@ -239,6 +239,7 @@ fn schema_diff_shape_covers_every_diff_kind() {
                     columns: vec!["id".into()],
                     is_unique: false,
                     index_type: None,
+                    required_by_foreign_key: false,
                 }),
                 target: None,
                 differences: Vec::new(),
@@ -953,6 +954,7 @@ fn typescript_interfaces_match_the_rust_dtos() {
             columns: Vec::new(),
             is_unique: false,
             index_type: None,
+            required_by_foreign_key: false,
         },
     );
     assert_ts_matches(

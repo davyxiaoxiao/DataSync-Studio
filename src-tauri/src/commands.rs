@@ -26,13 +26,17 @@ use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::excel::{self, ExcelSheetPreview};
 use crate::jobs::ProgressReporter;
+use crate::schema::model::foreign_key_covered_by;
 use crate::schema::ddl::{
     generate, normalize_designed_columns, plan_drop_tables, rename_column_ddl,
-    rename_table_ddl, DdlStatement, SyncSelection,
+    merge_mysql_index_statements, rename_table_ddl, validate_indexes, DdlStatement,
+    SyncSelection,
 };
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
-use crate::schema::model::{ColumnInfo, NamespaceInfo, TableStructure, TableSummary};
+use crate::schema::model::{
+    ColumnInfo, IndexInfo, NamespaceInfo, TableStructure, TableSummary,
+};
 use crate::state::{AppState, SchemaCompare};
 use crate::store::ConnectionConfig;
 
@@ -1553,6 +1557,10 @@ pub struct AlterTableRequest {
     pub table: String,
     /// The complete desired column list, in the desired order.
     pub columns: Vec<ColumnInfo>,
+    /// The complete desired index list. When omitted the indexes are left alone,
+    /// so a caller that only edits columns cannot disturb them.
+    #[serde(default)]
+    pub indexes: Option<Vec<IndexInfo>>,
     /// Columns whose name was edited. Sent explicitly so a rename becomes
     /// `RENAME COLUMN` instead of a drop followed by an add, which would throw
     /// the data away.
@@ -1579,6 +1587,7 @@ pub(crate) async fn plan_alter_table(
     namespace: &str,
     table: &str,
     columns: &[ColumnInfo],
+    indexes: Option<&[IndexInfo]>,
     renames: &[ColumnRename],
 ) -> AppResult<(Vec<DdlStatement>, Vec<String>)> {
     let target = pool.dialect();
@@ -1590,6 +1599,58 @@ pub(crate) async fn plan_alter_table(
 
     let mut desired = current.clone();
     desired.columns = desired_columns;
+    // Advice about kept indexes and unsupported changes, returned alongside the
+    // statements so the user is not left guessing.
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Indexes are only touched when the caller supplied a list, so the columns
+    // tab cannot accidentally drop one.
+    if let Some(submitted) = indexes {
+        let mut indexes = submitted.to_vec();
+        for index in &mut indexes {
+            index.name = index.name.trim().to_string();
+            index.columns = index
+                .columns
+                .iter()
+                .map(|column| column.trim().to_string())
+                .filter(|column| !column.is_empty())
+                .collect();
+        }
+        // A foreign key needs *an* index, and MySQL refuses to drop the last one
+        // that supports it. Rather than letting the whole apply fail with the
+        // server's wording, the submitted list is checked per key and a survivor
+        // is kept — preferring the index MySQL created for the constraint.
+        for foreign_key in &current.foreign_keys {
+            let satisfied = indexes
+                .iter()
+                .any(|entry| foreign_key_covered_by(&foreign_key.columns, &entry.columns));
+            if satisfied {
+                continue;
+            }
+            let keeper = current
+                .indexes
+                .iter()
+                .filter(|entry| {
+                    foreign_key_covered_by(&foreign_key.columns, &entry.columns)
+                })
+                .min_by_key(|entry| {
+                    if entry.name.eq_ignore_ascii_case(&foreign_key.name) {
+                        0
+                    } else {
+                        1
+                    }
+                });
+            if let Some(keeper) = keeper {
+                warnings.push(format!(
+                    "索引 {} 是外键 {} 唯一的支撑索引，不能删除，已保留",
+                    keeper.name, foreign_key.name
+                ));
+                indexes.push(keeper.clone());
+            }
+        }
+        validate_indexes(&indexes, &desired.columns)?;
+        desired.indexes = indexes;
+    }
 
     // Renames are applied to the *current* view first, so the comparison does
     // not mistake them for a drop plus an add.
@@ -1656,10 +1717,11 @@ pub(crate) async fn plan_alter_table(
         "drop_column",
         "modify_column",
         "column_comment",
+        "create_index",
+        "drop_index",
         // A column being added with a placeholder default is dropped right after
         "drop_column_default",
     ];
-    let mut warnings = Vec::new();
     let sources: HashMap<String, TableStructure> = HashMap::new();
     let plan = generate(&diff, &sources, None, Some(namespace), &mut warnings);
     let mut statements: Vec<DdlStatement> = rename_statements;
@@ -1667,6 +1729,9 @@ pub(crate) async fn plan_alter_table(
         plan.into_iter()
             .filter(|statement| allowed.contains(&statement.category.as_str())),
     );
+    if target == crate::dialect::Dialect::Mysql {
+        statements = merge_mysql_index_statements(table, Some(namespace), statements);
+    }
     Ok((statements, warnings))
 }
 
@@ -1680,8 +1745,15 @@ pub async fn preview_alter_table(
     renames: Option<Vec<ColumnRename>>,
 ) -> AppResult<SchemaSqlPreview> {
     let pool = pool_for(&state, &connection_id).await?;
-    let (statements, warnings) =
-        plan_alter_table(&pool, &namespace, &table, &columns, &renames.unwrap_or_default()).await?;
+    let (statements, warnings) = plan_alter_table(
+        &pool,
+        &namespace,
+        &table,
+        &columns,
+        None,
+        &renames.unwrap_or_default(),
+    )
+    .await?;
     Ok(SchemaSqlPreview {
         statements,
         warnings,
@@ -1701,6 +1773,7 @@ pub async fn apply_alter_table(
         &request.namespace,
         &request.table,
         &request.columns,
+        request.indexes.as_deref(),
         &request.renames,
     )
     .await;
