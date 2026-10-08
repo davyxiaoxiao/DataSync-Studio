@@ -3,6 +3,7 @@ mod data;
 mod db;
 mod dialect;
 mod error;
+mod excel;
 mod jobs;
 mod schema;
 mod state;

@@ -3,6 +3,7 @@ import { api, errorMessage } from "./api";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { DropTablesDialog } from "./components/DropTablesDialog";
+import { ExcelImportDialog } from "./components/ExcelImportDialog";
 import { LogPanel } from "./components/LogPanel";
 import { Sidebar, type TableRef } from "./components/Sidebar";
 import { TableDesignerDialog } from "./components/TableDesignerDialog";
@@ -25,6 +26,7 @@ type TableAction =
   | { kind: "designer"; ref: TableRef }
   | { kind: "rename"; ref: TableRef }
   | { kind: "drop"; refs: TableRef[] }
+  | { kind: "importExcel"; ref: TableRef }
   | { kind: "deleteConnection"; config: ConnectionConfig };
 
 function RenameTableDialog({
@@ -152,6 +154,7 @@ function Shell() {
           onEditTable={(ref) => setTableAction({ kind: "designer", ref })}
           onRenameTable={(ref) => setTableAction({ kind: "rename", ref })}
           onDropTables={(refs) => setTableAction({ kind: "drop", refs })}
+          onImportExcel={(ref) => setTableAction({ kind: "importExcel", ref })}
         />
 
         <div className="main-area">
@@ -266,6 +269,18 @@ function Shell() {
             }
             setTableAction(null);
             window.dispatchEvent(new CustomEvent("datasync:refresh-tables"));
+          }}
+          onLog={log}
+        />
+      )}
+
+      {tableAction?.kind === "importExcel" && (
+        <ExcelImportDialog
+          target={tableAction.ref}
+          onClose={() => setTableAction(null)}
+          onImported={() => {
+            // The table's contents changed, so an open grid should reload.
+            window.dispatchEvent(new CustomEvent("datasync:refresh-data"));
           }}
           onLog={log}
         />

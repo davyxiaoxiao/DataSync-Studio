@@ -36,6 +36,11 @@ sqlx = { version = "0.8", default-features = false, features = [
     "bigdecimal",
 ] }
 
+# --- spreadsheet import -----------------------------------------------------
+# Pure Rust reader for xlsx/xls/ods; keeps the parser out of the webview and
+# avoids the unmaintained npm `xlsx` package.
+calamine = { version = "0.26", features = ["dates"] }
+
 # --- runtime / core ---------------------------------------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures = "0.3"

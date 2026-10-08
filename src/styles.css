@@ -1226,3 +1226,55 @@ table.grid.designer tbody tr:hover {
 table.grid.designer .icon-btn:disabled {
   opacity: 0.25;
 }
+
+/* --------------------------------------------------- context menu entries */
+
+.menu-entry {
+  border-radius: 5px;
+  cursor: default;
+  position: relative;
+}
+
+.menu-entry .menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 5px 10px;
+  border-radius: 5px;
+}
+
+.menu-entry:hover > .menu-row {
+  background: var(--bg-hover);
+}
+
+.menu-entry.disabled {
+  color: var(--text-faint);
+}
+
+.menu-entry.disabled:hover > .menu-row {
+  background: transparent;
+}
+
+.menu-entry.danger:not(.disabled) {
+  color: var(--red);
+}
+
+.menu-sub {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -5px;
+  margin-left: 3px;
+  min-width: 168px;
+  background: #fff;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  box-shadow: 0 10px 26px rgba(15, 20, 28, 0.18);
+  padding: 4px;
+  z-index: 202;
+}
+
+.menu-entry.has-children:hover > .menu-sub {
+  display: block;
+}

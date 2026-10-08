@@ -155,24 +155,24 @@ impl Pool {
     /// the target exactly as it was. MySQL commits every DDL statement
     /// implicitly and cannot roll back, so there execution stops at the first
     /// failure and the caller is told that the change is partial.
-    pub async fn run_ddl(
+    pub async fn run_statements(
         &self,
         statements: &[String],
         use_transaction: bool,
         reporter: &ProgressReporter,
-    ) -> AppResult<DdlRun> {
+    ) -> AppResult<StatementRun> {
         let total = statements.len();
         if statements.is_empty() {
-            return Ok(DdlRun {
-                transactional: self.supports_transactional_ddl(),
-                ..DdlRun::default()
+            return Ok(StatementRun {
+                transactional: self.supports_ddl_transaction(),
+                ..StatementRun::default()
             });
         }
 
-        if !(use_transaction && self.supports_transactional_ddl()) {
+        if !(use_transaction && self.supports_ddl_transaction()) {
             let run = self.run_script_reporting(statements, true, reporter).await;
             let attempted = run.outcomes.len();
-            return Ok(DdlRun {
+            return Ok(StatementRun {
                 outcomes: run.outcomes,
                 cancelled: run.cancelled,
                 rolled_back: false,
@@ -196,7 +196,7 @@ impl Pool {
                 for (index, sql) in statements.iter().enumerate() {
                     if reporter.is_cancelled() {
                         tx.rollback().await.ok();
-                        return Ok(DdlRun {
+                        return Ok(StatementRun {
                             outcomes,
                             cancelled: true,
                             rolled_back: true,
@@ -225,7 +225,7 @@ impl Pool {
                             // Undo everything, including the statements that had
                             // already succeeded.
                             tx.rollback().await.ok();
-                            return Ok(DdlRun {
+                            return Ok(StatementRun {
                                 outcomes,
                                 cancelled: false,
                                 rolled_back: true,
@@ -243,7 +243,7 @@ impl Pool {
                     );
                 }
                 tx.commit().await?;
-                Ok(DdlRun {
+                Ok(StatementRun {
                     outcomes,
                     cancelled: false,
                     rolled_back: false,
@@ -255,13 +255,13 @@ impl Pool {
 
         match self {
             Pool::Postgres(pool) => ddl_tx!(pool),
-            // Guarded by `supports_transactional_ddl` above.
+            // Guarded by `supports_ddl_transaction` above.
             Pool::MySql(_) => unreachable!("MySQL does not support transactional DDL"),
         }
     }
 
     /// Whether DDL can be rolled back on this engine.
-    pub fn supports_transactional_ddl(&self) -> bool {
+    pub fn supports_ddl_transaction(&self) -> bool {
         matches!(self, Pool::Postgres(_))
     }
 
@@ -335,7 +335,7 @@ pub struct ScriptRun {
 
 /// Outcome of applying a DDL plan.
 #[derive(Debug, Clone, Default)]
-pub struct DdlRun {
+pub struct StatementRun {
     pub outcomes: Vec<StatementOutcome>,
     pub cancelled: bool,
     /// A transaction was used and rolled back, so nothing was applied.

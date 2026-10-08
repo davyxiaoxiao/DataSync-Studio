@@ -55,6 +55,13 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
     void load(0);
   }, [load]);
 
+  // An import into this table invalidates what is on screen.
+  useEffect(() => {
+    const onRefresh = () => void load(offset);
+    window.addEventListener("datasync:refresh-data", onRefresh);
+    return () => window.removeEventListener("datasync:refresh-data", onRefresh);
+  }, [load, offset]);
+
   const columns: ColumnMeta[] = data?.columns ?? [];
 
   const rows = useMemo(() => {

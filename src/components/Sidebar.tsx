@@ -28,16 +28,28 @@ interface Props {
   onEditTable: (ref: TableRef) => void;
   onRenameTable: (ref: TableRef) => void;
   onDropTables: (refs: TableRef[]) => void;
+  onImportExcel: (ref: TableRef) => void;
 }
 
 const refKey = (ref: TableRef) => `${ref.connectionId}::${ref.namespace}::${ref.table}`;
 const sameScope = (ref: TableRef, other: TableRef) =>
   ref.connectionId === other.connectionId && ref.namespace === other.namespace;
 
+export interface MenuItem {
+  label: string;
+  danger?: boolean;
+  disabled?: boolean;
+  /** A leading glyph, used for the import submenu's file type. */
+  hint?: string;
+  /** When present the entry opens a nested list instead of running. */
+  children?: MenuItem[];
+  run?: () => void;
+}
+
 interface MenuState {
   x: number;
   y: number;
-  items: { label: string; danger?: boolean; disabled?: boolean; run: () => void }[];
+  items: MenuItem[];
 }
 
 export function Sidebar({
@@ -47,6 +59,7 @@ export function Sidebar({
   onEditTable,
   onRenameTable,
   onDropTables,
+  onImportExcel,
 }: Props) {
   const {
     connections,
@@ -179,6 +192,22 @@ export function Sidebar({
         label: many ? `删除选中的 ${targets.length} 张表` : "删除表",
         danger: true,
         run: () => onDropTables(targets),
+      },
+      {
+        label: "导入",
+        disabled: many,
+        children: [
+          {
+            label: "从 Excel 导入…",
+            hint: "xlsx",
+            run: () => onImportExcel(ref),
+          },
+          {
+            label: "CSV 导入",
+            disabled: true,
+            run: () => undefined,
+          },
+        ],
       },
       {
         label: "作为数据同步源…",
@@ -517,35 +546,50 @@ export function Sidebar({
               padding: 4,
             }}
           >
-            {menu.items.map((item, index) => (
-              <div
-                key={index}
-                onClick={() => {
-                  if (item.disabled) return;
-                  setMenu(null);
-                  item.run();
-                }}
-                style={{
-                  padding: "5px 10px",
-                  borderRadius: 5,
-                  cursor: "default",
-                  color: item.disabled
-                    ? "var(--text-faint)"
-                    : item.danger
-                      ? "var(--red)"
-                      : "var(--text)",
-                  background: "transparent",
-                }}
-                onMouseEnter={(event) => {
-                  if (!item.disabled) event.currentTarget.style.background = "var(--bg-hover)";
-                }}
-                onMouseLeave={(event) => {
-                  event.currentTarget.style.background = "transparent";
-                }}
-              >
-                {item.label}
-              </div>
-            ))}
+            {menu.items.map((item, index) =>
+              item.children ? (
+                <div key={index} className="menu-entry has-children">
+                  <div className="menu-row">
+                    <span>{item.label}</span>
+                    <span className="faint">▸</span>
+                  </div>
+                  <div className="menu-sub">
+                    {item.children.map((child, childIndex) => (
+                      <div
+                        key={childIndex}
+                        className={`menu-entry ${child.disabled ? "disabled" : ""}`}
+                        onClick={() => {
+                          if (child.disabled || !child.run) return;
+                          setMenu(null);
+                          child.run();
+                        }}
+                      >
+                        <div className="menu-row">
+                          <span>{child.label}</span>
+                          {child.hint && <span className="faint mono">{child.hint}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div
+                  key={index}
+                  className={`menu-entry ${item.disabled ? "disabled" : ""} ${
+                    item.danger ? "danger" : ""
+                  }`}
+                  onClick={() => {
+                    if (item.disabled || !item.run) return;
+                    setMenu(null);
+                    item.run();
+                  }}
+                >
+                  <div className="menu-row">
+                    <span>{item.label}</span>
+                  </div>
+                </div>
+              ),
+            )}
           </div>
         </>
       )}

@@ -15,9 +15,13 @@ use crate::data::{
 };
 use crate::data::plan::DataPlan;
 use crate::db::value::{ColumnMeta, Value};
-use crate::db::{open_pool, DdlRun, Pool, StatementOutcome};
+use crate::data::import::{
+    run_import, suggest_mapping, ColumnMapping, ImportOptions, ImportOutcome,
+};
+use crate::db::{open_pool, Pool, StatementOutcome, StatementRun};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
+use crate::excel::{self, ExcelSheetPreview};
 use crate::jobs::ProgressReporter;
 use crate::schema::ddl::{
     generate, normalize_designed_columns, plan_drop_tables, rename_column_ddl,
@@ -587,7 +591,7 @@ fn summarize(
 
 /// Schema sync reports rollback explicitly: the difference between "nothing
 /// happened" and "half of it happened" matters enormously to the user.
-fn summarize_ddl(run: DdlRun, elapsed_ms: u64, warnings: Vec<String>) -> SyncRunResult {
+fn summarize_ddl(run: StatementRun, elapsed_ms: u64, warnings: Vec<String>) -> SyncRunResult {
     let total = run.outcomes.len();
     let failed = run.outcomes.iter().filter(|o| !o.ok).count();
     let succeeded = total - failed;
@@ -678,7 +682,7 @@ pub async fn apply_schema_sync(
     let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
     let started = Instant::now();
     let run = pool
-        .run_ddl(&sql, request.use_transaction, &reporter)
+        .run_statements(&sql, request.use_transaction, &reporter)
         .await;
     end_job(&state, job);
     reporter.finish("done", "结构同步完成", "结构同步结束");
@@ -1358,7 +1362,7 @@ pub async fn apply_drop_tables(
         plan_drop_scope(&pool, &request.namespace, &request.tables).await?;
     let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
     let started = Instant::now();
-    let run = pool.run_ddl(&sql, true, &reporter).await;
+    let run = pool.run_statements(&sql, true, &reporter).await;
     end_job(&state, job);
     reporter.finish("done", "删除完成", "删除结束");
     Ok(summarize_ddl(
@@ -1411,7 +1415,7 @@ pub async fn rename_table(
         Some(&request.namespace),
     )];
     let started = Instant::now();
-    let run = pool.run_ddl(&sql, true, &reporter).await;
+    let run = pool.run_statements(&sql, true, &reporter).await;
     end_job(&state, job);
     reporter.finish("done", "重命名完成", "重命名结束");
     Ok(summarize_ddl(run?, started.elapsed().as_millis() as u64, Vec::new()))
@@ -1579,7 +1583,7 @@ pub async fn apply_alter_table(
     let (statements, warnings) = outcome?;
     let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
     let started = Instant::now();
-    let run = pool.run_ddl(&sql, true, &reporter).await;
+    let run = pool.run_statements(&sql, true, &reporter).await;
     end_job(&state, job);
     reporter.finish("done", "字段修改完成", "字段修改结束");
     Ok(summarize_ddl(
@@ -1587,6 +1591,128 @@ pub async fn apply_alter_table(
         started.elapsed().as_millis() as u64,
         warnings,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Excel import
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExcelImportPlan {
+    pub preview: ExcelSheetPreview,
+    /// Columns of the target table that can receive data.
+    pub columns: Vec<ColumnInfo>,
+    /// Mapping guessed from matching names, used as the initial state.
+    pub suggested: Vec<ColumnMapping>,
+    pub primary_key: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportExcelRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub path: String,
+    #[serde(default)]
+    pub sheet: Option<String>,
+    #[serde(default)]
+    pub header_row: Option<usize>,
+    #[serde(default)]
+    pub mapping: Vec<ColumnMapping>,
+    #[serde(default)]
+    pub options: ImportOptions,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+/// Read a sheet for previewing. No database involved, so it is safe to call
+/// while the user is still choosing a file.
+#[tauri::command]
+pub async fn preview_excel(
+    path: String,
+    sheet: Option<String>,
+    header_row: Option<usize>,
+    sample: Option<usize>,
+) -> AppResult<ExcelSheetPreview> {
+    excel::preview(
+        &path,
+        sheet.as_deref(),
+        header_row,
+        sample.unwrap_or(30),
+    )
+}
+
+/// Everything the mapping step needs in one round trip: the sheet, the columns
+/// that can receive data, and a suggested mapping.
+#[tauri::command]
+pub async fn plan_excel_import(
+    state: State<'_, AppState>,
+    connection_id: String,
+    namespace: String,
+    table: String,
+    path: String,
+    sheet: Option<String>,
+    header_row: Option<usize>,
+) -> AppResult<ExcelImportPlan> {
+    let preview = excel::preview(&path, sheet.as_deref(), header_row, 30)?;
+    let pool = pool_for(&state, &connection_id).await?;
+    let structure = introspect::load_table(&pool, &namespace, &table).await?;
+    let columns: Vec<ColumnInfo> = structure
+        .columns
+        .iter()
+        .filter(|column| column.is_writable())
+        .cloned()
+        .collect();
+    let suggested = suggest_mapping(&structure, &preview.headers);
+    Ok(ExcelImportPlan {
+        preview,
+        columns,
+        suggested,
+        primary_key: structure.primary_key.clone(),
+    })
+}
+
+#[tauri::command]
+pub async fn import_excel(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: ImportExcelRequest,
+) -> AppResult<ImportOutcome> {
+    if request.mapping.is_empty() {
+        return Err(AppError::msg("请至少映射一个字段"));
+    }
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let structure = introspect::load_table(&pool, &request.namespace, &request.table).await?;
+
+    let (sheet, _, chosen) = excel::read_sheet(
+        &request.path,
+        request.sheet.as_deref(),
+        request.header_row,
+        None,
+    )?;
+    reporter.force(
+        "import",
+        "导入数据",
+        0,
+        Some(sheet.rows.len() as u64),
+        format!("工作表 {chosen}：{} 行", sheet.rows.len()),
+    );
+
+    let outcome = run_import(
+        &pool,
+        &request.namespace,
+        &structure,
+        &sheet,
+        &request.mapping,
+        &request.options,
+        &reporter,
+    )
+    .await;
+    end_job(&state, job);
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -1762,6 +1888,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         rename_table,
         preview_alter_table,
         apply_alter_table,
+        preview_excel,
+        plan_excel_import,
+        import_excel,
     ]
 }
 

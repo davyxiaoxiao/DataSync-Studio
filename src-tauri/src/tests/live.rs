@@ -19,6 +19,8 @@ use crate::commands::{
     apply_data_plan, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
     preview_table_data_core, ColumnRename,
 };
+use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
+use crate::excel;
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
 use crate::dialect::Dialect;
@@ -132,7 +134,24 @@ async fn run_plan(pool: &Pool, statements: Vec<String>) {
     assert!(failures.is_empty(), "有 {} 条语句执行失败:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// Prefix every namespace created or destroyed by these tests must carry.
+///
+/// These tests are pointed at whatever server the environment names, and that
+/// may well be a production box. The guard makes it structurally impossible for
+/// a test to drop or overwrite a real database or schema: a typo in a test can
+/// only ever produce a refusal, never a `DROP DATABASE datasync1`.
+const TEST_NAMESPACE_PREFIX: &str = "datasync_live_";
+
+fn assert_test_namespace(name: &str) {
+    assert!(
+        name.starts_with(TEST_NAMESPACE_PREFIX),
+        "拒绝操作 {name:?}：测试只允许处理以 {TEST_NAMESPACE_PREFIX:?} 开头的命名空间。\
+         这条断言的存在是为了让误操作线上库变成不可能，请勿放宽。"
+    );
+}
+
 async fn create_namespace(pool: &Pool, dialect: Dialect, name: &str) {
+    assert_test_namespace(name);
     let sql = match dialect {
         Dialect::Mysql => format!("CREATE DATABASE IF NOT EXISTS `{name}` DEFAULT CHARSET utf8mb4"),
         Dialect::Postgres => format!("CREATE SCHEMA IF NOT EXISTS \"{name}\""),
@@ -141,6 +160,7 @@ async fn create_namespace(pool: &Pool, dialect: Dialect, name: &str) {
 }
 
 async fn drop_namespace(pool: &Pool, dialect: Dialect, name: &str) {
+    assert_test_namespace(name);
     let sql = match dialect {
         Dialect::Mysql => format!("DROP DATABASE IF EXISTS `{name}`"),
         Dialect::Postgres => format!("DROP SCHEMA IF EXISTS \"{name}\" CASCADE"),
@@ -1669,7 +1689,7 @@ async fn live_postgres_ddl_rolls_back_on_failure() {
     create_namespace(&pool, Dialect::Postgres, dst).await;
 
     assert!(
-        pool.supports_transactional_ddl(),
+        pool.supports_ddl_transaction(),
         "PostgreSQL 应支持 DDL 事务"
     );
 
@@ -1731,7 +1751,7 @@ async fn live_postgres_ddl_rolls_back_on_failure() {
     assert_eq!(sql.len(), 2, "{sql:?}");
 
     let run = pool
-        .run_ddl(&sql, true, &ProgressReporter::inert())
+        .run_statements(&sql, true, &ProgressReporter::inert())
         .await
         .expect("run ddl");
 
@@ -1762,7 +1782,7 @@ async fn live_postgres_ddl_rolls_back_on_failure() {
     // Running the same plan without a transaction would leave the first change
     // behind, which is why the option matters.
     let run = pool
-        .run_ddl(&sql, false, &ProgressReporter::inert())
+        .run_statements(&sql, false, &ProgressReporter::inert())
         .await
         .expect("run ddl without a transaction");
     assert!(!run.transactional);
@@ -1792,7 +1812,7 @@ async fn live_mysql_reports_that_ddl_cannot_be_rolled_back() {
     let pool = connect(&target, Dialect::Mysql).await;
     // MySQL commits every DDL statement implicitly, so the tool must say so
     // rather than implying a rollback it cannot perform.
-    assert!(!pool.supports_transactional_ddl());
+    assert!(!pool.supports_ddl_transaction());
 }
 
 /// Table level operations: edit columns, rename a table, drop a table that is
@@ -1938,7 +1958,7 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         Some(ns),
     )];
     let run = pool
-        .run_ddl(&sql, true, &ProgressReporter::inert())
+        .run_statements(&sql, true, &ProgressReporter::inert())
         .await
         .expect("rename table");
     assert_eq!(run.outcomes.iter().filter(|o| !o.ok).count(), 0);
@@ -2020,6 +2040,392 @@ async fn live_postgres_table_operations() {
     table_ops_scenario(&pool, Dialect::Postgres, "datasync_live_ops", "pg 表操作").await;
 }
 
+/// Fetch a single value through SQL that casts to text.
+async fn text_of(pool: &Pool, sql: &str) -> Option<String> {
+    let rows = pool
+        .fetch(sql, &[], &[crate::db::value::ColumnKind::Str])
+        .await
+        .unwrap_or_else(|e| panic!("查询失败 {sql}: {e}"));
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(|value| value.display())
+}
+
+fn excel_fixture() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/import.xlsx")
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Import the fixture workbook into a real table.
+///
+/// The fixture carries a genuine Excel date serial, a boolean, numbers stored as
+/// floats, blank cells and one row whose values do not fit — so this covers the
+/// whole path from file to stored value.
+async fn excel_import_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
+    drop_namespace(pool, dialect, ns).await;
+    create_namespace(pool, dialect, ns).await;
+
+    let q = |name: &str| dialect.qualified(Some(ns), name);
+    let c = |name: &str| dialect.quote(name);
+    let engine = match dialect {
+        Dialect::Mysql => " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        Dialect::Postgres => "",
+    };
+    let ddl = match dialect {
+        Dialect::Mysql => format!(
+            "CREATE TABLE {} (
+                {id} INT NOT NULL,
+                {name} VARCHAR(64),
+                {amount} DECIMAL(12,2),
+                {ratio} DECIMAL(10,4),
+                {active} TINYINT(1),
+                {created_at} DATETIME,
+                {payload} JSON,
+                {extra} VARCHAR(32),
+                {derived} VARCHAR(64) GENERATED ALWAYS AS (UPPER({name})) STORED,
+                PRIMARY KEY ({id})
+             ){engine}",
+            q("sheet_import"),
+            id = c("id"),
+            name = c("name"),
+            amount = c("amount"),
+            ratio = c("ratio"),
+            active = c("active"),
+            created_at = c("created_at"),
+            payload = c("payload"),
+            extra = c("extra"),
+            derived = c("name_upper"),
+        ),
+        Dialect::Postgres => format!(
+            "CREATE TABLE {} (
+                \"id\" integer NOT NULL,
+                \"name\" character varying(64),
+                \"amount\" numeric(12,2),
+                \"ratio\" numeric(10,4),
+                \"active\" boolean,
+                \"created_at\" timestamp,
+                \"payload\" jsonb,
+                \"extra\" character varying(32),
+                \"name_upper\" character varying(64) GENERATED ALWAYS AS (upper(\"name\")) STORED,
+                PRIMARY KEY (\"id\")
+             )",
+            q("sheet_import"),
+        ),
+    };
+    exec_all(pool, &[ddl]).await;
+
+    let structure = crate::schema::introspect::load_table(pool, ns, "sheet_import")
+        .await
+        .expect("load table");
+    let (sheet, _, _) = excel::read_sheet(&excel_fixture(), Some("数据"), Some(0), None)
+        .expect("read fixture");
+    assert_eq!(sheet.total_rows, 4, "{tag}: 夹具应有 4 行数据");
+
+    // Headers match column names, so the suggestion should cover every writable
+    // column and leave the generated one alone.
+    let suggested = suggest_mapping(&structure, &sheet.headers);
+    let suggested_names: Vec<&str> = suggested.iter().map(|m| m.column.as_str()).collect();
+    assert!(
+        suggested_names.contains(&"name") && suggested_names.contains(&"created_at"),
+        "{tag}: 建议映射应包含同名列: {suggested_names:?}"
+    );
+    assert!(
+        !suggested_names.contains(&"name_upper"),
+        "{tag}: 生成列不应出现在建议映射里: {suggested_names:?}"
+    );
+
+    let mapping = suggested;
+    let outcome = run_import(
+        pool,
+        ns,
+        &structure,
+        &sheet,
+        &mapping,
+        &ImportOptions::default(),
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("import");
+
+    assert_eq!(outcome.read, 4, "{tag}: 应读到 4 行");
+    assert_eq!(outcome.prepared, 3, "{tag}: 3 行可转换");
+    assert_eq!(outcome.skipped, 1, "{tag}: 1 行数值非法应被跳过");
+    assert_eq!(outcome.failed, 0, "{tag}: 不应有语句级失败");
+    assert_eq!(outcome.inserted, 3, "{tag}: 应写入 3 行");
+    assert_eq!(outcome.errors.len(), 1, "{tag}: 应记录 1 条错误");
+    assert_eq!(outcome.errors[0].row, 4, "{tag}: 出问题的应是第 4 行");
+    assert_eq!(
+        outcome.errors[0].column.as_deref(),
+        Some("amount"),
+        "{tag}: 应指出是 amount 列"
+    );
+
+    // Values arrived converted, not as raw strings.
+    let rows = scalar_count(pool, ns, "sheet_import", dialect).await;
+    assert_eq!(rows, 3, "{tag}: 表中应有 3 行");
+
+    let name = text_of(
+        pool,
+        &format!(
+            "SELECT {} FROM {} WHERE {} = 1",
+            c("name"),
+            q("sheet_import"),
+            c("id")
+        ),
+    )
+    .await;
+    assert_eq!(name.as_deref(), Some("苹果"), "{tag}: 中文与主键匹配");
+
+    let escaped = text_of(
+        pool,
+        &format!(
+            "SELECT {} FROM {} WHERE {} = 2",
+            c("name"),
+            q("sheet_import"),
+            c("id")
+        ),
+    )
+    .await;
+    assert_eq!(
+        escaped.as_deref(),
+        Some("O'Brien"),
+        "{tag}: 含引号的字符串应完整写入"
+    );
+
+    // The fixture stores this as an Excel date serial with a date format; a
+    // reader that ignored the format would store 45356 here.
+    let created_sql = match dialect {
+        Dialect::Mysql => format!(
+            "SELECT CAST({} AS CHAR) FROM {} WHERE {} = 1",
+            c("created_at"),
+            q("sheet_import"),
+            c("id")
+        ),
+        Dialect::Postgres => format!(
+            "SELECT {}::text FROM {} WHERE \"id\" = 1",
+            c("created_at"),
+            q("sheet_import")
+        ),
+    };
+    let created = text_of(pool, &created_sql).await;
+    assert!(
+        created.as_deref().is_some_and(|value| value.starts_with("2024-03-05")),
+        "{tag}: Excel 日期序列号必须还原为日期, 实际 {created:?}"
+    );
+
+    let amount_sql = match dialect {
+        Dialect::Mysql => format!(
+            "SELECT CAST({} AS CHAR) FROM {} WHERE {} = 1",
+            c("amount"),
+            q("sheet_import"),
+            c("id")
+        ),
+        Dialect::Postgres => format!(
+            "SELECT {}::text FROM {} WHERE \"id\" = 1",
+            c("amount"),
+            q("sheet_import")
+        ),
+    };
+    let amount = text_of(pool, &amount_sql).await;
+    assert_eq!(amount.as_deref(), Some("10.50"), "{tag}: 数值应按列精度存储");
+
+    // Row 3 had blank cells, which must land as NULL rather than empty strings.
+    let blank = text_of(
+        pool,
+        &format!(
+            "SELECT {} FROM {} WHERE {} = 3",
+            c("amount"),
+            q("sheet_import"),
+            c("id")
+        ),
+    )
+    .await;
+    assert_eq!(blank, None, "{tag}: 空单元格应写入 NULL");
+
+    let payload_sql = match dialect {
+        Dialect::Mysql => format!(
+            "SELECT CAST({} AS CHAR) FROM {} WHERE {} = 1",
+            c("payload"),
+            q("sheet_import"),
+            c("id")
+        ),
+        Dialect::Postgres => format!(
+            "SELECT {}::text FROM {} WHERE \"id\" = 1",
+            c("payload"),
+            q("sheet_import")
+        ),
+    };
+    let payload = text_of(pool, &payload_sql).await;
+    assert!(
+        payload.as_deref().is_some_and(|value| value.contains('1')),
+        "{tag}: JSON 应被接受, 实际 {payload:?}"
+    );
+
+    // ---- 覆盖模式：同一份数据再导一次，应更新而不是插入重复行 ----------
+    let name_sql = |id: i32| {
+        format!(
+            "SELECT {} FROM {} WHERE {} = {id}",
+            c("name"),
+            q("sheet_import"),
+            c("id")
+        )
+    };
+    exec(
+        pool,
+        &format!(
+            "UPDATE {} SET {} = 'changed' WHERE {} = 1",
+            q("sheet_import"),
+            c("name"),
+            c("id")
+        ),
+    )
+    .await;
+
+    let upsert_options = ImportOptions {
+        strategy: ImportStrategy::Upsert,
+        ..ImportOptions::default()
+    };
+    let overwritten = run_import(
+        pool,
+        ns,
+        &structure,
+        &sheet,
+        &mapping,
+        &upsert_options,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("upsert import");
+
+    assert_eq!(overwritten.failed, 0, "{tag}: 覆盖模式不应有失败");
+    assert_eq!(
+        scalar_count(pool, ns, "sheet_import", dialect).await,
+        3,
+        "{tag}: 覆盖模式不得产生重复行"
+    );
+    assert_eq!(
+        overwritten.existing_keys,
+        Some(3),
+        "{tag}: 3 行的主键都已存在，应被识别为覆盖"
+    );
+    let restored = text_of(pool, &name_sql(1)).await;
+    assert_eq!(
+        restored.as_deref(),
+        Some("苹果"),
+        "{tag}: 覆盖模式应把被改动的值写回"
+    );
+
+    // 新增模式遇到同样的数据则应报主键冲突，证明两种策略确实不同。
+    let append_again = run_import(
+        pool,
+        ns,
+        &structure,
+        &sheet,
+        &mapping,
+        &ImportOptions::default(),
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("append import");
+    assert!(
+        append_again.failed > 0,
+        "{tag}: 新增模式遇到已存在的主键应当失败"
+    );
+
+    // ---- a duplicate key must not leave a half-imported table --------------
+    exec(
+        pool,
+        &format!("DELETE FROM {}", q("sheet_import")),
+    )
+    .await;
+    exec(
+        pool,
+        &format!(
+            "INSERT INTO {} ({}) VALUES (2)",
+            q("sheet_import"),
+            c("id")
+        ),
+    )
+    .await;
+
+    let one_at_a_time = ImportOptions {
+        batch_size: 1,
+        use_transaction: true,
+        ..ImportOptions::default()
+    };
+    let second = run_import(
+        pool,
+        ns,
+        &structure,
+        &sheet,
+        &mapping,
+        &one_at_a_time,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("second import");
+
+    assert!(second.failed > 0, "{tag}: 主键冲突应被报告");
+    let after = scalar_count(pool, ns, "sheet_import", dialect).await;
+    if dialect == Dialect::Postgres {
+        assert!(second.rolled_back, "{tag}: PostgreSQL 应整体回滚");
+        assert_eq!(second.inserted, 0, "{tag}: 回滚后插入数应为 0");
+        assert_eq!(
+            after, 1,
+            "{tag}: 回滚后只应剩下导入前的那一行, 实际 {after}"
+        );
+        assert!(
+            second.warnings.iter().any(|w| w.contains("事务已回滚")),
+            "{tag}: 应提示已回滚: {:?}",
+            second.warnings
+        );
+    } else {
+        // MySQL commits DDL — and here every statement — so a failure cannot be
+        // undone; the tool must say so rather than imply otherwise.
+        assert!(!second.rolled_back, "{tag}: MySQL 无法回滚");
+        assert!(!second.transactional);
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|w| w.contains("不支持事务回滚") && w.contains("已经写入")),
+            "{tag}: 应明确说明已写入的行无法回滚: {:?}",
+            second.warnings
+        );
+        // Execution stops at the first failure, so the batch before it stays and
+        // the batch after it is never attempted: the pre-existing row plus one.
+        assert_eq!(second.inserted, 1, "{tag}: 失败前的行会保留");
+        assert_eq!(
+            after, 2,
+            "{tag}: 应剩下导入前的 1 行 + 失败前写入的 1 行, 实际 {after}"
+        );
+    }
+
+    drop_namespace(pool, dialect, ns).await;
+}
+
+#[tokio::test]
+async fn live_mysql_excel_import() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    excel_import_scenario(&pool, Dialect::Mysql, "datasync_live_import", "mysql 导入").await;
+}
+
+#[tokio::test]
+async fn live_postgres_excel_import() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    excel_import_scenario(&pool, Dialect::Postgres, "datasync_live_import", "pg 导入").await;
+}
+
 /// Cross-engine synchronisation is deliberately refused, and the refusal must
 /// happen before any database work.
 #[tokio::test]
@@ -2036,9 +2442,9 @@ async fn live_cross_engine_sync_is_rejected() {
 
     let schema_error = compare_schema_core(
         &mysql,
-        "datasync_probe_src",
+        "datasync_live_probe_src",
         &pg,
-        "datasync_probe_dst",
+        "datasync_live_probe_dst",
         CompareOptions::default(),
         None,
         &ProgressReporter::inert(),
@@ -2050,12 +2456,12 @@ async fn live_cross_engine_sync_is_rejected() {
 
     let source = TableEndpoint {
         connection_id: "src".into(),
-        namespace: "datasync_probe_src".into(),
+        namespace: "datasync_live_probe_src".into(),
         table: "t".into(),
     };
     let target = TableEndpoint {
         connection_id: "dst".into(),
-        namespace: "datasync_probe_dst".into(),
+        namespace: "datasync_live_probe_dst".into(),
         table: "t".into(),
     };
     let data_error = compare_data_core(&mysql, &source, &pg, &target, &[], &[], 100, &ProgressReporter::inert())

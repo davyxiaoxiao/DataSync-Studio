@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ColumnInfo,
+  ColumnMapping,
   ColumnPair,
+  ExcelImportPlan,
+  ExcelSheetPreview,
+  ImportOutcome,
+  ImportStrategy,
   CompareSchemaResult,
   ConnectionConfig,
   ConnectionInfo,
@@ -131,6 +136,48 @@ export const api = {
 
   /** Ask a running job to stop; returns false when it already finished. */
   cancelJob: (jobId: string) => invoke<boolean>("cancel_job", { jobId }),
+
+  previewExcel: (
+    path: string,
+    sheet?: string | null,
+    headerRow?: number | null,
+    sample?: number,
+  ) =>
+    invoke<ExcelSheetPreview>("preview_excel", { path, sheet, headerRow, sample }),
+
+  planExcelImport: (
+    connectionId: string,
+    namespace: string,
+    table: string,
+    path: string,
+    sheet?: string | null,
+    headerRow?: number | null,
+  ) =>
+    invoke<ExcelImportPlan>("plan_excel_import", {
+      connectionId,
+      namespace,
+      table,
+      path,
+      sheet,
+      headerRow,
+    }),
+
+  importExcel: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    path: string;
+    sheet?: string | null;
+    headerRow?: number | null;
+    mapping: ColumnMapping[];
+    options?: {
+      skipInvalid?: boolean;
+      useTransaction?: boolean;
+      batchSize?: number;
+      strategy?: ImportStrategy;
+    };
+    jobId?: string;
+  }) => invoke<ImportOutcome>("import_excel", { request }),
 
   previewDropTables: (connectionId: string, namespace: string, tables: string[]) =>
     invoke<DropTablesPreview>("preview_drop_tables", { connectionId, namespace, tables }),

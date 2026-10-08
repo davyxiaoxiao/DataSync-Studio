@@ -259,6 +259,60 @@ export interface SchemaSqlPreview {
   warnings: string[];
 }
 
+/** A worksheet read for the import flow. */
+export interface ExcelSheetPreview {
+  sheets: string[];
+  sheet: string;
+  headerRow?: number | null;
+  headers: string[];
+  rows: string[][];
+  totalRows: number;
+  truncated: boolean;
+  /** The first few raw rows, so a different header row can be picked offline. */
+  head: string[][];
+}
+
+/** One target column fed by one spreadsheet column. */
+export interface ColumnMapping {
+  column: string;
+  excelIndex: number;
+}
+
+export interface ExcelImportPlan {
+  preview: ExcelSheetPreview;
+  /** Target columns that can receive data (generated ones are excluded). */
+  columns: ColumnInfo[];
+  suggested: ColumnMapping[];
+  primaryKey: string[];
+}
+
+export interface ImportRowError {
+  row: number;
+  column?: string | null;
+  message: string;
+}
+
+/** `append` = plain INSERT; `upsert` = overwrite the row with the same key. */
+export type ImportStrategy = "append" | "upsert";
+
+export interface ImportOutcome {
+  read: number;
+  prepared: number;
+  skipped: number;
+  failed: number;
+  inserted: number;
+  statements: number;
+  errors: ImportRowError[];
+  warnings: string[];
+  cancelled: boolean;
+  rolledBack: boolean;
+  transactional: boolean;
+  strategy: ImportStrategy;
+  /** Rows overwriting an existing key, counted by primary key before writing. */
+  existingKeys?: number | null;
+  elapsedMs: number;
+}
+
 /** Mirrors `jobs::ProgressUpdate`; delivered on the `sync://progress` event. */
 export interface ProgressUpdate {
   jobId: string;
