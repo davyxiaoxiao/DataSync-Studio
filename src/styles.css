@@ -1456,3 +1456,16 @@ table.grid.resizing .col-resizer {
   line-height: 1.6;
   pointer-events: auto;
 }
+
+.col-tip-value {
+  margin-top: 4px;
+  max-height: 150px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--bg-subtle);
+  border-radius: 5px;
+  padding: 4px 6px;
+  font-size: 11px;
+  line-height: 1.5;
+}

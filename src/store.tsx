@@ -79,6 +79,10 @@ interface StoreValue {
   closeTabsForConnection: (connectionId: string) => void;
   openTab: (tab: Omit<Tab, "id"> & { id?: string }) => string;
   closeTab: (id: string) => void;
+  /** Keep only this tab. */
+  closeOtherTabs: (id: string) => void;
+  /** Close everything, leaving a welcome tab so the window is never blank. */
+  closeAllTabs: () => void;
   setActiveTab: (id: string) => void;
 }
 
@@ -376,6 +380,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const closeOtherTabs = useCallback((id: string) => {
+    const target = tabsRef.current.find((tab) => tab.id === id);
+    if (!target) return;
+    setTabs([target]);
+    setActiveTabId(id);
+  }, []);
+
+  const closeAllTabs = useCallback(() => {
+    // An empty tab strip would leave nothing to look at, so the welcome tab is
+    // always the last one standing.
+    setTabs([{ id: "welcome", kind: "welcome", title: "欢迎" }]);
+    setActiveTabId("welcome");
+  }, []);
+
   const value = useMemo<StoreValue>(
     () => ({
       connections,
@@ -398,6 +416,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       closeTabsForConnection,
       openTab,
       closeTab,
+      closeOtherTabs,
+      closeAllTabs,
       setActiveTab: setActiveTabId,
     }),
     [
@@ -417,6 +437,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       refreshTables,
       openTab,
       closeTab,
+      closeOtherTabs,
+      closeAllTabs,
       closeTabsForConnection,
     ],
   );

@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { useStore, type Tab } from "../store";
+import { ContextMenu, menuAt, type MenuState } from "./ContextMenu";
 import {
   IconClose,
   IconCompare,
@@ -20,7 +22,9 @@ function TabIcon({ kind }: { kind: Tab["kind"] }) {
 }
 
 export function TabBar() {
-  const { tabs, activeTabId, setActiveTab, closeTab } = useStore();
+  const { tabs, activeTabId, setActiveTab, closeTab, closeOtherTabs, closeAllTabs } =
+    useStore();
+  const [menu, setMenu] = useState<MenuState | null>(null);
 
   return (
     <div className="tabbar">
@@ -29,7 +33,28 @@ export function TabBar() {
           key={tab.id}
           className={`tab ${tab.id === activeTabId ? "active" : ""}`}
           onClick={() => setActiveTab(tab.id)}
+          onContextMenu={(event) =>
+            setMenu(
+              menuAt(event, [
+                {
+                  label: "关闭",
+                  run: () => closeTab(tab.id),
+                },
+                {
+                  label: "关闭其他",
+                  disabled: tabs.length <= 1,
+                  run: () => closeOtherTabs(tab.id),
+                },
+                {
+                  label: "全部关闭",
+                  disabled: tabs.every((entry) => entry.kind === "welcome"),
+                  run: () => closeAllTabs(),
+                },
+              ]),
+            )
+          }
           onAuxClick={(event) => {
+            // Middle click closes, as it does everywhere else.
             if (event.button === 1) closeTab(tab.id);
           }}
         >
@@ -49,6 +74,8 @@ export function TabBar() {
           </button>
         </div>
       ))}
+
+      {menu && <ContextMenu state={menu} onClose={() => setMenu(null)} />}
     </div>
   );
 }

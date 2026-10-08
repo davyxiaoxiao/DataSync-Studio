@@ -90,7 +90,18 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
     startX: number;
     startWidth: number;
   } | null>(null);
-  const [tip, setTip] = useState<{ column: ColumnMeta; x: number; y: number } | null>(null);
+  const [tip, setTip] = useState<{
+    column: ColumnMeta;
+    /** The hovered cell's full value; absent when hovering the header. */
+    value?: string;
+    /**
+     * True only for a real NULL. An empty string is a value too, and showing it
+     * as NULL would be a lie.
+     */
+    isNull?: boolean;
+    x: number;
+    y: number;
+  } | null>(null);
   const tipTimer = useRef<number | null>(null);
   const requestSeq = useRef(0);
 
@@ -200,16 +211,34 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
   const columnWidth = (name: string) => widths[name] ?? 180;
   const tableWidth = ROWNO_WIDTH + columns.reduce((sum, column) => sum + columnWidth(column.name), 0);
 
-  const showTip = (column: ColumnMeta, target: HTMLElement) => {
+  /// Show the column box near `target`.
+  ///
+  /// Hovering the header answers "what is this column"; hovering a cell answers
+  /// the same thing plus "what does this cell actually contain", which matters
+  /// because long values are ellipsised in the grid.
+  const showTip = (
+    column: ColumnMeta,
+    target: HTMLElement,
+    value?: string,
+    isNull = false,
+  ) => {
     if (tipTimer.current !== null) window.clearTimeout(tipTimer.current);
-    // A short delay keeps the box from flashing while the pointer crosses the
-    // header row.
+    // A short delay keeps the box from flashing while the pointer moves.
     tipTimer.current = window.setTimeout(() => {
       const rect = target.getBoundingClientRect();
+      // Roughly the box's height, so it flips above when there is no room below.
+      const estimated = 96 + (column.comment ? 30 : 0) + (value !== undefined ? 46 : 0);
+      const below = rect.bottom + 6;
+      const y =
+        below + estimated > window.innerHeight - 8
+          ? Math.max(rect.top - estimated - 6, 8)
+          : below;
       setTip({
         column,
+        value,
+        isNull,
         x: Math.min(rect.left, Math.max(window.innerWidth - 330, 8)),
-        y: rect.bottom + 6,
+        y,
       });
     }, 220);
   };
@@ -263,6 +292,7 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
     const meta = columns[cellIndex];
     if (!meta || meta.generated) return;
     setCellError(null);
+    hideTip();
     setEditing({ row: rowIndex, column: cellIndex });
     setEditValue(cellText(rows[rowIndex]?.[cellIndex]));
   };
@@ -499,13 +529,14 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
                       className={`${isNull ? "null" : ""} ${numeric ? "num" : ""} ${
                         editable ? "editable" : ""
                       }`}
-                      title={
-                        meta?.generated
-                          ? "生成列不可编辑"
-                          : editable
-                            ? `单击编辑 · ${cell.text ?? "NULL"}`
-                            : "该表没有主键，无法编辑"
-                      }
+                      // The browser tooltip is gone: the column box carries the
+                      // name, the type, the comment and the full value.
+                      onMouseEnter={(event) => {
+                        if (meta) {
+                          showTip(meta, event.currentTarget, cellText(cell), isNull);
+                        }
+                      }}
+                      onMouseLeave={hideTip}
                       onClick={() => startEdit(rowIndex, cellIndex)}
                     >
                       {isNull ? "NULL" : cell.text}
@@ -550,6 +581,30 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
               <span className="faint">（该列没有备注）</span>
             )}
           </div>
+          {tip.value !== undefined && (
+            <>
+              <div
+                className="faint"
+                style={{
+                  marginTop: 8,
+                  paddingTop: 6,
+                  borderTop: "1px solid var(--border)",
+                  fontSize: 11,
+                }}
+              >
+                本格的值
+              </div>
+              <div className="mono col-tip-value">
+                {tip.isNull ? (
+                  <span className="faint">NULL</span>
+                ) : tip.value === "" ? (
+                  <span className="faint">（空字符串）</span>
+                ) : (
+                  tip.value
+                )}
+              </div>
+            </>
+          )}
         </div>
       )}
 

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useStore, dialectLabel } from "../store";
+import { ContextMenu, menuAt, type MenuState } from "./ContextMenu";
 import type { ConnectionConfig } from "../types";
 import {
   IconChevronDown,
@@ -35,23 +36,6 @@ interface Props {
 const refKey = (ref: TableRef) => `${ref.connectionId}::${ref.namespace}::${ref.table}`;
 const sameScope = (ref: TableRef, other: TableRef) =>
   ref.connectionId === other.connectionId && ref.namespace === other.namespace;
-
-export interface MenuItem {
-  label: string;
-  danger?: boolean;
-  disabled?: boolean;
-  /** A leading glyph, used for the import submenu's file type. */
-  hint?: string;
-  /** When present the entry opens a nested list instead of running. */
-  children?: MenuItem[];
-  run?: () => void;
-}
-
-interface MenuState {
-  x: number;
-  y: number;
-  items: MenuItem[];
-}
 
 export function Sidebar({
   onNewConnection,
@@ -112,14 +96,8 @@ export function Sidebar({
     return () => window.removeEventListener("datasync:refresh-tables", onRefresh);
   }, [connections, sessions, refreshTables]);
 
-  const openMenu = (
-    event: MouseEvent,
-    items: MenuState["items"],
-  ) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setMenu({ x: event.clientX, y: event.clientY, items });
-  };
+  const openMenu = (event: MouseEvent, items: MenuState["items"]) =>
+    setMenu(menuAt(event, items));
 
   /** Visible tables of a namespace, in tree order — the basis for range select. */
   const visibleTablesOf = (connectionId: string, namespace: string): TableRef[] => {
@@ -540,77 +518,7 @@ export function Sidebar({
         </button>
       </div>
 
-      {menu && (
-        <>
-          <div
-            style={{ position: "fixed", inset: 0, zIndex: 200 }}
-            onClick={() => setMenu(null)}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              setMenu(null);
-            }}
-          />
-          <div
-            style={{
-              position: "fixed",
-              left: menu.x,
-              top: menu.y,
-              zIndex: 201,
-              minWidth: 168,
-              background: "#fff",
-              border: "1px solid var(--border-strong)",
-              borderRadius: 7,
-              boxShadow: "0 10px 26px rgba(15,20,28,.18)",
-              padding: 4,
-            }}
-          >
-            {menu.items.map((item, index) =>
-              item.children ? (
-                <div key={index} className="menu-entry has-children">
-                  <div className="menu-row">
-                    <span>{item.label}</span>
-                    <span className="faint">▸</span>
-                  </div>
-                  <div className="menu-sub">
-                    {item.children.map((child, childIndex) => (
-                      <div
-                        key={childIndex}
-                        className={`menu-entry ${child.disabled ? "disabled" : ""}`}
-                        onClick={() => {
-                          if (child.disabled || !child.run) return;
-                          setMenu(null);
-                          child.run();
-                        }}
-                      >
-                        <div className="menu-row">
-                          <span>{child.label}</span>
-                          {child.hint && <span className="faint mono">{child.hint}</span>}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div
-                  key={index}
-                  className={`menu-entry ${item.disabled ? "disabled" : ""} ${
-                    item.danger ? "danger" : ""
-                  }`}
-                  onClick={() => {
-                    if (item.disabled || !item.run) return;
-                    setMenu(null);
-                    item.run();
-                  }}
-                >
-                  <div className="menu-row">
-                    <span>{item.label}</span>
-                  </div>
-                </div>
-              ),
-            )}
-          </div>
-        </>
-      )}
+      {menu && <ContextMenu state={menu} onClose={() => setMenu(null)} />}
     </div>
   );
 }
