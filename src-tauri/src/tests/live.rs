@@ -24,6 +24,7 @@ use crate::data::view::{
     build_cell_update, CellEdit, FilterCondition, FilterGroup, FilterOp, RowKeyValue, SortSpec,
 };
 use crate::excel;
+use crate::excel_export::{export, ExportColumn, ExportOptions};
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
 use crate::dialect::Dialect;
@@ -2992,6 +2993,254 @@ async fn live_postgres_data_grid() {
     };
     let pool = connect(&target, Dialect::Postgres).await;
     grid_scenario(&pool, Dialect::Postgres, "datasync_live_grid", "pg 网格").await;
+}
+
+/// Export a table to a workbook and read it back.
+///
+/// Checking the file with the same reader the import uses proves the round trip,
+/// not just that a file appeared.
+async fn excel_export_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
+    drop_namespace(pool, dialect, ns).await;
+    create_namespace(pool, dialect, ns).await;
+
+    let q = |name: &str| dialect.qualified(Some(ns), name);
+    let c = |name: &str| dialect.quote(name);
+    let engine = match dialect {
+        Dialect::Mysql => " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        Dialect::Postgres => "",
+    };
+    let (int_type, text_type, decimal_type, bool_type, time_type) = match dialect {
+        Dialect::Mysql => ("INT", "VARCHAR(64)", "DECIMAL(12,2)", "TINYINT(1)", "DATETIME"),
+        Dialect::Postgres => (
+            "integer",
+            "character varying(64)",
+            "numeric(12,2)",
+            "boolean",
+            "timestamp",
+        ),
+    };
+    let truth = match dialect {
+        Dialect::Mysql => "1",
+        Dialect::Postgres => "true",
+    };
+    let falsity = match dialect {
+        Dialect::Mysql => "0",
+        Dialect::Postgres => "false",
+    };
+
+    exec_all(
+        pool,
+        &[
+            format!(
+                "CREATE TABLE {} (
+                    {id} {int_type} NOT NULL,
+                    {name} {text_type},
+                    {amount} {decimal_type},
+                    {ratio} {decimal_type},
+                    {active} {bool_type},
+                    {created_at} {time_type},
+                    {note} {text_type},
+                    PRIMARY KEY ({id})
+                 ){engine}",
+                q("sheet_export"),
+                id = c("id"),
+                name = c("name"),
+                amount = c("amount"),
+                ratio = c("ratio"),
+                active = c("active"),
+                created_at = c("created_at"),
+                note = c("note"),
+            ),
+            format!(
+                "INSERT INTO {} ({id}, {name}, {amount}, {ratio}, {active}, {created_at}, {note}) VALUES
+                    (1, '苹果', 10.50, 0.25, {truth}, '2024-03-05 10:20:30', NULL),
+                    (2, 'O''Brien', 20.00, 1.50, {falsity}, '2024-03-06 00:00:00', 'note')",
+                q("sheet_export"),
+                id = c("id"),
+                name = c("name"),
+                amount = c("amount"),
+                ratio = c("ratio"),
+                active = c("active"),
+                created_at = c("created_at"),
+                note = c("note"),
+            ),
+        ],
+    )
+    .await;
+
+    let structure = crate::schema::introspect::load_table(pool, ns, "sheet_export")
+        .await
+        .expect("load table");
+
+    let path = std::env::temp_dir().join(format!("datasync_live_export_{tag}.xlsx"));
+    let path = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&path);
+
+    // Two columns get renamed headers; the rest keep their names.
+    let columns = vec![
+        ExportColumn {
+            column: "id".into(),
+            header: Some("编号".into()),
+        },
+        ExportColumn {
+            column: "name".into(),
+            header: Some("名称".into()),
+        },
+        ExportColumn {
+            column: "amount".into(),
+            header: None,
+        },
+        ExportColumn {
+            column: "ratio".into(),
+            header: None,
+        },
+        ExportColumn {
+            column: "active".into(),
+            header: None,
+        },
+        ExportColumn {
+            column: "created_at".into(),
+            header: None,
+        },
+        ExportColumn {
+            column: "note".into(),
+            header: None,
+        },
+    ];
+    let outcome = export(
+        pool,
+        ns,
+        &structure,
+        &columns,
+        &ExportOptions::default(),
+        &path,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("export");
+
+    assert_eq!(outcome.rows, 2, "{tag}: 应导出 2 行");
+    assert_eq!(outcome.columns, 7);
+    assert!(!outcome.truncated, "{tag}: 未达上限不应标记截断");
+    assert!(std::path::Path::new(&path).exists(), "{tag}: 文件应存在");
+
+    // Read it back with the same reader the import uses.
+    let (sheet, sheets, _) = excel::read_sheet(&path, None, Some(0), None).expect("read back");
+    assert_eq!(sheets.len(), 1, "{tag}: 应只有一张工作表");
+    assert_eq!(
+        sheet.headers,
+        vec![
+            "编号", "名称", "amount", "ratio", "active", "created_at", "note"
+        ],
+        "{tag}: 表头应使用重命名后的名字"
+    );
+    assert_eq!(sheet.total_rows, 2, "{tag}: 应读回 2 行");
+
+    let first = &sheet.rows[0];
+    assert_eq!(first[0].as_deref(), Some("1"), "{tag}: 整数不应变成 1.0");
+    assert_eq!(first[1].as_deref(), Some("苹果"), "{tag}: 中文应完整");
+    // Numbers are written as numeric cells, which is what lets Excel sum them.
+    assert_eq!(first[2].as_deref(), Some("10.5"), "{tag}: 数值应保持数值");
+    assert_eq!(first[3].as_deref(), Some("0.25"));
+    assert_eq!(
+        first[4].as_deref(),
+        Some("true"),
+        "{tag}: 布尔应写成布尔单元格"
+    );
+    assert!(
+        first[5].as_deref().is_some_and(|value| value.starts_with("2024-03-05")),
+        "{tag}: 日期应可读, 实际 {:?}",
+        first[5]
+    );
+    assert_eq!(first[6], None, "{tag}: NULL 应是空单元格而不是文本 NULL");
+
+    let second = &sheet.rows[1];
+    assert_eq!(
+        second[1].as_deref(),
+        Some("O'Brien"),
+        "{tag}: 含引号的字符串应完整写回"
+    );
+    assert_eq!(second[4].as_deref(), Some("false"));
+    assert_eq!(second[6].as_deref(), Some("note"));
+
+    // ---- a subset of columns, with a row cap -------------------------------
+    let subset = vec![
+        ExportColumn {
+            column: "id".into(),
+            header: None,
+        },
+        ExportColumn {
+            column: "note".into(),
+            header: Some("备注".into()),
+        },
+    ];
+    let subset_path = std::env::temp_dir().join(format!("datasync_live_export_sub_{tag}.xlsx"));
+    let subset_path = subset_path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&subset_path);
+    let outcome = export(
+        pool,
+        ns,
+        &structure,
+        &subset,
+        &ExportOptions {
+            sheet_name: Some("报表".into()),
+            max_rows: Some(1),
+            include_header: true,
+        },
+        &subset_path,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("subset export");
+    assert_eq!(outcome.rows, 1, "{tag}: 行数上限应生效");
+    assert!(outcome.truncated, "{tag}: 被截断时应标记");
+    assert_eq!(outcome.sheet, "报表");
+
+    let (subset_sheet, _, _) =
+        excel::read_sheet(&subset_path, None, Some(0), None).expect("read subset");
+    assert_eq!(subset_sheet.headers, vec!["id", "备注"]);
+    assert_eq!(subset_sheet.total_rows, 1, "{tag}: 只应导出一行");
+
+    // ---- an unknown column is refused before a file is written -------------
+    let error = export(
+        pool,
+        ns,
+        &structure,
+        &[ExportColumn {
+            column: "does_not_exist".into(),
+            header: None,
+        }],
+        &ExportOptions::default(),
+        &path,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("没有字段"), "{tag}: {error}");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&subset_path);
+    drop_namespace(pool, dialect, ns).await;
+}
+
+#[tokio::test]
+async fn live_mysql_excel_export() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    excel_export_scenario(&pool, Dialect::Mysql, "datasync_live_export", "mysql").await;
+}
+
+#[tokio::test]
+async fn live_postgres_excel_export() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    excel_export_scenario(&pool, Dialect::Postgres, "datasync_live_export", "pg").await;
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must

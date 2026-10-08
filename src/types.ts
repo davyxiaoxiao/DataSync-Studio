@@ -366,6 +366,32 @@ export interface ImportOutcome {
   elapsedMs: number;
 }
 
+/** One column written to an exported workbook. */
+export interface ExportColumn {
+  column: string;
+  /** Header text; defaults to the column name. */
+  header?: string | null;
+}
+
+export interface ExportOptions {
+  sheetName?: string | null;
+  /** 0 or null means "as many rows as Excel allows". */
+  maxRows?: number | null;
+  includeHeader?: boolean;
+}
+
+export interface ExportOutcome {
+  rows: number;
+  columns: number;
+  path: string;
+  sheet: string;
+  /** True when a row limit cut the export short. */
+  truncated: boolean;
+  cancelled: boolean;
+  elapsedMs: number;
+  warnings: string[];
+}
+
 /** Mirrors `jobs::ProgressUpdate`; delivered on the `sync://progress` event. */
 export interface ProgressUpdate {
   jobId: string;

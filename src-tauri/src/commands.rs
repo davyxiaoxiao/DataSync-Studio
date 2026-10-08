@@ -25,6 +25,7 @@ use crate::db::{open_pool, Pool, StatementOutcome, StatementRun};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::excel::{self, ExcelSheetPreview};
+use crate::excel_export::{self, ExportColumn, ExportOptions, ExportOutcome};
 use crate::jobs::ProgressReporter;
 use crate::schema::model::foreign_key_covered_by;
 use crate::schema::ddl::{
@@ -1955,6 +1956,77 @@ pub async fn import_excel(
 }
 
 // ---------------------------------------------------------------------------
+// Excel export
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportExcelRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub table: String,
+    /// Where to write the workbook; chosen by the caller's save dialog.
+    pub path: String,
+    /// The columns to write, in order, with optional renamed headers.
+    pub columns: Vec<ExportColumn>,
+    #[serde(default)]
+    pub options: ExportOptions,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+/// How many rows the export would write, so the dialog can warn before starting.
+#[tauri::command]
+pub async fn count_table_rows(
+    state: State<'_, AppState>,
+    connection_id: String,
+    namespace: String,
+    table: String,
+) -> AppResult<Option<u64>> {
+    let pool = pool_for(&state, &connection_id).await?;
+    let structure = introspect::load_table(&pool, &namespace, &table).await?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM {}",
+        pool.dialect().qualified(Some(&namespace), &table)
+    );
+    let _ = structure;
+    let rows = pool
+        .fetch(&sql, &[], &[crate::db::value::ColumnKind::Int])
+        .await?;
+    Ok(rows
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|value| value.display())
+        .and_then(|text| text.parse::<u64>().ok()))
+}
+
+#[tauri::command]
+pub async fn export_excel(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: ExportExcelRequest,
+) -> AppResult<ExportOutcome> {
+    if request.columns.is_empty() {
+        return Err(AppError::msg("请至少选择一列"));
+    }
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let structure = introspect::load_table(&pool, &request.namespace, &request.table).await?;
+    let outcome = excel_export::export(
+        &pool,
+        &request.namespace,
+        &structure,
+        &request.columns,
+        &request.options,
+        &request.path,
+        &reporter,
+    )
+    .await;
+    end_job(&state, job);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
 
@@ -2131,6 +2203,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         plan_excel_import,
         import_excel,
         update_table_cell,
+        count_table_rows,
+        export_excel,
     ]
 }
 

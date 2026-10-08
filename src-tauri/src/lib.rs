@@ -4,6 +4,7 @@ mod db;
 mod dialect;
 mod error;
 mod excel;
+mod excel_export;
 mod jobs;
 mod schema;
 mod state;

@@ -40,6 +40,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 # Pure Rust reader for xlsx/xls/ods; keeps the parser out of the webview and
 # avoids the unmaintained npm `xlsx` package.
 calamine = { version = "0.26", features = ["dates"] }
+# Pure Rust writer, so exporting needs no Office installation or C library.
+rust_xlsxwriter = "0.79"
 
 # --- runtime / core ---------------------------------------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

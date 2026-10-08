@@ -8,6 +8,9 @@ import type {
   ForeignKeyInfo,
   ExcelImportPlan,
   ExcelSheetPreview,
+  ExportColumn,
+  ExportOptions,
+  ExportOutcome,
   ImportOutcome,
   ImportStrategy,
   IndexInfo,
@@ -199,6 +202,20 @@ export const api = {
     };
     jobId?: string;
   }) => invoke<ImportOutcome>("import_excel", { request }),
+
+  /** Rows in a table, so the export dialog can warn before starting. */
+  countTableRows: (connectionId: string, namespace: string, table: string) =>
+    invoke<number | null>("count_table_rows", { connectionId, namespace, table }),
+
+  exportExcel: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    path: string;
+    columns: ExportColumn[];
+    options?: ExportOptions;
+    jobId?: string;
+  }) => invoke<ExportOutcome>("export_excel", { request }),
 
   previewDropTables: (connectionId: string, namespace: string, tables: string[]) =>
     invoke<DropTablesPreview>("preview_drop_tables", { connectionId, namespace, tables }),

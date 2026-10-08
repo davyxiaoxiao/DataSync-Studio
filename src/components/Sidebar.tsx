@@ -29,6 +29,7 @@ interface Props {
   onRenameTable: (ref: TableRef) => void;
   onDropTables: (refs: TableRef[]) => void;
   onImportExcel: (ref: TableRef) => void;
+  onExportExcel: (ref: TableRef) => void;
 }
 
 const refKey = (ref: TableRef) => `${ref.connectionId}::${ref.namespace}::${ref.table}`;
@@ -60,6 +61,7 @@ export function Sidebar({
   onRenameTable,
   onDropTables,
   onImportExcel,
+  onExportExcel,
 }: Props) {
   const {
     connections,
@@ -204,6 +206,22 @@ export function Sidebar({
           },
           {
             label: "CSV 导入",
+            disabled: true,
+            run: () => undefined,
+          },
+        ],
+      },
+      {
+        label: "导出",
+        disabled: many,
+        children: [
+          {
+            label: "导出 Excel…",
+            hint: "xlsx",
+            run: () => onExportExcel(ref),
+          },
+          {
+            label: "CSV 导出",
             disabled: true,
             run: () => undefined,
           },
