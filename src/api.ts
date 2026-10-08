@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ColumnInfo,
+  CellUpdateResult,
   ColumnMapping,
   ColumnPair,
+  FilterCondition,
   ExcelImportPlan,
   ExcelSheetPreview,
   ImportOutcome,
@@ -15,6 +17,8 @@ import type {
   SchemaDiff,
   DropTablesPreview,
   SchemaSqlPreview,
+  RowKeyValue,
+  SortSpec,
   SyncRunResult,
   SyncSelection,
   TableData,
@@ -70,6 +74,8 @@ export const api = {
     table: string,
     limit = 200,
     offset = 0,
+    filters: FilterCondition[] = [],
+    sort: SortSpec[] = [],
   ) =>
     invoke<TableData>("preview_table_data", {
       connectionId,
@@ -77,7 +83,20 @@ export const api = {
       table,
       limit,
       offset,
+      filters,
+      sort,
     }),
+
+  /** Apply one cell edit; the previous value guards against concurrent change. */
+  updateTableCell: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    key: RowKeyValue[];
+    column: string;
+    value?: string | null;
+    previous?: string | null;
+  }) => invoke<CellUpdateResult>("update_table_cell", { request }),
 
   compareSchema: (request: {
     sourceConnectionId: string;

@@ -240,6 +240,8 @@ pub struct ColumnMeta {
     pub kind: ColumnKind,
     pub nullable: bool,
     pub primary_key: bool,
+    /// Generated columns are computed by the server and cannot be edited.
+    pub generated: bool,
 }
 
 // ---------------------------------------------------------------------------

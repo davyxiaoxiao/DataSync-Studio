@@ -470,10 +470,11 @@ fn table_data_shape_used_by_the_grid() {
         kind: ColumnKind::Int,
         nullable: false,
         primary_key: true,
+        generated: false,
     };
     assert_keys(
         &to_json(&meta),
-        &["name", "dataType", "kind", "nullable", "primaryKey"],
+        &["name", "dataType", "kind", "nullable", "primaryKey", "generated"],
     );
     assert_eq!(to_json(&meta)["kind"], json!("int"));
 
@@ -1032,6 +1033,7 @@ fn typescript_interfaces_match_the_rust_dtos() {
             kind: ColumnKind::Int,
             nullable: false,
             primary_key: true,
+            generated: false,
         },
     );
     assert_ts_matches(

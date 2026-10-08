@@ -2,6 +2,7 @@ pub mod convert;
 pub mod import;
 pub mod plan;
 pub mod stream;
+pub mod view;
 
 use serde::{Deserialize, Serialize};
 
@@ -85,57 +86,24 @@ pub struct ReadPlan {
     pub kinds: Vec<ColumnKind>,
 }
 
-pub fn build_read_plan(
-    dialect: Dialect,
-    namespace: &str,
-    table: &str,
-    structure: &TableStructure,
-    order_by: &[String],
-    limit: Option<u64>,
-    offset: Option<u64>,
-) -> ReadPlan {
-    let q = |name: &str| dialect.quote(name);
-    let select_list: Vec<String> = structure
+/// The projection for a table read.
+///
+/// PostgreSQL types the driver cannot decode natively are cast to text and
+/// aliased back, so the result set always carries the original column names.
+pub fn select_list(dialect: Dialect, structure: &TableStructure) -> Vec<String> {
+    structure
         .columns
         .iter()
         .map(|column| {
-            let quoted = q(&column.name);
+            let quoted = dialect.quote(&column.name);
             if dialect == Dialect::Postgres && column.needs_text_cast() {
                 format!("{quoted}::text AS {quoted}")
             } else {
                 quoted
             }
         })
-        .collect();
-
-    let mut sql = format!(
-        "SELECT {} FROM {}",
-        select_list.join(", "),
-        dialect.qualified(Some(namespace), table)
-    );
-    if !order_by.is_empty() {
-        let cols: Vec<String> = order_by.iter().map(|c| q(c)).collect();
-        sql.push_str(&format!(" ORDER BY {}", cols.join(", ")));
-    }
-    if let Some(n) = limit {
-        sql.push_str(&format!(" LIMIT {n}"));
-    }
-    if let Some(n) = offset {
-        if n > 0 {
-            // `LIMIT ... OFFSET ...` is valid on both engines.
-            if limit.is_none() {
-                sql.push_str(" LIMIT 18446744073709551615");
-            }
-            sql.push_str(&format!(" OFFSET {n}"));
-        }
-    }
-
-    ReadPlan {
-        select_sql: sql,
-        kinds: structure.columns.iter().map(|c| c.kind()).collect(),
-    }
+        .collect()
 }
-
 pub async fn read_rows(pool: &Pool, plan: &ReadPlan) -> AppResult<Vec<Vec<Value>>> {
     pool.fetch(&plan.select_sql, &[], &plan.kinds).await
 }

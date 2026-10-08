@@ -9,12 +9,15 @@ use std::cmp::Ordering;
 
 use crate::data::stream::{compare_key_tuples, StreamPlan, TableStream};
 use crate::data::{
-    build_delete_statements, build_insert_statements, build_read_plan, build_update_statements,
-    column_index, preview_deletes, preview_inserts, preview_updates, read_rows, ColumnPair,
-    DataDiffResult, DataDiffSummary, RowChange, TableEndpoint, PREVIEW_ROWS, SQL_PREVIEW_LIMIT,
+    build_delete_statements, build_insert_statements, build_update_statements, column_index,
+    preview_deletes, preview_inserts, preview_updates, read_rows, ColumnPair, DataDiffResult,
+    DataDiffSummary, ReadPlan, RowChange, TableEndpoint, PREVIEW_ROWS, SQL_PREVIEW_LIMIT,
 };
 use crate::data::plan::DataPlan;
 use crate::db::value::{ColumnMeta, Value};
+use crate::data::view::{
+    build_cell_update, build_grid_query, CellEdit, FilterCondition, RowKeyValue, SortSpec,
+};
 use crate::data::import::{
     run_import, suggest_mapping, ColumnMapping, ImportOptions, ImportOutcome,
 };
@@ -201,6 +204,8 @@ pub struct TableData {
     pub limit: u64,
     pub offset: u64,
     pub has_more: bool,
+    /// Rows matching the current filter, when the server could count them.
+    pub total: Option<u64>,
     pub elapsed_ms: u64,
     pub sql: String,
 }
@@ -213,26 +218,54 @@ pub(crate) async fn preview_table_data_core(
     table: &str,
     limit: Option<u64>,
     offset: Option<u64>,
+    filters: &[FilterCondition],
+    sort: &[SortSpec],
 ) -> AppResult<TableData> {
     let structure = introspect::load_table(pool, namespace, table).await?;
+    let dialect = pool.dialect();
     let limit = limit.unwrap_or(200).clamp(1, 5000);
     let offset = offset.unwrap_or(0);
-    let plan = build_read_plan(
-        pool.dialect(),
+    // One extra row is fetched so `has_more` is known without a second query.
+    let query = build_grid_query(
+        dialect,
         namespace,
         table,
         &structure,
-        &structure.primary_key,
-        Some(limit + 1),
-        Some(offset),
-    );
+        filters,
+        sort,
+        limit + 1,
+        offset,
+    )?;
     let started = Instant::now();
-    // One extra row is fetched so `has_more` is known without a second query.
-    let mut rows = read_rows(pool, &plan).await?;
+    let mut rows = read_rows(
+        pool,
+        &ReadPlan {
+            select_sql: query.select_sql.clone(),
+            kinds: structure
+                .columns
+                .iter()
+                .map(|column| column.kind())
+                .collect(),
+        },
+    )
+    .await?;
     let has_more = rows.len() as u64 > limit;
     if has_more {
         rows.truncate(limit as usize);
     }
+    // The filtered total, so the grid can say how much the filter matched
+    // rather than only how much is on screen.
+    let total = match pool
+        .fetch(&query.count_sql, &[], &[crate::db::value::ColumnKind::Int])
+        .await
+    {
+        Ok(rows) => rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|value| value.display())
+            .and_then(|text| text.parse::<u64>().ok()),
+        Err(_) => None,
+    };
     let columns = structure
         .columns
         .iter()
@@ -242,6 +275,7 @@ pub(crate) async fn preview_table_data_core(
             kind: c.kind(),
             nullable: c.nullable,
             primary_key: structure.primary_key.contains(&c.name),
+            generated: !c.is_writable(),
         })
         .collect();
     let cells = rows
@@ -256,8 +290,9 @@ pub(crate) async fn preview_table_data_core(
         limit,
         offset,
         has_more,
+        total,
         elapsed_ms: started.elapsed().as_millis() as u64,
-        sql: plan.select_sql,
+        sql: query.select_sql,
     })
 }
 
@@ -269,9 +304,98 @@ pub async fn preview_table_data(
     table: String,
     limit: Option<u64>,
     offset: Option<u64>,
+    filters: Option<Vec<FilterCondition>>,
+    sort: Option<Vec<SortSpec>>,
 ) -> AppResult<TableData> {
     let pool = pool_for(&state, &connection_id).await?;
-    preview_table_data_core(&pool, &namespace, &table, limit, offset).await
+    preview_table_data_core(
+        &pool,
+        &namespace,
+        &table,
+        limit,
+        offset,
+        &filters.unwrap_or_default(),
+        &sort.unwrap_or_default(),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCellRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub table: String,
+    /// Primary key values identifying the row.
+    pub key: Vec<RowKeyValue>,
+    pub column: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    /// The value the grid displayed, used to detect a concurrent change.
+    #[serde(default)]
+    pub previous: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellUpdateResult {
+    /// False when the row no longer matches — it was changed or deleted.
+    pub updated: bool,
+    pub affected: u64,
+    pub sql: String,
+    pub message: String,
+}
+
+/// Apply one cell edit.
+///
+/// The statement matches on the primary key *and* the value the grid showed, so
+/// a row changed by someone else is reported instead of being overwritten.
+#[tauri::command]
+pub async fn update_table_cell(
+    state: State<'_, AppState>,
+    request: UpdateCellRequest,
+) -> AppResult<CellUpdateResult> {
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let structure = introspect::load_table(&pool, &request.namespace, &request.table).await?;
+    let edit = CellEdit {
+        column: request.column.clone(),
+        value: request.value.clone(),
+        previous: request.previous.clone(),
+    };
+    let sql = build_cell_update(
+        pool.dialect(),
+        &request.namespace,
+        &request.table,
+        &structure,
+        &request.key,
+        &edit,
+    )?;
+    let outcome = pool
+        .run_script_reporting(&[sql.clone()], true, &ProgressReporter::inert())
+        .await;
+    let affected = outcome
+        .outcomes
+        .first()
+        .map(|entry| entry.rows_affected)
+        .unwrap_or(0);
+    let failed = outcome
+        .outcomes
+        .first()
+        .filter(|entry| !entry.ok)
+        .and_then(|entry| entry.error.clone());
+    if let Some(error) = failed {
+        return Err(AppError::msg(format!("修改失败：{error}")));
+    }
+    Ok(CellUpdateResult {
+        updated: affected > 0,
+        affected,
+        message: if affected > 0 {
+            format!("已修改 {} 行", affected)
+        } else {
+            "该行已被其他人修改或删除，未做任何更改".to_string()
+        },
+        sql,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1891,6 +2015,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         preview_excel,
         plan_excel_import,
         import_excel,
+        update_table_cell,
     ]
 }
 

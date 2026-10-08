@@ -77,6 +77,16 @@ impl Dialect {
         }
     }
 
+    /// NULL-safe equality: `a <=> b` on MySQL, `a IS NOT DISTINCT FROM b` on
+    /// PostgreSQL. Used to match a row without a plain `= NULL` silently
+    /// matching nothing.
+    pub fn not_distinct_from(self) -> &'static str {
+        match self {
+            Dialect::Mysql => "<=>",
+            Dialect::Postgres => "IS NOT DISTINCT FROM",
+        }
+    }
+
     pub fn bool_literal(self, value: bool) -> &'static str {
         match self {
             Dialect::Mysql => {

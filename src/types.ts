@@ -259,6 +259,45 @@ export interface SchemaSqlPreview {
   warnings: string[];
 }
 
+/** Comparison used by one search condition in the data grid. */
+export type FilterOp =
+  | "eq"
+  | "ne"
+  | "gt"
+  | "ge"
+  | "lt"
+  | "le"
+  | "contains"
+  | "startsWith"
+  | "endsWith"
+  | "isNull"
+  | "notNull"
+  | "in";
+
+export interface FilterCondition {
+  column: string;
+  operator: FilterOp;
+  value?: string | null;
+}
+
+export interface SortSpec {
+  column: string;
+  descending: boolean;
+}
+
+export interface RowKeyValue {
+  column: string;
+  value?: string | null;
+}
+
+export interface CellUpdateResult {
+  /** False when the row no longer matches: it changed or was deleted. */
+  updated: boolean;
+  affected: number;
+  sql: string;
+  message: string;
+}
+
 /** A worksheet read for the import flow. */
 export interface ExcelSheetPreview {
   sheets: string[];
@@ -343,6 +382,8 @@ export interface ColumnMeta {
   kind: string;
   nullable: boolean;
   primaryKey: boolean;
+  /** Computed by the server, so it cannot be edited. */
+  generated: boolean;
 }
 
 export interface TableData {
@@ -352,6 +393,8 @@ export interface TableData {
   limit: number;
   offset: number;
   hasMore: boolean;
+  /** Rows matching the current filter, when the server could count them. */
+  total?: number | null;
   elapsedMs: number;
   sql: string;
 }

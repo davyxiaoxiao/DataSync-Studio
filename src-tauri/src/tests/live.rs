@@ -20,6 +20,7 @@ use crate::commands::{
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
+use crate::data::view::{build_cell_update, CellEdit, FilterCondition, FilterOp, RowKeyValue, SortSpec};
 use crate::excel;
 use crate::data::TableEndpoint;
 use crate::db::{open_pool, Pool};
@@ -1376,7 +1377,7 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     }
 
     // ---- first page -------------------------------------------------------
-    let page1 = preview_table_data_core(pool, ns, "browse", Some(3), Some(0))
+    let page1 = preview_table_data_core(pool, ns, "browse", Some(3), Some(0), &[], &[])
         .await
         .expect("browse page 1");
     assert_eq!(page1.rows.len(), 3, "{tag}: 首页应有 3 行");
@@ -1463,7 +1464,7 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     }
 
     // ---- second page continues the ordering without overlapping -----------
-    let page2 = preview_table_data_core(pool, ns, "browse", Some(3), Some(3))
+    let page2 = preview_table_data_core(pool, ns, "browse", Some(3), Some(3), &[], &[])
         .await
         .expect("browse page 2");
     assert_eq!(page2.offset, 3);
@@ -1481,14 +1482,14 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     assert_eq!(id_at(&page2, 0), 4, "{tag}: 第二页应从第 4 行开始");
 
     // ---- last page reports no more ---------------------------------------
-    let last = preview_table_data_core(pool, ns, "browse", Some(3), Some(9))
+    let last = preview_table_data_core(pool, ns, "browse", Some(3), Some(9), &[], &[])
         .await
         .expect("browse last page");
     assert_eq!(last.rows.len(), 1, "{tag}: 最后一页只剩 1 行");
     assert!(!last.has_more, "{tag}: 最后一页不应还有更多");
 
     // ---- a limit beyond the row count ------------------------------------
-    let all = preview_table_data_core(pool, ns, "browse", Some(50), Some(0))
+    let all = preview_table_data_core(pool, ns, "browse", Some(50), Some(0), &[], &[])
         .await
         .expect("browse everything");
     assert_eq!(all.rows.len(), total, "{tag}: 应返回全部 {total} 行");
@@ -2424,6 +2425,323 @@ async fn live_postgres_excel_import() {
     };
     let pool = connect(&target, Dialect::Postgres).await;
     excel_import_scenario(&pool, Dialect::Postgres, "datasync_live_import", "pg 导入").await;
+}
+
+/// Text of one column across every row of a page.
+fn column_texts(data: &crate::commands::TableData, column: &str) -> Vec<Option<String>> {
+    let index = data
+        .columns
+        .iter()
+        .position(|entry| entry.name == column)
+        .unwrap_or_else(|| panic!("结果中没有列 {column}"));
+    data.rows
+        .iter()
+        .map(|row| row.get(index).and_then(|cell| cell.text.clone()))
+        .collect()
+}
+
+fn filter(column: &str, operator: FilterOp, value: Option<&str>) -> FilterCondition {
+    FilterCondition {
+        column: column.into(),
+        operator,
+        value: value.map(str::to_string),
+    }
+}
+
+fn sort_by(column: &str, descending: bool) -> SortSpec {
+    SortSpec {
+        column: column.into(),
+        descending,
+    }
+}
+
+/// Search conditions, column sorting and inline cell editing against a real
+/// server — the three things the data grid does beyond scrolling.
+async fn grid_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
+    drop_namespace(pool, dialect, ns).await;
+    create_namespace(pool, dialect, ns).await;
+
+    let q = |name: &str| dialect.qualified(Some(ns), name);
+    let c = |name: &str| dialect.quote(name);
+    let engine = match dialect {
+        Dialect::Mysql => " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        Dialect::Postgres => "",
+    };
+    let text_type = match dialect {
+        Dialect::Mysql => "VARCHAR(64)",
+        Dialect::Postgres => "character varying(64)",
+    };
+    let int_type = match dialect {
+        Dialect::Mysql => "INT",
+        Dialect::Postgres => "integer",
+    };
+
+    exec_all(
+        pool,
+        &[
+            format!(
+                "CREATE TABLE {} (
+                    {id} {int_type} NOT NULL,
+                    {name} {text_type},
+                    {score} {int_type},
+                    {note} {text_type},
+                    {code} {text_type} NOT NULL,
+                    PRIMARY KEY ({id})
+                 ){engine}",
+                q("grid"),
+                id = c("id"),
+                name = c("name"),
+                score = c("score"),
+                note = c("note"),
+                code = c("code"),
+            ),
+            format!(
+                "INSERT INTO {} ({id}, {name}, {score}, {note}, {code}) VALUES
+                    (1, 'alice', 10, NULL, 'A'),
+                    (2, 'bob', 20, 'x', 'B'),
+                    (3, '100% cotton', 30, NULL, 'C'),
+                    (4, 'Carol', 20, 'y', 'D'),
+                    (5, 'dave', 10, 'z', 'E')",
+                q("grid"),
+                id = c("id"),
+                name = c("name"),
+                score = c("score"),
+                note = c("note"),
+                code = c("code"),
+            ),
+        ],
+    )
+    .await;
+
+    let page = |filters: Vec<FilterCondition>, sort: Vec<SortSpec>, limit: u64, offset: u64| {
+        let ns = ns.to_string();
+        async move {
+            preview_table_data_core(pool, &ns, "grid", Some(limit), Some(offset), &filters, &sort)
+                .await
+                .expect("grid query")
+        }
+    };
+
+    // ---- search conditions -------------------------------------------------
+    let all = page(Vec::new(), Vec::new(), 50, 0).await;
+    assert_eq!(all.rows.len(), 5, "{tag}: 应读到 5 行");
+    assert_eq!(all.total, Some(5), "{tag}: 未筛选时总数应为 5");
+
+    // A literal `%` must not act as a wildcard.
+    let literal = page(vec![filter("name", FilterOp::Contains, Some("100%"))], Vec::new(), 50, 0).await;
+    assert_eq!(
+        column_texts(&literal, "id"),
+        vec![Some("3".into())],
+        "{tag}: LIKE 通配符必须转义，否则会匹配到所有行"
+    );
+    assert_eq!(literal.total, Some(1), "{tag}: 计数应反映筛选结果");
+
+    let wildcard = page(vec![filter("name", FilterOp::Contains, Some("%"))], Vec::new(), 50, 0).await;
+    assert_eq!(
+        column_texts(&wildcard, "id"),
+        vec![Some("3".into())],
+        "{tag}: 搜索 % 应只匹配真的含有 % 的行"
+    );
+
+    let equals = page(vec![filter("score", FilterOp::Eq, Some("20"))], Vec::new(), 50, 0).await;
+    assert_eq!(
+        column_texts(&equals, "id"),
+        vec![Some("2".into()), Some("4".into())],
+        "{tag}: 数值条件不应被当成字符串"
+    );
+
+    let nulls = page(vec![filter("note", FilterOp::IsNull, None)], Vec::new(), 50, 0).await;
+    assert_eq!(
+        column_texts(&nulls, "id"),
+        vec![Some("1".into()), Some("3".into())],
+        "{tag}: 为 NULL 条件"
+    );
+
+    let listed = page(vec![filter("id", FilterOp::In, Some("1, 3,5"))], Vec::new(), 50, 0).await;
+    assert_eq!(
+        column_texts(&listed, "id"),
+        vec![Some("1".into()), Some("3".into()), Some("5".into())],
+        "{tag}: IN 条件"
+    );
+
+    let combined = page(
+        vec![
+            filter("score", FilterOp::Ge, Some("20")),
+            filter("note", FilterOp::NotNull, None),
+        ],
+        Vec::new(),
+        50,
+        0,
+    )
+    .await;
+    assert_eq!(
+        column_texts(&combined, "id"),
+        vec![Some("2".into()), Some("4".into())],
+        "{tag}: 多个条件之间是 AND"
+    );
+
+    // An invalid value is refused before it reaches the server.
+    let error = preview_table_data_core(
+        pool,
+        ns,
+        "grid",
+        Some(10),
+        Some(0),
+        &[filter("score", FilterOp::Eq, Some("abc"))],
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("不是整数"), "{tag}: {error}");
+
+    // ---- sorting ----------------------------------------------------------
+    let ascending = page(Vec::new(), vec![sort_by("score", false)], 50, 0).await;
+    assert_eq!(
+        column_texts(&ascending, "score"),
+        vec![
+            Some("10".into()),
+            Some("10".into()),
+            Some("20".into()),
+            Some("20".into()),
+            Some("30".into())
+        ],
+        "{tag}: 升序"
+    );
+    let descending = page(Vec::new(), vec![sort_by("score", true)], 50, 0).await;
+    assert_eq!(
+        column_texts(&descending, "score"),
+        vec![
+            Some("30".into()),
+            Some("20".into()),
+            Some("20".into()),
+            Some("10".into()),
+            Some("10".into())
+        ],
+        "{tag}: 降序"
+    );
+
+    // Paging over a column with ties must not repeat or skip rows; without the
+    // primary-key tiebreaker the order within equal scores is undefined.
+    let mut seen: Vec<String> = Vec::new();
+    for offset in [0u64, 2, 4] {
+        let page_data = page(Vec::new(), vec![sort_by("score", false)], 2, offset).await;
+        seen.extend(
+            column_texts(&page_data, "id")
+                .into_iter()
+                .flatten(),
+        );
+    }
+    assert_eq!(
+        seen,
+        vec!["1", "5", "2", "4", "3"],
+        "{tag}: 分页在排序值相同时必须稳定"
+    );
+
+    // ---- inline editing ---------------------------------------------------
+    let edit = |column: &str, value: Option<&str>, previous: Option<&str>| CellEdit {
+        column: column.into(),
+        value: value.map(str::to_string),
+        previous: previous.map(str::to_string),
+    };
+    let key = |value: &str| {
+        vec![RowKeyValue {
+            column: "id".into(),
+            value: Some(value.to_string()),
+        }]
+    };
+    let structure = crate::schema::introspect::load_table(pool, ns, "grid")
+        .await
+        .expect("load grid");
+
+    let run = |key: Vec<RowKeyValue>, edit: CellEdit| {
+        let sql = build_cell_update(dialect, ns, "grid", &structure, &key, &edit).expect("plan");
+        let sqls = vec![sql.clone()];
+        async move {
+            let outcome = pool
+                .run_statements(&sqls, true, &ProgressReporter::inert())
+                .await
+                .expect("run update");
+            let first = outcome.outcomes.first().expect("an outcome");
+            assert!(first.ok, "修改失败: {:?}", first.error);
+            (first.rows_affected, sql)
+        }
+    };
+
+    // A plain edit updates exactly one row.
+    let (affected, sql) = run(key("1"), edit("note", Some("hello"), None)).await;
+    assert_eq!(affected, 1, "{tag}: 应更新 1 行");
+    assert!(sql.contains("IS NOT DISTINCT FROM") || sql.contains("<=>"), "{sql}");
+    let after = page(vec![filter("id", FilterOp::Eq, Some("1"))], Vec::new(), 1, 0).await;
+    assert_eq!(column_texts(&after, "note"), vec![Some("hello".into())]);
+
+    // A stale "previous" value means someone else changed the row first; the
+    // statement must match nothing rather than overwrite.
+    let (affected, _) = run(key("1"), edit("note", Some("clobbered"), Some("not-the-current-value"))).await;
+    assert_eq!(affected, 0, "{tag}: 旧值不匹配时不得写入");
+    let after = page(vec![filter("id", FilterOp::Eq, Some("1"))], Vec::new(), 1, 0).await;
+    assert_eq!(
+        column_texts(&after, "note"),
+        vec![Some("hello".into())],
+        "{tag}: 冲突时原值应保持不变"
+    );
+
+    // Clearing a value writes NULL, and the guard still matches that NULL on a
+    // second attempt (a plain `= NULL` would never match).
+    let (affected, _) = run(key("1"), edit("note", None, Some("hello"))).await;
+    assert_eq!(affected, 1, "{tag}: 清空应写入 NULL");
+    let after = page(vec![filter("id", FilterOp::Eq, Some("1"))], Vec::new(), 1, 0).await;
+    assert_eq!(column_texts(&after, "note"), vec![None], "{tag}: 应为 NULL");
+    let (affected, _) = run(key("1"), edit("note", Some("back"), None)).await;
+    assert_eq!(
+        affected, 1,
+        "{tag}: 从 NULL 改回值时必须能匹配到那一行"
+    );
+
+    // A NOT NULL column cannot be cleared, and the message says so.
+    let error = build_cell_update(
+        dialect,
+        ns,
+        "grid",
+        &structure,
+        &key("1"),
+        &edit("code", None, Some("A")),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("不允许为空"), "{tag}: {error}");
+
+    // A typed value that does not fit the column is refused with its name.
+    let error = build_cell_update(
+        dialect,
+        ns,
+        "grid",
+        &structure,
+        &key("1"),
+        &edit("score", Some("abc"), Some("10")),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("不是整数"), "{tag}: {error}");
+
+    drop_namespace(pool, dialect, ns).await;
+}
+
+#[tokio::test]
+async fn live_mysql_data_grid() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    grid_scenario(&pool, Dialect::Mysql, "datasync_live_grid", "mysql 网格").await;
+}
+
+#[tokio::test]
+async fn live_postgres_data_grid() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    grid_scenario(&pool, Dialect::Postgres, "datasync_live_grid", "pg 网格").await;
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must
