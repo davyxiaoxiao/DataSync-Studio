@@ -1305,7 +1305,7 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
                 &format!(
                     "CREATE TABLE {table} (
                         `id` INT NOT NULL,
-                        `title` VARCHAR(64) NOT NULL,
+                        `title` VARCHAR(64) NOT NULL COMMENT '标题备注',
                         `body` TEXT,
                         `amount` DECIMAL(10,2),
                         `flag` TINYINT(1) NOT NULL,
@@ -1353,6 +1353,15 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
         }
     }
 
+    if dialect == Dialect::Postgres {
+        // PostgreSQL attaches comments with a separate statement.
+        exec(
+            pool,
+            &format!("COMMENT ON COLUMN {table}.\"title\" IS '标题备注'"),
+        )
+        .await;
+    }
+
     let total = 10usize;
     for id in 1..=total {
         let sql = match dialect {
@@ -1388,6 +1397,24 @@ async fn browse_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
     assert_eq!(page1.limit, 3);
     assert_eq!(page1.offset, 0);
     assert_eq!(page1.primary_key, vec!["id".to_string()]);
+
+    // The header tooltip reads these, so they have to survive introspection.
+    let title_meta = page1
+        .columns
+        .iter()
+        .find(|c| c.name == "title")
+        .expect("title column");
+    assert_eq!(
+        title_meta.comment.as_deref(),
+        Some("标题备注"),
+        "{tag}: 列备注应传递到网格元数据"
+    );
+    let id_meta = page1
+        .columns
+        .iter()
+        .find(|c| c.name == "id")
+        .expect("id column");
+    assert_eq!(id_meta.comment, None, "{tag}: 无备注的列应为空");
 
     // ---- column kinds -----------------------------------------------------
     use crate::db::value::ColumnKind;

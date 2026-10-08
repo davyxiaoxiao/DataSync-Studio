@@ -281,6 +281,7 @@ pub(crate) async fn preview_table_data_core(
             nullable: c.nullable,
             primary_key: structure.primary_key.contains(&c.name),
             generated: !c.is_writable(),
+            comment: c.comment.clone(),
         })
         .collect();
     let cells = rows

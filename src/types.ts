@@ -424,6 +424,8 @@ export interface ColumnMeta {
   primaryKey: boolean;
   /** Computed by the server, so it cannot be edited. */
   generated: boolean;
+  /** The column's comment, shown in the header tooltip. */
+  comment?: string | null;
 }
 
 export interface TableData {

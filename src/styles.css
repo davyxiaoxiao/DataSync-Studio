@@ -1402,3 +1402,57 @@ table.grid.designer tr.fk-index td {
 .filter-row {
   padding: 2px 0;
 }
+
+/* ------------------------------------------------- resizable data columns */
+
+table.grid.resizable {
+  table-layout: fixed;
+}
+
+table.grid.resizable th {
+  position: relative;
+}
+
+table.grid.resizable th,
+table.grid.resizable td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+table.grid.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.col-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.col-resizer:hover,
+table.grid.resizing .col-resizer {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+/* --------------------------------------------------- column header tooltip */
+
+.col-tip {
+  position: fixed;
+  z-index: 300;
+  max-width: 320px;
+  padding: 9px 11px;
+  background: #fff;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  box-shadow: 0 10px 26px rgba(15, 20, 28, 0.18);
+  font-size: 12px;
+  line-height: 1.6;
+  pointer-events: auto;
+}

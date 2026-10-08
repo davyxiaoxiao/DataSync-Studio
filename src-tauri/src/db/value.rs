@@ -242,6 +242,9 @@ pub struct ColumnMeta {
     pub primary_key: bool,
     /// Generated columns are computed by the server and cannot be edited.
     pub generated: bool,
+    /// The column's comment from the table definition, shown in the header
+    /// tooltip. `None` when the column has no comment.
+    pub comment: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
