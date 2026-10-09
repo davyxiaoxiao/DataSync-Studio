@@ -26,6 +26,7 @@ import type {
   RowKeyValue,
   SavedQuery,
   SortSpec,
+  SqlCheckResult,
   SqlRunResult,
   SyncRunResult,
   SyncSelection,
@@ -244,6 +245,10 @@ export const api = {
   /** The folder the .sql files live in, for revealing it in the file manager. */
   queriesDirectory: (connectionId: string) =>
     invoke<string>("queries_directory", { connectionId }),
+
+  /** Validate a script with the server without running it. */
+  checkSql: (request: { connectionId: string; namespace: string; sql: string }) =>
+    invoke<SqlCheckResult>("check_sql", { request }),
 
   /** Table / view / column / database names for editor completion. */
   completionCatalog: (connectionId: string, namespace: string) =>

@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    apply_data_plan, plan_create_table, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
+    apply_data_plan, check_sql_on, plan_create_table, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
@@ -3557,6 +3557,85 @@ async fn sql_console_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str
     // ---- a statement with no result set still reports --------------------
     let outcome = run("SELECT 1 WHERE 1 = 0").await;
     assert!(outcome.results[0].ok, "{tag}: {:?}", outcome.results[0].error);
+
+    // ---- syntax checking ---------------------------------------------------
+    // A good script passes; the server parses it but nothing is executed.
+    let checked = check_sql_on(
+        pool,
+        ns,
+        &format!(
+            "SELECT * FROM console WHERE {id} = 1",
+            id = c("id")
+        ),
+    )
+    .await
+    .expect("check a valid statement");
+    assert_eq!(checked.entries.len(), 1);
+    assert!(
+        checked.entries[0].ok,
+        "{tag}: 合法语句应通过检查: {:?}",
+        checked.entries[0].error
+    );
+
+    // A typo is reported with the server's own message, and nothing ran.
+    let checked = check_sql_on(pool, ns, "SELECT * FROM console WHRE id = 1")
+        .await
+        .expect("check a broken statement");
+    assert!(!checked.entries[0].ok, "{tag}: 关键字拼错应被发现");
+    assert!(
+        checked.entries[0].error.is_some(),
+        "{tag}: 应带回服务端的错误信息"
+    );
+    let count_after_check = scalar_count(pool, ns, "console", dialect).await;
+    assert_eq!(
+        count_after_check, 2,
+        "{tag}: 语法检查不得改动数据"
+    );
+
+    // A column that does not exist is caught too — this is the part a
+    // client-side check cannot know.
+    let checked = check_sql_on(pool, ns, "SELECT no_such_column FROM console")
+        .await
+        .expect("check an unknown column");
+    assert!(!checked.entries[0].ok, "{tag}: 不存在的字段应被发现");
+
+    // Multi-statement scripts are checked one by one.
+    let checked = check_sql_on(pool, ns, "SELECT 1; SELECT * FROM console; SELECT oops FROM console")
+        .await
+        .expect("check a script");
+    assert_eq!(checked.entries.len(), 3, "{tag}: 应逐条检查");
+    assert!(checked.entries[0].ok && checked.entries[1].ok);
+    assert!(!checked.entries[2].ok);
+
+    // CREATE is only preparable on MySQL; PostgreSQL reports it as un-checkable
+    // instead of inventing a syntax error.
+    let checked = check_sql_on(pool, ns, "CREATE TABLE datasync_check_probe (id integer)")
+        .await
+        .expect("check a DDL statement");
+    if dialect == Dialect::Postgres {
+        assert!(
+            !checked.entries[0].checkable,
+            "{tag}: PostgreSQL 应把 DDL 标为无法预检"
+        );
+        assert!(checked.entries[0].ok, "{tag}: 无法预检不应报成语法错误");
+    } else {
+        assert!(
+            checked.entries[0].ok && checked.entries[0].checkable,
+            "{tag}: MySQL 可以预检 DDL: {:?}",
+            checked.entries[0].error
+        );
+    }
+    // The probe must not have been created either way.
+    let tables = crate::schema::introspect::list_tables(pool, ns)
+        .await
+        .expect("list tables")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert!(
+        !tables.iter().any(|name| name == "datasync_check_probe"),
+        "{tag}: 检查过程中不得真的建表"
+    );
 
     drop_namespace(pool, dialect, ns).await;
 }

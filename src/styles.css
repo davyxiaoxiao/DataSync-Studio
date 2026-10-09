@@ -1538,3 +1538,31 @@ table.grid.resizing .col-resizer {
   background: #fdf3e0;
   color: #9a6b12;
 }
+
+/* ------------------------------------------------- SQL syntax highlighting */
+
+.sql-highlight {
+  color: var(--text);
+}
+
+.sql-highlight .tok-keyword {
+  color: #0b62c4;
+  font-weight: 600;
+}
+
+.sql-highlight .tok-string {
+  color: #a3350a;
+}
+
+.sql-highlight .tok-comment {
+  color: #7c8a99;
+  font-style: italic;
+}
+
+.sql-highlight .tok-number {
+  color: #7a3fa0;
+}
+
+.sql-highlight .tok-function {
+  color: #1f7a4d;
+}

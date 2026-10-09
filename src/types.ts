@@ -364,6 +364,19 @@ export interface SqlStatementResult {
   truncated: boolean;
 }
 
+export interface SqlCheckEntry {
+  sql: string;
+  ok: boolean;
+  error?: string | null;
+  /** False when this statement type cannot be validated without running it. */
+  checkable: boolean;
+}
+
+export interface SqlCheckResult {
+  entries: SqlCheckEntry[];
+  elapsedMs: number;
+}
+
 export interface SqlRunResult {
   results: SqlStatementResult[];
   elapsedMs: number;

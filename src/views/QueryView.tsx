@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, errorMessage } from "../api";
 import { useJobProgress } from "../jobs";
-import type { CompletionCatalog, SqlRunResult, SqlStatementResult } from "../types";
+import type {
+  CompletionCatalog,
+  SqlCheckResult,
+  SqlRunResult,
+  SqlStatementResult,
+} from "../types";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { SqlEditor } from "../components/SqlEditor";
 
@@ -49,6 +54,8 @@ export function QueryView({
   const [askingName, setAskingName] = useState(false);
   const [newName, setNewName] = useState("");
   const [result, setResult] = useState<SqlRunResult | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [check, setCheck] = useState<SqlCheckResult | null>(null);
 
   const dirty = sql !== saved;
 
@@ -150,6 +157,28 @@ export function QueryView({
     }
   }, [connectionId, namespace, sql, job, onLog]);
 
+  /// Ask the server to validate the script without running it.
+  const validate = useCallback(async () => {
+    setChecking(true);
+    setError(null);
+    setCheck(null);
+    try {
+      const outcome = await api.checkSql({ connectionId, namespace, sql });
+      setCheck(outcome);
+      const failed = outcome.entries.filter((entry) => !entry.ok).length;
+      if (failed > 0) {
+        onLog("err", `语法检查发现 ${failed} 条语句有问题`);
+      } else {
+        onLog("ok", `语法检查通过（${outcome.entries.length} 条语句，${outcome.elapsedMs} ms）`);
+      }
+    } catch (err) {
+      setError(errorMessage(err));
+      onLog("err", `语法检查失败: ${errorMessage(err)}`);
+    } finally {
+      setChecking(false);
+    }
+  }, [connectionId, namespace, sql, onLog]);
+
   useEffect(() => {
     const name = path
       ? (path.split("/").pop()?.replace(/\.sql$/, "") ?? "查询")
@@ -180,6 +209,14 @@ export function QueryView({
             disabled={saving || (!dirty && !scratch)}
           >
             {saving ? "保存中…" : scratch ? "保存到文件…" : "保存"}
+          </button>
+          <button
+            className="btn small"
+            onClick={() => void validate()}
+            disabled={checking || running}
+            title="让服务端解析并校验，但不执行"
+          >
+            {checking ? "检查中…" : "检查语法"}
           </button>
           <button className="btn primary small" onClick={() => void run()} disabled={running}>
             {running ? "执行中…" : "执行 (⌘↵)"}
@@ -239,6 +276,34 @@ export function QueryView({
             void onSaveAs(newName.trim(), sql);
           }}
         />
+      )}
+
+      {check && (
+        <div className="section" style={{ paddingTop: 0 }}>
+          {check.entries.every((entry) => entry.ok) ? (
+            <div className="warnbox" style={{ borderColor: "var(--green)", color: "var(--green)" }}>
+              语法检查通过：{check.entries.length} 条语句（{check.elapsedMs} ms）
+            </div>
+          ) : (
+            <div className="errbox">
+              {check.entries
+                .filter((entry) => !entry.ok)
+                .map((entry, index) => (
+                  <div key={index} style={{ marginBottom: 4 }}>
+                    <span className="mono">
+                      {entry.sql.replace(/\s+/g, " ").trim().slice(0, 80)}
+                    </span>
+                    <div style={{ marginTop: 2 }}>{entry.error}</div>
+                  </div>
+                ))}
+            </div>
+          )}
+          {check.entries.some((entry) => !entry.checkable) && (
+            <div className="faint" style={{ marginTop: 6 }}>
+              有语句无法预检（PostgreSQL 的 PREPARE 不支持该类型），只能直接执行确认。
+            </div>
+          )}
+        </div>
       )}
 
       {/* Nothing is shown until something has actually been executed. */}

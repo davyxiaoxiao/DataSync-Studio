@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sqlx::Executor;
 use tauri::State;
 
 use std::cmp::Ordering;
@@ -2408,6 +2409,153 @@ pub struct SqlRunResult {
 /// Largest page the data grid will fetch at once.
 pub const MAX_PAGE_ROWS: u64 = 1_000;
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlCheckEntry {
+    pub sql: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// False when this statement type cannot be checked without running it.
+    pub checkable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlCheckResult {
+    pub entries: Vec<SqlCheckEntry>,
+    pub elapsed_ms: u64,
+}
+
+/// Whether PostgreSQL can validate a statement with `PREPARE`.
+///
+/// `PREPARE` only accepts statements that return rows or modify data; wrapping a
+/// `CREATE TABLE` in one would produce a "syntax error" that has nothing to do
+/// with the user's SQL, so those are reported as un-checkable instead.
+fn pg_preparable(statement: &str) -> bool {
+    let first = statement
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '(')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        first.as_str(),
+        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "VALUES" | "MERGE" | "WITH" | "TABLE"
+    )
+}
+
+/// Validate a script without running it.
+///
+/// The server does the checking through `PREPARE`, which parses and plans the
+/// statement but leaves the data alone. That catches typos, unknown tables and
+/// unknown columns — the things a client-side check cannot know.
+#[tauri::command]
+pub async fn check_sql(
+    state: State<'_, AppState>,
+    request: RunSqlRequest,
+) -> AppResult<SqlCheckResult> {
+    let pool = pool_for(&state, &request.connection_id).await?;
+    check_sql_on(&pool, &request.namespace, &request.sql).await
+}
+
+/// Validate a script with the server without executing it.
+///
+/// Runs inside a transaction that carries the selected database, for the same
+/// reason execution does: without it an unqualified table name would be resolved
+/// against the connection default and reported as missing.
+pub(crate) async fn check_sql_on(
+    pool: &Pool,
+    namespace: &str,
+    sql: &str,
+) -> AppResult<SqlCheckResult> {
+    let statements = split_statements(sql);
+    if statements.is_empty() {
+        return Err(AppError::msg("没有可检查的语句"));
+    }
+    let dialect = pool.dialect();
+    let started = Instant::now();
+    let mut entries = Vec::with_capacity(statements.len());
+
+    macro_rules! run_checks {
+        ($tx:expr) => {{
+            for statement in &statements {
+                if dialect == crate::dialect::Dialect::Postgres && !pg_preparable(statement) {
+                    entries.push(SqlCheckEntry {
+                        sql: statement.clone(),
+                        ok: true,
+                        error: None,
+                        checkable: false,
+                    });
+                    continue;
+                }
+                // MySQL quotes the statement into PREPARE; PostgreSQL inlines it.
+                let prepare = match dialect {
+                    crate::dialect::Dialect::Mysql => format!(
+                        "PREPARE datasync_check FROM {}",
+                        dialect.string_literal(statement)
+                    ),
+                    crate::dialect::Dialect::Postgres => {
+                        format!("PREPARE datasync_check AS {statement}")
+                    }
+                };
+                let failure = $tx
+                    .execute(sqlx::raw_sql(&prepare))
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
+                if failure.is_none() {
+                    // Release the name so the next statement can reuse it.
+                    let deallocate = match dialect {
+                        crate::dialect::Dialect::Mysql => "DEALLOCATE PREPARE datasync_check",
+                        crate::dialect::Dialect::Postgres => "DEALLOCATE datasync_check",
+                    };
+                    let _ = $tx.execute(sqlx::raw_sql(deallocate)).await;
+                }
+                entries.push(SqlCheckEntry {
+                    sql: statement.clone(),
+                    ok: failure.is_none(),
+                    error: failure,
+                    checkable: true,
+                });
+            }
+        }};
+    }
+
+    match pool {
+        Pool::MySql(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let use_db = format!("USE {}", crate::dialect::Dialect::Mysql.quote(namespace));
+                tx.execute(sqlx::raw_sql(&use_db)).await.map_err(|error| {
+                    AppError::msg(format!("切换到 {namespace} 失败: {error}"))
+                })?;
+            }
+            run_checks!(tx);
+            // Nothing to keep: a check must leave no trace.
+            let _ = tx.rollback().await;
+        }
+        Pool::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let path = format!(
+                    "SET LOCAL search_path TO {}",
+                    crate::dialect::Dialect::Postgres.quote(namespace)
+                );
+                tx.execute(sqlx::raw_sql(&path)).await.map_err(|error| {
+                    AppError::msg(format!("切换到 {namespace} 失败: {error}"))
+                })?;
+            }
+            run_checks!(tx);
+            let _ = tx.rollback().await;
+        }
+    }
+
+    Ok(SqlCheckResult {
+        entries,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 /// Rows shown per statement before the console stops collecting.
 const SQL_CONSOLE_ROW_LIMIT: usize = 5_000;
 
@@ -2741,6 +2889,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         delete_query,
         queries_directory,
         run_sql,
+        check_sql,
         completion_catalog,
     ]
 }
