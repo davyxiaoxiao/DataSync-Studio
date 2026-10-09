@@ -257,6 +257,14 @@ export const api = {
   queriesDirectory: (connectionId: string) =>
     invoke<string>("queries_directory", { connectionId }),
 
+  /** Total rows a query returns; run after the first page is shown. */
+  countQueryRows: (request: {
+    connectionId: string;
+    namespace: string;
+    sql: string;
+    offset?: number;
+  }) => invoke<number>("count_query_rows", { request }),
+
   /** One page of a query's result set. */
   runSqlPage: (request: {
     connectionId: string;

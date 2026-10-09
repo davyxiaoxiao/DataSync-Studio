@@ -20,7 +20,41 @@ use crate::jobs::ProgressReporter;
 use crate::schema::model::TableStructure;
 
 /// Excel's hard limit for one worksheet.
+/// `.xlsx` holds this many rows. The legacy `.xls` holds only 65,536, which is
+/// one of the reasons this writer produces the newer format only.
 pub const MAX_ROWS: u64 = 1_048_576;
+
+/// The ceiling of the format that is *not* written, quoted when refusing it.
+pub const LEGACY_XLS_MAX_ROWS: u64 = 65_536;
+
+/// Refuse a target this writer cannot produce.
+///
+/// `.xls` is a different binary format (BIFF8 inside an OLE2 container), and
+/// quietly writing `.xlsx` bytes into a file named `.xls` would produce
+/// something Excel refuses to open — or worse, opens with a warning and gets
+/// edited anyway. Saying so is the only honest answer.
+fn ensure_writable_format(path: &str) -> AppResult<()> {
+    if path.trim().to_ascii_lowercase().ends_with(".xls") {
+        return Err(AppError::msg(format!(
+            "只支持 .xlsx：.xls（Excel 97-2003）上限仅 {} 行，且是另一种文件格式。请改用 .xlsx",
+            with_separators(LEGACY_XLS_MAX_ROWS)
+        )));
+    }
+    Ok(())
+}
+
+/// Group digits, so a limit reads as 65,536 rather than 65536 in a message.
+fn with_separators(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
 /// Excel's own limit on a sheet name.
 const MAX_SHEET_NAME: usize = 31;
 /// Rows fetched per round trip.
@@ -214,6 +248,7 @@ pub struct ExportRowsRequest {
 /// back from a table. The values arrive as text with the column's kind, so a
 /// number is still written as a numeric cell.
 pub async fn export_rows(request: &ExportRowsRequest) -> AppResult<ExportOutcome> {
+    ensure_writable_format(&request.path)?;
     let started = Instant::now();
     if request.columns.is_empty() {
         return Err(AppError::msg("请至少选择一列"));
@@ -360,6 +395,7 @@ pub async fn export_query(
 ) -> AppResult<ExportOutcome> {
     use crate::db::{decode_mysql_row_lenient, decode_pg_row_lenient, describe_mysql, describe_pg};
 
+    ensure_writable_format(path)?;
     let started = Instant::now();
     let inner = sql.trim().trim_end_matches(';');
     if inner.is_empty() {
@@ -559,6 +595,7 @@ pub async fn export(
     path: &str,
     reporter: &ProgressReporter,
 ) -> AppResult<ExportOutcome> {
+    ensure_writable_format(path)?;
     let started = Instant::now();
     let dialect = pool.dialect();
     let selected = resolve_columns(structure, columns)?;
@@ -876,5 +913,49 @@ mod tests {
             matches!(cell_of(&Value::Decimal(long.into())), Cell::Text(t) if t == long),
             "超出双精度的小数应保留原文而不是丢位数"
         );
+    }
+
+
+    #[test]
+    fn a_legacy_xls_target_is_refused() {
+        // Writing xlsx bytes into a file named `.xls` would produce something
+        // Excel opens with a warning, or not at all.
+        for path in ["/tmp/out.xls", "/tmp/OUT.XLS", "/tmp/out.Xls", " out.xls "] {
+            let error = ensure_writable_format(path).unwrap_err().to_string();
+            assert!(
+                error.contains(".xlsx"),
+                "拒绝信息应说明该用什么格式: {error}"
+            );
+            assert!(
+                error.contains("65,536"),
+                "拒绝信息应给出 .xls 的真实上限: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_writable_format_and_the_paths_without_an_extension_pass() {
+        assert!(ensure_writable_format("/tmp/out.xlsx").is_ok());
+        assert!(ensure_writable_format("/tmp/out.XLSX").is_ok());
+        // A path with no extension is written as xlsx, which is fine.
+        assert!(ensure_writable_format("/tmp/out").is_ok());
+        // `.xlsm` is a different extension and not mistaken for `.xls`.
+        assert!(ensure_writable_format("/tmp/out.xlsm").is_ok());
+    }
+
+    #[test]
+    fn limits_are_written_with_digit_separators() {
+        assert_eq!(with_separators(65_536), "65,536");
+        assert_eq!(with_separators(1_048_576), "1,048,576");
+        assert_eq!(with_separators(999), "999");
+        assert_eq!(with_separators(1_000), "1,000");
+    }
+
+    #[test]
+    fn the_two_excel_formats_have_different_ceilings() {
+        // This is the fact the whole check exists for.
+        assert_eq!(MAX_ROWS, 1_048_576);
+        assert_eq!(LEGACY_XLS_MAX_ROWS, 65_536);
+        assert!(LEGACY_XLS_MAX_ROWS < MAX_ROWS);
     }
 }

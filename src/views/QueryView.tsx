@@ -416,7 +416,7 @@ export function QueryView({
             connectionId={connectionId}
             namespace={namespace}
             onLog={onLog}
-            onExport={(columns) =>
+            onExport={(columns, knownTotal) =>
               setExportSource(
                 // A query is re-run for the export, so the whole result is
                 // written rather than the page that happens to be on screen.
@@ -428,6 +428,7 @@ export function QueryView({
                       namespace,
                       sql: entry.sql,
                       columns,
+                      total: knownTotal,
                     }
                   : {
                       kind: "rows",
@@ -553,7 +554,10 @@ function StatementResult({
   connectionId: string;
   namespace: string;
   onLog: (level: "info" | "ok" | "warn" | "err" | "sql", message: string) => void;
-  onExport: (columns: { name: string; dataType: string }[]) => void;
+  onExport: (
+    columns: { name: string; dataType: string }[],
+    total: number | null,
+  ) => void;
 }) {
   const pageSize = 1000;
   const [offset, setOffset] = useState(0);
@@ -570,6 +574,39 @@ function StatementResult({
     hasMore: entry.hasMore,
   }));
   const [paging, setPaging] = useState(false);
+  const [total, setTotal] = useState<number | null>(null);
+  const [counting, setCounting] = useState(false);
+
+  // Only a truncated result needs a count: a complete page already says how
+  // many rows there are.
+  useEffect(() => {
+    if (!entry.hasMore) {
+      setTotal(null);
+      return;
+    }
+    let cancelled = false;
+    setCounting(true);
+    void (async () => {
+      try {
+        const counted = await api.countQueryRows({
+          connectionId,
+          namespace,
+          sql: entry.sql,
+          offset: 0,
+        });
+        if (!cancelled) setTotal(counted);
+      } catch {
+        // A count the server cannot produce is not an error the user needs;
+        // the page itself is still perfectly usable.
+        if (!cancelled) setTotal(null);
+      } finally {
+        if (!cancelled) setCounting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionId, namespace, entry.sql, entry.hasMore]);
 
   // Later pages are read from the server on demand; only one page is ever held.
   const load = async (next: number) => {
@@ -607,7 +644,14 @@ function StatementResult({
       {paged && (
         <div className="row" style={{ marginBottom: 6, gap: 8 }}>
           <span className="faint">
-            第 {from}–{to} 行{page.hasMore ? "（还有更多）" : ""}
+            第 {from}–{to} 行
+            {counting
+              ? "（正在统计总行数…）"
+              : total !== null
+                ? `，共 ${total.toLocaleString("zh-CN")} 行`
+                : page.hasMore
+                  ? "（还有更多）"
+                  : ""}
           </span>
           {paging && <InlineLoading />}
           <button
@@ -626,7 +670,7 @@ function StatementResult({
           </button>
           <button
             className="btn small"
-            onClick={() => onExport(page.columns)}
+            onClick={() => onExport(page.columns, total)}
             title="导出全部行，不只是当前页"
           >
             导出 Excel

@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import type { TableRef } from "./Sidebar";
 import { IconFile, IconWarn } from "./Icons";
+import { JobProgress } from "./JobProgress";
 
 interface Props {
   target: TableRef;
@@ -561,6 +562,17 @@ export function ExcelImportDialog({ target, onClose, onImported, onLog }: Props)
             </div>
           )}
         </div>
+
+        {(running || job.update) && (
+          <div style={{ padding: "0 12px" }}>
+            <JobProgress
+              update={job.update}
+              running={running}
+              onDismiss={job.dismiss}
+              onLog={onLog}
+            />
+          </div>
+        )}
 
         <div className="modal-foot">
           <span className="faint">

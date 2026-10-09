@@ -5,6 +5,7 @@ import { useJobProgress } from "../jobs";
 import type { Cell, ColumnInfo, ExportOutcome } from "../types";
 import type { TableRef } from "./Sidebar";
 import { IconWarn } from "./Icons";
+import { JobProgress } from "./JobProgress";
 
 /**
  * What is being exported.
@@ -21,6 +22,8 @@ export type ExportSource =
       namespace: string;
       sql: string;
       columns: { name: string; dataType: string }[];
+      /** Known total, when the console already counted it. */
+      total?: number | null;
     }
   | {
       kind: "rows";
@@ -46,8 +49,20 @@ interface Row {
 
 let seq = 0;
 
-/** Excel's own limits, mirrored so the form can refuse impossible input. */
-const MAX_ROWS = 1_048_576;
+/**
+ * Excel's two formats have different ceilings, and knowing which one applies is
+ * the difference between a usable file and a truncated one.
+ *
+ * Only `.xlsx` is written: the legacy `.xls` is a different binary format
+ * (BIFF8 inside an OLE2 container), so a `.xls` target is refused rather than
+ * quietly filled with something Excel would complain about.
+ */
+const LIMITS = {
+  xlsx: { rows: 1_048_576, columns: 16_384 },
+  xls: { rows: 65_536, columns: 256 },
+} as const;
+
+const MAX_ROWS = LIMITS.xlsx.rows;
 
 /**
  * Excel export: choose the columns, rename their headers, write the file.
@@ -88,9 +103,12 @@ export function ExcelExportDialog({ source, onClose, onLog }: Props) {
               header: column.name,
             })),
           );
-          // A query's row count is unknown without running it, and running it
-          // just to count would cost as much as the export.
-          setTotal(source.kind === "rows" ? source.rows.length : null);
+          // The console may already have counted the result; otherwise the row
+          // count stays unknown, since counting it here would cost as much as
+          // the export itself.
+          setTotal(
+            source.kind === "rows" ? source.rows.length : (source.total ?? null),
+          );
           return;
         }
         const structure = await api.getTableStructure(
@@ -146,12 +164,20 @@ export function ExcelExportDialog({ source, onClose, onLog }: Props) {
   const maxInvalid =
     parsedMax !== null && (!Number.isFinite(parsedMax) || parsedMax < 0 || parsedMax > MAX_ROWS);
 
+  // Choosing `.xls` is a reasonable thing to try, so it is answered rather than
+  // ignored: the format's ceiling is 65,536 rows and this tool writes the newer
+  // format anyway.
+  const legacyPath =
+    path !== null && /\.xls$/i.test(path.trim()) ? path.trim() : null;
+
   const blocker =
     selected.length === 0
       ? "请至少选择一列"
       : maxInvalid
         ? `行数上限需在 0 到 ${MAX_ROWS.toLocaleString()} 之间`
-        : null;
+        : legacyPath !== null
+          ? `只支持 .xlsx：.xls（Excel 97-2003）上限仅 ${LIMITS.xls.rows.toLocaleString()} 行，且格式不同`
+          : null;
 
   const willTruncate =
     parsedMax !== null && parsedMax > 0 && total !== null && total > parsedMax;
@@ -430,6 +456,14 @@ export function ExcelExportDialog({ source, onClose, onLog }: Props) {
           )}
 
           <div className="row" style={{ gap: 8 }}>
+            {legacyPath && (
+              <button
+                className="btn small"
+                onClick={() => setPath(legacyPath.replace(/\.xls$/i, ".xlsx"))}
+              >
+                改为 .xlsx
+              </button>
+            )}
             <button className="btn small" onClick={() => void pickPath()} disabled={running}>
               选择保存位置…
             </button>
@@ -476,6 +510,31 @@ export function ExcelExportDialog({ source, onClose, onLog }: Props) {
             </div>
           )}
         </div>
+
+        {/* The export reports progress on the shared channel; without this the
+            dialog looks frozen for however long the export takes. */}
+        {(running || job.update) && (
+          <div style={{ padding: "0 12px" }}>
+            <JobProgress
+              update={
+                // A known total turns the bar determinate: the dialog counted
+                // the table, or the console already counted the query.
+                // A row cap makes the cap the real total, or the bar would
+                // never reach the end.
+                total !== null && job.update
+                  ? {
+                      ...job.update,
+                      total:
+                        parsedMax && parsedMax > 0 ? Math.min(total, parsedMax) : total,
+                    }
+                  : job.update
+              }
+              running={running}
+              onDismiss={job.dismiss}
+              onLog={onLog}
+            />
+          </div>
+        )}
 
         <div className="modal-foot">
           <span className="faint">{blocker ?? `将导出 ${selected.length} 列`}</span>

@@ -2664,6 +2664,19 @@ pub async fn run_sql_page(
     })
 }
 
+/// Count the rows a query returns, so the console can say how many there are.
+///
+/// Kept separate from reading a page: the count can be far more expensive than
+/// the page, so the page is shown first and this fills in afterwards.
+#[tauri::command]
+pub async fn count_query_rows(
+    state: State<'_, AppState>,
+    request: SqlPageRequest,
+) -> AppResult<u64> {
+    let pool = pool_for(&state, &request.connection_id).await?;
+    crate::db::count_query(&pool, &request.namespace, &request.sql).await
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SqlPageRequest {
@@ -3146,6 +3159,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         run_sql,
         check_sql,
         run_sql_page,
+        count_query_rows,
         explain_sql,
         completion_catalog,
     ]

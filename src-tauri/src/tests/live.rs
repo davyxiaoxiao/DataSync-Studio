@@ -3779,6 +3779,38 @@ async fn sql_console_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str
     assert_eq!(seen, bulk, "{tag}: 分页应覆盖全部行且不重复");
     assert_eq!(pages, 3, "{tag}: 应有 3 页");
 
+    // The total is what tells the user whether "more" means a thousand or a
+    // million, so it has to be exact rather than estimated.
+    let counted = crate::db::count_query(pool, ns, &query)
+        .await
+        .expect("count the query");
+    assert_eq!(
+        counted, bulk as u64,
+        "{tag}: 统计的总行数应等于真实行数"
+    );
+    // A filtered count is the number of matching rows, not of the table.
+    let counted = crate::db::count_query(
+        pool,
+        ns,
+        &format!(
+            "SELECT {id} FROM {table} WHERE {id} <= 10",
+            id = c("id"),
+            table = q("bulk")
+        ),
+    )
+    .await
+    .expect("count a filtered query");
+    assert_eq!(counted, 10, "{tag}: 条件统计应只数匹配的行");
+    // A query with no rows counts as zero rather than failing.
+    let counted = crate::db::count_query(
+        pool,
+        ns,
+        &format!("SELECT {id} FROM {table} WHERE 1 = 0", id = c("id"), table = q("bulk")),
+    )
+    .await
+    .expect("count an empty query");
+    assert_eq!(counted, 0, "{tag}: 空结果应统计为 0");
+
     // A single statement can be read at an arbitrary offset.
     let page = crate::db::run_query_page(pool, ns, &query, (bulk - 3) as u64, SQL_CONSOLE_PAGE_SIZE)
         .await

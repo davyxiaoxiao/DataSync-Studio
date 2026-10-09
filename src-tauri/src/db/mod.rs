@@ -349,6 +349,73 @@ pub enum ConsoleOutcome {
     Failed(String),
 }
 
+/// Count every row a query returns.
+///
+/// The console only reads one page at a time, so without this the user has no
+/// idea whether a result is 1,001 rows or a million. The cost is real — the
+/// server has to produce the whole result to count it — which is why the caller
+/// runs this after the first page is already on screen.
+pub async fn count_query(pool: &Pool, namespace: &str, statement: &str) -> AppResult<u64> {
+    let inner = statement.trim().trim_end_matches(';');
+    if inner.is_empty() {
+        return Err(AppError::msg("没有可统计的语句"));
+    }
+    if !is_query(inner) {
+        return Err(AppError::msg("只有查询语句可以统计行数"));
+    }
+    let wrapped = format!("SELECT COUNT(*) AS datasync_total FROM ({inner}) AS datasync_count");
+
+    macro_rules! count {
+        ($tx:expr, $decode:ident) => {{
+            let row = $tx
+                .fetch_one(sqlx::query(&wrapped))
+                .await
+                .map_err(|error| AppError::msg(format!("统计行数失败: {error}")))?;
+            let values = $decode(&row, &[ColumnKind::Int]);
+            match values.first() {
+                Some(Value::Int(number)) => *number as u64,
+                Some(Value::Uint(number)) => *number,
+                Some(Value::Decimal(text)) | Some(Value::Str(text)) => {
+                    text.trim().parse::<u64>().map_err(|_| {
+                        AppError::msg(format!("统计行数返回了意外的值: {text}"))
+                    })?
+                }
+                _ => return Err(AppError::msg("统计行数没有返回结果")),
+            }
+        }};
+    }
+
+    match pool {
+        Pool::MySql(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let use_db = format!("USE {}", Dialect::Mysql.quote(namespace));
+                tx.execute(sqlx::raw_sql(&use_db))
+                    .await
+                    .map_err(|error| AppError::msg(format!("切换到 {namespace} 失败: {error}")))?;
+            }
+            let total = count!(tx, decode_mysql_row_lenient);
+            let _ = tx.rollback().await;
+            Ok(total)
+        }
+        Pool::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let path = format!(
+                    "SET LOCAL search_path TO {}",
+                    Dialect::Postgres.quote(namespace)
+                );
+                tx.execute(sqlx::raw_sql(&path))
+                    .await
+                    .map_err(|error| AppError::msg(format!("切换到 {namespace} 失败: {error}")))?;
+            }
+            let total = count!(tx, decode_pg_row_lenient);
+            let _ = tx.rollback().await;
+            Ok(total)
+        }
+    }
+}
+
 /// One page of a query's result.
 pub struct QueryPage {
     pub columns: Vec<DescribedColumn>,
