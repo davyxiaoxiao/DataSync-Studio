@@ -274,6 +274,25 @@ export const api = {
     jobId?: string;
   }) => invoke<SyncRunResult>("rename_table", { request }),
 
+  previewCreateTable: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    columns: ColumnInfo[];
+    primaryKey?: string[];
+    indexes?: IndexInfo[];
+  }) => invoke<SchemaSqlPreview>("preview_create_table", { request }),
+
+  createTable: (request: {
+    connectionId: string;
+    namespace: string;
+    table: string;
+    columns: ColumnInfo[];
+    primaryKey?: string[];
+    indexes?: IndexInfo[];
+    jobId?: string;
+  }) => invoke<SyncRunResult>("create_table", { request }),
+
   previewAlterTable: (
     connectionId: string,
     namespace: string,

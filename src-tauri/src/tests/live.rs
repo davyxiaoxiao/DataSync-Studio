@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    apply_data_plan, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
+    apply_data_plan, plan_create_table, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
@@ -2228,6 +2228,87 @@ async fn table_ops_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) 
         .unwrap_err();
     assert!(error.to_string().contains("数量不一致"), "{tag}: {error}");
 
+    // ---- 1d. create a table from a design ----------------------------------
+    let designed = vec![
+        crate::schema::model::ColumnInfo {
+            name: "id".into(),
+            ordinal: 1,
+            data_type: "INT".into(),
+            full_type: int_type_of(dialect).into(),
+            nullable: false,
+            default: None,
+            is_auto_increment: false,
+            auto_kind: None,
+            is_generated: false,
+            generation_expression: None,
+            generation_kind: None,
+            is_unsigned: false,
+            comment: None,
+            charset: None,
+            collation: None,
+            udt_name: None,
+        },
+        crate::schema::model::ColumnInfo {
+            name: "label".into(),
+            ordinal: 2,
+            data_type: "VARCHAR".into(),
+            full_type: text_type_of(dialect).into(),
+            nullable: true,
+            default: None,
+            is_auto_increment: false,
+            auto_kind: None,
+            is_generated: false,
+            generation_expression: None,
+            generation_kind: None,
+            is_unsigned: false,
+            comment: None,
+            charset: None,
+            collation: None,
+            udt_name: None,
+        },
+    ];
+    let (plan, _) = plan_create_table(
+        pool,
+        ns,
+        "designed",
+        &designed,
+        &["id".to_string()],
+        &[],
+    )
+    .await
+    .expect("plan create table");
+    assert_eq!(plan[0].category, "create_table", "{tag}: 应先建表");
+    run_plan(pool, plan.into_iter().map(|s| s.sql).collect()).await;
+
+    let created = crate::schema::introspect::load_table(pool, ns, "designed")
+        .await
+        .expect("reload the new table");
+    assert_eq!(
+        created.primary_key,
+        vec!["id".to_string()],
+        "{tag}: 主键应按设计建立"
+    );
+    assert!(!created.column("id").expect("id").nullable);
+    assert!(created.column("label").expect("label").nullable);
+
+    // Creating the same table twice must be refused before touching the server.
+    let error = plan_create_table(pool, ns, "designed", &designed, &["id".to_string()], &[])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("已存在"), "{tag}: {error}");
+
+    // A key naming a column that is not in the design is refused too, since the
+    // generated DDL could never run.
+    let error = plan_create_table(pool, ns, "another", &designed, &["nope".to_string()], &[])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("主键字段"), "{tag}: {error}");
+
+    crate::schema::introspect::load_table(pool, ns, "designed")
+        .await
+        .expect("table should still load");
+    exec(pool, &format!("DROP TABLE {}", q("designed"))).await;
+
     // ---- 2. rename the table ----------------------------------------------
     let sql = vec![crate::schema::ddl::rename_table_ddl(
         "child",
@@ -2327,6 +2408,21 @@ async fn text_of(pool: &Pool, sql: &str) -> Option<String> {
     rows.first()
         .and_then(|row| row.first())
         .and_then(|value| value.display())
+}
+
+/// The integer and text spellings each engine expects in a design payload.
+fn int_type_of(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Mysql => "INT",
+        Dialect::Postgres => "integer",
+    }
+}
+
+fn text_type_of(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Mysql => "VARCHAR(64)",
+        Dialect::Postgres => "character varying(64)",
+    }
 }
 
 fn excel_fixture() -> String {

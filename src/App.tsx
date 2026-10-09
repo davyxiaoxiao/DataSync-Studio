@@ -29,6 +29,7 @@ type TableAction =
   | { kind: "rename"; ref: TableRef }
   | { kind: "drop"; refs: TableRef[] }
   | { kind: "importExcel"; ref: TableRef }
+  | { kind: "createTable"; target: { connectionId: string; namespace: string } }
   | {
       kind: "renameQuery";
       query: { connectionId: string; namespace: string; name: string; path: string };
@@ -232,6 +233,7 @@ function Shell() {
           onImportExcel={(ref) => setTableAction({ kind: "importExcel", ref })}
           onExportExcel={(ref) => setTableAction({ kind: "exportExcel", ref })}
           onRenameQuery={(query) => setTableAction({ kind: "renameQuery", query })}
+          onCreateTable={(target) => setTableAction({ kind: "createTable", target })}
         />
 
         <div className="main-area">
@@ -403,6 +405,20 @@ function Shell() {
           onImported={() => {
             // The table's contents changed, so an open grid should reload.
             window.dispatchEvent(new CustomEvent("datasync:refresh-data"));
+          }}
+          onLog={log}
+        />
+      )}
+
+      {tableAction?.kind === "createTable" && (
+        <TableEditorDialog
+          connectionId={tableAction.target.connectionId}
+          namespace={tableAction.target.namespace}
+          table=""
+          mode="create"
+          onClose={() => setTableAction(null)}
+          onSaved={() => {
+            window.dispatchEvent(new CustomEvent("datasync:refresh-tables"));
           }}
           onLog={log}
         />

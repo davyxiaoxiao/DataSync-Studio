@@ -41,6 +41,7 @@ interface Props {
     name: string;
     path: string;
   }) => void;
+  onCreateTable: (target: { connectionId: string; namespace: string }) => void;
 }
 
 const refKey = (ref: TableRef) => `${ref.connectionId}::${ref.namespace}::${ref.table}`;
@@ -57,6 +58,7 @@ export function Sidebar({
   onImportExcel,
   onExportExcel,
   onRenameQuery,
+  onCreateTable,
 }: Props) {
   const {
     connections,
@@ -501,6 +503,14 @@ export function Sidebar({
                         onContextMenu={(event) =>
                           openMenu(event, [
                             {
+                              label: "新建表…",
+                              run: () =>
+                                onCreateTable({
+                                  connectionId: config.id,
+                                  namespace: ns.name,
+                                }),
+                            },
+                            {
                               label: "刷新表列表",
                               run: () => void refreshTables(config.id, ns.name),
                             },
@@ -544,6 +554,14 @@ export function Sidebar({
                             onToggle: () =>
                               toggleNamespaceGroup(config.id, ns.name, "tables"),
                             menu: [
+                              {
+                                label: "新建表…",
+                                run: () =>
+                                  onCreateTable({
+                                    connectionId: config.id,
+                                    namespace: ns.name,
+                                  }),
+                              },
                               {
                                 label: "刷新表列表",
                                 run: () => void refreshTables(config.id, ns.name),

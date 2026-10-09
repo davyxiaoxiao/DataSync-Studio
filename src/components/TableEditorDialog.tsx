@@ -25,6 +25,8 @@ interface Props {
   connectionId: string;
   namespace: string;
   table: string;
+  /** `create` starts from an empty design instead of loading an existing table. */
+  mode?: "edit" | "create";
   onClose: () => void;
   onSaved: () => void;
   onLog: (level: "info" | "ok" | "warn" | "err", message: string) => void;
@@ -127,15 +129,18 @@ export function TableEditorDialog({
   connectionId,
   namespace,
   table,
+  mode = "edit",
   onClose,
   onSaved,
   onLog,
 }: Props) {
+  const creating = mode === "create";
   const { connections } = useStore();
   const job = useJobProgress();
   const dialect = connections.find((c) => c.id === connectionId)?.dialect ?? "mysql";
 
   const [tab, setTab] = useState<Tab>("columns");
+  const [tableName, setTableName] = useState(table);
   const [columns, setColumns] = useState<EditableColumn[]>([]);
   const [indexes, setIndexes] = useState<EditableIndex[]>([]);
   const [foreignKeys, setForeignKeys] = useState<EditableForeignKey[]>([]);
@@ -153,6 +158,15 @@ export function TableEditorDialog({
     let cancelled = false;
     void (async () => {
       try {
+        if (creating) {
+          // A new table starts with one column so there is something to fill in.
+          setColumns([
+            { key: nextKey(), column: blankColumn(1), originalName: null },
+          ]);
+          setPrimaryKey([]);
+          setLoading(false);
+          return;
+        }
         const structure = await api.getTableStructure(connectionId, namespace, table);
         if (cancelled) return;
         setPrimaryKey(structure.primaryKey);
@@ -204,7 +218,7 @@ export function TableEditorDialog({
     return () => {
       cancelled = true;
     };
-  }, [connectionId, namespace, table]);
+  }, [connectionId, namespace, table, creating]);
 
   const patch = useCallback((key: string, changes: Partial<ColumnInfo>) => {
     setColumns((prev) => {
@@ -298,6 +312,7 @@ export function TableEditorDialog({
   );
 
   const localError = useMemo(() => {
+    if (creating && tableName.trim() === "") return "请填写表名";
     const names = payload.map((column) => column.name.trim().toLowerCase());
     if (payload.length === 0) return "表至少需要一个字段";
     if (names.some((name) => !name)) return "有字段没有填写名称";
@@ -400,6 +415,23 @@ export function TableEditorDialog({
           </div>
         </div>
 
+        {creating && (
+          <div className="section" style={{ padding: "8px 12px", borderBottom: "1px solid var(--border)" }}>
+            <div className="row" style={{ gap: 8 }}>
+              <span className="faint">表名</span>
+              <input
+                type="text"
+                value={tableName}
+                autoFocus
+                placeholder="例如：orders"
+                style={{ width: 240 }}
+                onChange={(event) => setTableName(event.target.value)}
+              />
+              <span className="faint">模式 {namespace}</span>
+            </div>
+          </div>
+        )}
+
         <div className="modal-tabs">
           {(
             [
@@ -458,7 +490,11 @@ export function TableEditorDialog({
                   }
                 >
                   <IconPlus size={11} />{" "}
-                  {tab === "columns" ? "添加字段" : tab === "indexes" ? "添加索引" : "外键"}
+                  {creating || tab === "columns"
+                    ? "添加字段"
+                    : tab === "indexes"
+                      ? "添加索引"
+                      : "外键"}
                 </button>
                 {tab === "foreignKeys" && (
                   <button
@@ -517,6 +553,7 @@ export function TableEditorDialog({
                       <th className="rowno">#</th>
                       <th style={{ width: 180 }}>字段名</th>
                       <th style={{ width: 190 }}>类型</th>
+                      <th style={{ width: 46 }}>主键</th>
                       <th style={{ width: 56 }}>可空</th>
                       <th style={{ width: 150 }}>默认值</th>
                       <th style={{ width: 150 }}>注释</th>
@@ -557,10 +594,37 @@ export function TableEditorDialog({
                           <td style={{ textAlign: "center" }}>
                             <input
                               type="checkbox"
-                              checked={column.nullable}
-                              disabled={column.isGenerated || isPrimary}
+                              checked={primaryKey.includes(column.name)}
+                              disabled={
+                                !creating ||
+                                column.isGenerated ||
+                                column.name.trim() === ""
+                              }
                               title={
-                                isPrimary
+                                creating
+                                  ? "勾选作为主键"
+                                  : "主键在建表时设定，之后可用结构同步调整"
+                              }
+                              onChange={(event) =>
+                                setPrimaryKey((prev) =>
+                                  event.target.checked
+                                    ? [...prev, column.name]
+                                    : prev.filter((name) => name !== column.name),
+                                )
+                              }
+                            />
+                          </td>
+                          <td style={{ textAlign: "center" }}>
+                            <input
+                              type="checkbox"
+                              checked={column.nullable}
+                              disabled={
+                                column.isGenerated ||
+                                isPrimary ||
+                                primaryKey.includes(column.name)
+                              }
+                              title={
+                                isPrimary || primaryKey.includes(column.name)
                                   ? "主键字段必须非空"
                                   : column.isGenerated
                                     ? "生成列由表达式决定"

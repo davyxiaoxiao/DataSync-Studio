@@ -613,7 +613,7 @@ fn drop_fk_ddl(
     }
 }
 
-fn create_table_ddl(
+pub fn create_table_ddl(
     structure: &TableStructure,
     target: Dialect,
     schema: Option<&str>,

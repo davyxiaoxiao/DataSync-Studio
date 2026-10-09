@@ -31,8 +31,8 @@ use crate::jobs::ProgressReporter;
 use crate::schema::model::foreign_key_covered_by;
 use crate::schema::ddl::{
     generate, normalize_designed_columns, plan_drop_tables, rename_column_ddl,
-    merge_mysql_index_statements, rename_table_ddl, validate_foreign_keys, validate_indexes,
-    DdlStatement, SyncSelection,
+    create_table_ddl, merge_mysql_index_statements, rename_table_ddl, validate_foreign_keys,
+    validate_indexes, DdlStatement, SyncSelection,
 };
 use crate::schema::diff::{compare_everything, ChangeKind, CompareOptions, SchemaDiff};
 use crate::schema::introspect;
@@ -1556,6 +1556,156 @@ pub async fn rename_table(
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CreateTableRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub table: String,
+    pub columns: Vec<ColumnInfo>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub indexes: Vec<IndexInfo>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+/// Create a table from the editor's design.
+///
+/// The statement comes from the same generator the structure sync uses for new
+/// tables, so a table made here and one made by a sync are identical.
+pub(crate) async fn plan_create_table(
+    pool: &Pool,
+    namespace: &str,
+    table: &str,
+    columns: &[ColumnInfo],
+    primary_key: &[String],
+    indexes: &[IndexInfo],
+) -> AppResult<(Vec<DdlStatement>, Vec<String>)> {
+    let name = table.trim();
+    if name.is_empty() {
+        return Err(AppError::msg("表名不能为空"));
+    }
+    let dialect = pool.dialect();
+    let normalized = normalize_designed_columns(dialect, columns)?;
+    if normalized.is_empty() {
+        return Err(AppError::msg("表至少需要一个字段"));
+    }
+
+    // Every key column has to exist, or the generated DDL cannot execute.
+    let mut primary_key = primary_key.to_vec();
+    for key in &primary_key {
+        if !normalized
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(key.trim()))
+        {
+            return Err(AppError::msg(format!("主键字段 {key} 不在字段列表里")));
+        }
+    }
+    // Spell the key columns the way the columns themselves are spelt.
+    for key in &mut primary_key {
+        if let Some(column) = normalized
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(key.trim()))
+        {
+            *key = column.name.clone();
+        }
+    }
+
+    let mut indexes = indexes.to_vec();
+    for index in &mut indexes {
+        index.name = index.name.trim().to_string();
+        index.columns = index
+            .columns
+            .iter()
+            .map(|column| column.trim().to_string())
+            .filter(|column| !column.is_empty())
+            .collect();
+    }
+    validate_indexes(&indexes, &normalized)?;
+
+    let existing = introspect::list_tables(pool, namespace).await?;
+    if existing
+        .iter()
+        .any(|entry| entry.name.eq_ignore_ascii_case(name))
+    {
+        return Err(AppError::msg(format!("表 {name} 已存在")));
+    }
+
+    let structure = TableStructure {
+        name: name.to_string(),
+        comment: None,
+        engine: None,
+        charset: None,
+        collation: None,
+        primary_key,
+        columns: normalized,
+        indexes,
+        foreign_keys: Vec::new(),
+    };
+    let mut warnings = Vec::new();
+    let statements = create_table_ddl(&structure, dialect, Some(namespace), namespace, &mut warnings);
+    Ok((statements, warnings))
+}
+
+#[tauri::command]
+pub async fn preview_create_table(
+    state: State<'_, AppState>,
+    request: CreateTableRequest,
+) -> AppResult<SchemaSqlPreview> {
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let (statements, warnings) = plan_create_table(
+        &pool,
+        &request.namespace,
+        &request.table,
+        &request.columns,
+        &request.primary_key,
+        &request.indexes,
+    )
+    .await?;
+    Ok(SchemaSqlPreview {
+        statements,
+        warnings,
+    })
+}
+
+#[tauri::command]
+pub async fn create_table(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: CreateTableRequest,
+) -> AppResult<SyncRunResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let planned = plan_create_table(
+        &pool,
+        &request.namespace,
+        &request.table,
+        &request.columns,
+        &request.primary_key,
+        &request.indexes,
+    )
+    .await;
+    let started = Instant::now();
+    let outcome = match planned {
+        Ok((statements, warnings)) => {
+            let sql: Vec<String> = statements.into_iter().map(|s| s.sql).collect();
+            let run = pool.run_statements(&sql, true, &reporter).await;
+            run.map(|run| (run, warnings))
+        }
+        Err(error) => Err(error),
+    };
+    end_job(&state, job);
+    reporter.finish("done", "建表完成", "建表结束");
+    let (run, warnings) = outcome?;
+    Ok(summarize_ddl(
+        run,
+        started.elapsed().as_millis() as u64,
+        warnings,
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AlterTableRequest {
     pub connection_id: String,
     pub namespace: String,
@@ -2574,6 +2724,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         rename_table,
         preview_alter_table,
         apply_alter_table,
+        preview_create_table,
+        create_table,
         preview_excel,
         plan_excel_import,
         import_excel,

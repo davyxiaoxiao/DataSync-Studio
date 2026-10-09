@@ -12,7 +12,8 @@ use crate::data::{
 use crate::db::value::{ColumnKind, Value};
 use crate::dialect::Dialect;
 use crate::schema::ddl::{
-    family_from_declared_type, generate, normalize_designed_columns, plan_drop_tables,
+    create_table_ddl, family_from_declared_type, generate, normalize_designed_columns,
+    plan_drop_tables,
     rename_column_ddl, rename_table_ddl, validate_foreign_keys, validate_indexes, SyncSelection,
     TableSelection,
 };
@@ -1939,4 +1940,75 @@ fn foreign_keys_are_validated_before_they_reach_the_server() {
     missing.ref_table = "  ".into();
     let error = validate_foreign_keys(&[missing], &columns).unwrap_err();
     assert!(error.to_string().contains("引用表"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Creating a table from the editor's design
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_designed_table_becomes_a_create_statement() {
+    let mut structure = table(
+        "orders",
+        vec![
+            {
+                let mut id = col("id", "INT", "integer");
+                id.nullable = false;
+                id
+            },
+            col("remark", "VARCHAR", "character varying(32)"),
+        ],
+        &["id"],
+    );
+    structure.indexes.push(IndexInfo {
+        name: "idx_orders_remark".into(),
+        columns: vec!["remark".into()],
+        is_unique: false,
+        index_type: None,
+        required_by_foreign_key: false,
+    });
+
+    // PostgreSQL splits the index out; MySQL inlines it into CREATE TABLE.
+    let pg = create_table_ddl(
+        &structure,
+        Dialect::Postgres,
+        Some("app"),
+        "app",
+        &mut Vec::new(),
+    );
+    assert_eq!(pg[0].category, "create_table");
+    assert!(pg[0].sql.contains("CREATE TABLE \"app\".\"orders\""), "{}", pg[0].sql);
+    assert!(
+        pg.iter().any(|s| s.category == "create_index"),
+        "PostgreSQL 的索引应为独立语句"
+    );
+
+    let mysql = create_table_ddl(
+        &structure,
+        Dialect::Mysql,
+        Some("app"),
+        "app",
+        &mut Vec::new(),
+    );
+    assert_eq!(mysql.len(), 1, "MySQL 应只生成一条 CREATE TABLE");
+    assert!(mysql[0].sql.contains("PRIMARY KEY"), "{}", mysql[0].sql);
+    // MySQL spells the inline form `KEY`, not `INDEX`.
+    assert!(
+        mysql[0].sql.contains("idx_orders_remark"),
+        "索引应内联进 CREATE TABLE: {}",
+        mysql[0].sql
+    );
+}
+
+#[test]
+fn a_primary_key_must_reference_a_real_column() {
+    // The DDL is generated from the key list, so a typo there would produce a
+    // statement the server rejects.
+    let structure = table("t", vec![col("id", "INT", "integer")], &["id"]);
+    assert_eq!(structure.primary_key, vec!["id".to_string()]);
+    assert!(structure.column("id").is_some());
+    assert!(
+        structure.column("nope").is_none(),
+        "不存在的列必须能被识别出来"
+    );
 }
