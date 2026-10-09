@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, errorMessage } from "../api";
 import { useJobProgress } from "../jobs";
+import { Loading } from "./Loading";
 import { useStore } from "../store";
 import type {
   ColumnInfo,
@@ -459,7 +460,12 @@ export function TableEditorDialog({
         </div>
 
         <div className="modal-body" style={{ padding: 0, display: "flex", flexDirection: "column" }}>
-          {loading && <div style={{ padding: 20 }}>正在读取表结构…</div>}
+          {loading && (
+            <Loading
+              label="正在读取表结构…"
+              detail={`${namespace}.${table}`}
+            />
+          )}
           {loadError && (
             <div style={{ padding: 16 }}>
               <div className="errbox">{loadError}</div>

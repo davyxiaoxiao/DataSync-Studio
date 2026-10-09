@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { SqlEditor } from "../components/SqlEditor";
+import { InlineLoading, Loading } from "../components/Loading";
 import {
   ExcelExportDialog,
   type ExportSource,
@@ -391,7 +392,17 @@ export function QueryView({
       {/* Nothing is shown until something has actually been executed. */}
       {(running || result) && (
         <div style={{ overflow: "auto", flex: 1, padding: "0 12px 12px" }}>
-        {running && <div className="faint">正在执行…</div>}
+        {running && (
+          <Loading
+            label="正在执行 SQL…"
+            detail={
+              // A rough count is enough to say whether this will take a moment.
+              sql.split(";").filter((part) => part.trim() !== "").length > 1
+                ? "多语句脚本，逐条执行"
+                : "已发送到服务端，等待结果"
+            }
+          />
+        )}
         {result?.cancelled && (
           <div className="warnbox" style={{ marginBottom: 8 }}>
             执行已取消，结果可能不完整。
@@ -598,6 +609,7 @@ function StatementResult({
           <span className="faint">
             第 {from}–{to} 行{page.hasMore ? "（还有更多）" : ""}
           </span>
+          {paging && <InlineLoading />}
           <button
             className="btn small"
             disabled={offset === 0 || paging}

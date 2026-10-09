@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { InlineLoading } from "./Loading";
 import { useStore, dialectLabel, type NamespaceNode } from "../store";
 import { api, errorMessage } from "../api";
 import { ContextMenu, menuAt, type MenuState } from "./ContextMenu";
@@ -540,7 +541,11 @@ export function Sidebar({
                           <IconFolder size={13} />
                         </span>
                         <span className="label">{ns.name}</span>
-                        {ns.loading && <span className="meta">载入中…</span>}
+                        {ns.loading && (
+                          <span className="meta">
+                            <InlineLoading label="载入中…" />
+                          </span>
+                        )}
                         {ns.loaded && <span className="meta">{ns.tables.length}</span>}
                       </div>
 
@@ -568,6 +573,11 @@ export function Sidebar({
                               },
                             ],
                           })}
+                          {ns.tablesExpanded && ns.loading && (
+                            <div className="tnode" style={{ paddingLeft: 58 }}>
+                              <InlineLoading label={`正在读取 ${ns.name} 的表…`} />
+                            </div>
+                          )}
                           {ns.tablesExpanded &&
                             tablesOf(ns).map((table) => (
                               <div

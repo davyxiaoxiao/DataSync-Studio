@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorMessage } from "../api";
+import { InlineLoading, Loading, LoadingOverlay } from "../components/Loading";
 import type {
   Cell,
   ColumnMeta,
@@ -446,6 +447,14 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
       )}
 
       <div className="grid-wrap">
+        {/* Rows already on screen stay visible but dimmed, so a re-query does
+            not blank out what the user was reading. */}
+        {loading && rows.length > 0 && (
+          <LoadingOverlay
+            label={offset === 0 ? "正在重新读取…" : "正在翻页…"}
+            detail={`${namespace}.${table}`}
+          />
+        )}
         <table
           className={`grid resizable${resizing ? " resizing" : ""}`}
           style={{ width: tableWidth, tableLayout: "fixed" }}
@@ -562,6 +571,12 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
                 })}
               </tr>
             ))}
+            {loading && rows.length === 0 && (
+              <Loading
+                label="正在读取表数据…"
+                detail={`${namespace}.${table}`}
+              />
+            )}
             {rows.length === 0 && !loading && (
               <tr>
                 <td
@@ -643,7 +658,7 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
             </span>
           </>
         )}
-        {loading && <span>加载中…</span>}
+        {loading && <InlineLoading label="读取中…" />}
         {saving && <span>保存中…</span>}
         <div className="spacer" />
         <button

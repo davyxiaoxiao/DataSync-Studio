@@ -644,6 +644,8 @@ select {
   overflow: auto;
   min-height: 0;
   flex: 1;
+  /* The loading overlay is positioned against this box. */
+  position: relative;
   border-top: 1px solid var(--border);
 }
 
@@ -1565,4 +1567,50 @@ table.grid.resizing .col-resizer {
 
 .sql-highlight .tok-function {
   color: #1f7a4d;
+}
+
+/* ------------------------------------------------------------- loading UI */
+
+.loading-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 40px 16px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.loading-block .icon {
+  color: var(--accent);
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.62);
+  backdrop-filter: saturate(0.6);
+  z-index: 40;
+  border-radius: inherit;
+}
+
+.loading-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 8px 20px rgba(15, 20, 28, 0.14);
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.loading-card .icon {
+  color: var(--accent);
 }
