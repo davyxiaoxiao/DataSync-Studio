@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    apply_data_plan, check_sql_on, plan_create_table, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
+    apply_data_plan, check_sql_on, explain_sql_on, plan_create_table, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
@@ -3625,6 +3625,63 @@ async fn sql_console_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str
             checked.entries[0].error
         );
     }
+    // ---- execution plans ---------------------------------------------------
+    let explained = explain_sql_on(
+        pool,
+        ns,
+        &format!("SELECT * FROM console WHERE {id} = 1", id = c("id")),
+    )
+    .await
+    .expect("explain a select");
+    assert_eq!(explained.entries.len(), 1);
+    let plan = &explained.entries[0];
+    assert!(plan.supported, "{tag}: SELECT 应可分析");
+    assert!(plan.ok, "{tag}: {:?}", plan.error);
+    assert!(!plan.columns.is_empty(), "{tag}: 执行计划应有列");
+    assert!(!plan.rows.is_empty(), "{tag}: 执行计划应有内容");
+
+    // Analysing must not modify anything, which is why plain EXPLAIN is used.
+    let before = scalar_count(pool, ns, "console", dialect).await;
+    let explained = explain_sql_on(
+        pool,
+        ns,
+        &format!(
+            "UPDATE console SET {name} = 'analysed' WHERE {id} = 1",
+            name = c("name"),
+            id = c("id")
+        ),
+    )
+    .await
+    .expect("explain an update");
+    assert!(explained.entries[0].supported, "{tag}: UPDATE 应可分析");
+    let after = scalar_count(pool, ns, "console", dialect).await;
+    assert_eq!(before, after, "{tag}: 分析不得改动数据");
+    let name_after = text_of(
+        pool,
+        &format!(
+            "SELECT {} FROM {} WHERE {} = 1",
+            c("name"),
+            q("console"),
+            c("id")
+        ),
+    )
+    .await;
+    assert_ne!(
+        name_after.as_deref(),
+        Some("analysed"),
+        "{tag}: 分析绝不能真的执行 UPDATE"
+    );
+
+    // A statement type the engine cannot explain is reported as such.
+    let explained = explain_sql_on(pool, ns, "CREATE TABLE datasync_explain_probe (id int)")
+        .await
+        .expect("explain a DDL statement");
+    assert!(
+        !explained.entries[0].supported,
+        "{tag}: DDL 应被标为不支持分析"
+    );
+    assert!(explained.entries[0].ok, "{tag}: 不支持分析不应报成错误");
+
     // The probe must not have been created either way.
     let tables = crate::schema::introspect::list_tables(pool, ns)
         .await

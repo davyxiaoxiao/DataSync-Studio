@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, errorMessage } from "../api";
 import { useJobProgress } from "../jobs";
 import type {
   CompletionCatalog,
   SqlCheckResult,
+  SqlExplainEntry,
+  SqlExplainResult,
   SqlRunResult,
   SqlStatementResult,
 } from "../types";
@@ -56,6 +58,11 @@ export function QueryView({
   const [result, setResult] = useState<SqlRunResult | null>(null);
   const [checking, setChecking] = useState(false);
   const [check, setCheck] = useState<SqlCheckResult | null>(null);
+  const [explaining, setExplaining] = useState(false);
+  const [explain, setExplain] = useState<SqlExplainResult | null>(null);
+  const [checkFailed, setCheckFailed] = useState(false);
+  // Guards against an older check landing after a newer one.
+  const checkSeq = useRef(0);
 
   const dirty = sql !== saved;
 
@@ -133,6 +140,7 @@ export function QueryView({
     setResult(null);
     const jobId = job.begin();
     try {
+      setExplain(null);
       const outcome = await api.runSql({ connectionId, namespace, sql, jobId });
       setResult(outcome);
       const failed = outcome.results.filter((entry) => !entry.ok).length;
@@ -157,25 +165,61 @@ export function QueryView({
     }
   }, [connectionId, namespace, sql, job, onLog]);
 
-  /// Ask the server to validate the script without running it.
-  const validate = useCallback(async () => {
-    setChecking(true);
+  /// Validate the script automatically, a moment after typing stops.
+  ///
+  /// Checking on every keystroke would put a round trip behind each character,
+  /// and checking instantly would report errors for half-typed words, so the
+  /// request is debounced and stale replies are dropped.
+  useEffect(() => {
+    if (sql.trim() === "" || running) {
+      setCheck(null);
+      setChecking(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      const seq = ++checkSeq.current;
+      setChecking(true);
+      void (async () => {
+        try {
+          const outcome = await api.checkSql({ connectionId, namespace, sql });
+          if (seq !== checkSeq.current) return;
+          setCheck(outcome);
+          setCheckFailed(false);
+        } catch {
+          if (seq !== checkSeq.current) return;
+          // A failed check is not a syntax error; say nothing rather than
+          // blaming the user's SQL.
+          setCheck(null);
+          setCheckFailed(true);
+        } finally {
+          if (seq === checkSeq.current) setChecking(false);
+        }
+      })();
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [sql, connectionId, namespace, running]);
+
+  /// Ask the server for the execution plan. Plain `EXPLAIN`, never `ANALYZE`:
+  /// the latter really runs the statement, which would change data.
+  const analyse = useCallback(async () => {
+    setExplaining(true);
     setError(null);
-    setCheck(null);
+    setExplain(null);
     try {
-      const outcome = await api.checkSql({ connectionId, namespace, sql });
-      setCheck(outcome);
+      const outcome = await api.explainSql({ connectionId, namespace, sql });
+      setExplain(outcome);
       const failed = outcome.entries.filter((entry) => !entry.ok).length;
-      if (failed > 0) {
-        onLog("err", `语法检查发现 ${failed} 条语句有问题`);
-      } else {
-        onLog("ok", `语法检查通过（${outcome.entries.length} 条语句，${outcome.elapsedMs} ms）`);
-      }
+      onLog(
+        failed > 0 ? "err" : "ok",
+        failed > 0
+          ? `执行计划分析有 ${failed} 条语句失败`
+          : `已生成 ${outcome.entries.length} 条语句的执行计划（${outcome.elapsedMs} ms）`,
+      );
     } catch (err) {
       setError(errorMessage(err));
-      onLog("err", `语法检查失败: ${errorMessage(err)}`);
+      onLog("err", `分析失败: ${errorMessage(err)}`);
     } finally {
-      setChecking(false);
+      setExplaining(false);
     }
   }, [connectionId, namespace, sql, onLog]);
 
@@ -202,6 +246,25 @@ export function QueryView({
             </span>
           )}
           {dirty && <span className="badge purple">未保存</span>}
+          {checking && <span className="faint">检查中…</span>}
+          {!checking && check && check.entries.some((entry) => !entry.ok) && (
+            <span className="badge" style={{ color: "var(--red)" }}>
+              {check.entries.filter((entry) => !entry.ok).length} 处语法问题
+            </span>
+          )}
+          {!checking &&
+            check &&
+            check.entries.every((entry) => entry.ok) &&
+            check.entries.every((entry) => entry.checkable) && (
+              <span className="badge" style={{ color: "var(--green)" }}>
+                语法正确
+              </span>
+            )}
+          {!checking && checkFailed && (
+            <span className="faint" title="无法连接服务端进行校验">
+              未能检查
+            </span>
+          )}
           <div className="grow" />
           <button
             className="btn small"
@@ -212,11 +275,11 @@ export function QueryView({
           </button>
           <button
             className="btn small"
-            onClick={() => void validate()}
-            disabled={checking || running}
-            title="让服务端解析并校验，但不执行"
+            onClick={() => void analyse()}
+            disabled={explaining || running}
+            title="生成执行计划。使用 EXPLAIN 而非 EXPLAIN ANALYZE，因此不会真正执行语句"
           >
-            {checking ? "检查中…" : "检查语法"}
+            {explaining ? "分析中…" : "分析执行计划"}
           </button>
           <button className="btn primary small" onClick={() => void run()} disabled={running}>
             {running ? "执行中…" : "执行 (⌘↵)"}
@@ -278,31 +341,37 @@ export function QueryView({
         />
       )}
 
-      {check && (
+      {/* Only problems are shown; a correct query stays quiet. */}
+      {check && check.entries.some((entry) => !entry.ok) && (
         <div className="section" style={{ paddingTop: 0 }}>
-          {check.entries.every((entry) => entry.ok) ? (
-            <div className="warnbox" style={{ borderColor: "var(--green)", color: "var(--green)" }}>
-              语法检查通过：{check.entries.length} 条语句（{check.elapsedMs} ms）
-            </div>
-          ) : (
-            <div className="errbox">
-              {check.entries
-                .filter((entry) => !entry.ok)
-                .map((entry, index) => (
-                  <div key={index} style={{ marginBottom: 4 }}>
-                    <span className="mono">
-                      {entry.sql.replace(/\s+/g, " ").trim().slice(0, 80)}
-                    </span>
-                    <div style={{ marginTop: 2 }}>{entry.error}</div>
-                  </div>
-                ))}
-            </div>
-          )}
+          <div className="errbox">
+            {check.entries
+              .filter((entry) => !entry.ok)
+              .map((entry, index) => (
+                <div key={index} style={{ marginBottom: 6 }}>
+                  <span className="mono">
+                    {entry.sql.replace(/\s+/g, " ").trim().slice(0, 90)}
+                  </span>
+                  <div style={{ marginTop: 2 }}>{entry.error}</div>
+                </div>
+              ))}
+          </div>
           {check.entries.some((entry) => !entry.checkable) && (
             <div className="faint" style={{ marginTop: 6 }}>
               有语句无法预检（PostgreSQL 的 PREPARE 不支持该类型），只能直接执行确认。
             </div>
           )}
+        </div>
+      )}
+
+      {explain && (
+        <div style={{ overflow: "auto", flex: 1, padding: "0 12px 12px" }}>
+          <div className="faint" style={{ marginBottom: 6 }}>
+            执行计划（EXPLAIN，未真正执行语句）
+          </div>
+          {explain.entries.map((entry, index) => (
+            <ExplainPlan key={index} index={index} entry={entry} />
+          ))}
         </div>
       )}
 
@@ -318,6 +387,91 @@ export function QueryView({
         {result?.results.map((entry, index) => (
           <StatementResult key={index} index={index} entry={entry} />
         ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExplainPlan({ index, entry }: { index: number; entry: SqlExplainEntry }) {
+  return (
+    <div
+      style={{
+        border: `1px solid ${entry.ok ? "var(--border)" : "var(--red)"}`,
+        borderRadius: 7,
+        marginBottom: 10,
+        overflow: "hidden",
+      }}
+    >
+      <div
+        className="row"
+        style={{
+          padding: "6px 10px",
+          background: "var(--bg-subtle)",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <span className="faint">#{index + 1}</span>
+        <span
+          className="mono"
+          style={{
+            fontSize: 11,
+            maxWidth: 560,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {entry.sql.replace(/\s+/g, " ").trim()}
+        </span>
+      </div>
+
+      {!entry.supported && (
+        <div className="faint" style={{ padding: 10 }}>
+          该语句类型不支持生成执行计划。
+        </div>
+      )}
+      {entry.supported && !entry.ok && (
+        <div className="errbox" style={{ margin: 10 }}>
+          {entry.error}
+        </div>
+      )}
+      {entry.supported && entry.ok && (
+        <div style={{ maxHeight: 300, overflow: "auto" }}>
+          <table className="grid">
+            <thead>
+              <tr>
+                <th className="rowno">#</th>
+                {entry.columns.map((column) => (
+                  <th key={column.name} title={column.name}>
+                    <span>{column.name}</span>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {entry.rows.map((row, rowIndex) => (
+                <tr key={rowIndex}>
+                  <td className="rowno">{rowIndex + 1}</td>
+                  {row.map((cell, cellIndex) => (
+                    <td key={cellIndex} className={cell.text == null ? "null" : ""}>
+                      {cell.text ?? "NULL"}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+              {entry.rows.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={entry.columns.length + 1}
+                    style={{ textAlign: "center", color: "var(--text-faint)", height: 44 }}
+                  >
+                    没有计划内容
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

@@ -31,11 +31,20 @@ const DIALECT_KEYWORDS: Record<string, string[]> = {
   mysql: ["AUTO_INCREMENT", "ENGINE", "CHARSET", "COLLATE", "DUPLICATE", "SHOW", "DESCRIBE", "IGNORE"],
 };
 
-type TokenType = "plain" | "keyword" | "string" | "comment" | "number" | "function";
+type TokenType =
+  | "plain"
+  | "identifier"
+  | "keyword"
+  | "string"
+  | "comment"
+  | "number"
+  | "function";
 
 interface Token {
   text: string;
   type: TokenType;
+  /** Offset of the token's first character, for mapping the caret to a scope. */
+  start: number;
 }
 
 interface Scan {
@@ -52,15 +61,16 @@ export function scan(input: string, keywords: Set<string>): Scan {
   let bufferType: TokenType = "plain";
   let depth = 0;
 
+  let bufferStart = 0;
   const flush = () => {
     if (buffer) {
-      tokens.push({ text: buffer, type: bufferType });
+      tokens.push({ text: buffer, type: bufferType, start: bufferStart });
       buffer = "";
     }
   };
   const push = (text: string, type: TokenType) => {
     flush();
-    tokens.push({ text, type });
+    tokens.push({ text, type, start: index });
   };
 
   let index = 0;
@@ -146,11 +156,13 @@ export function scan(input: string, keywords: Set<string>): Scan {
       // A word followed by `(` reads as a function call, which colours better
       // than treating every name the same.
       const following = input.slice(cursor).match(/^\s*\(/);
+      // An identifier gets its own type: the alias resolver has to tell a name
+      // apart from punctuation, and `plain` covers both.
       const type: TokenType = keywords.has(upper)
         ? "keyword"
         : following
           ? "function"
-          : "plain";
+          : "identifier";
       push(word, type);
       index = cursor;
       continue;
@@ -163,6 +175,7 @@ export function scan(input: string, keywords: Set<string>): Scan {
         depth = 0;
       }
     }
+    if (buffer === "") bufferStart = index;
     bufferType = "plain";
     buffer += char;
     index += 1;
@@ -171,6 +184,165 @@ export function scan(input: string, keywords: Set<string>): Scan {
   if (depth > 0) issues.push(`有 ${depth} 个左括号 ( 没有闭合`);
 
   return { tokens, issues };
+}
+
+/**
+ * Resolve the table aliases visible at a position.
+ *
+ * Scopes follow parentheses: a subquery can read the aliases of the query it is
+ * nested in (that is how correlated references work), while two sibling
+ * subqueries cannot see each other's. A derived table contributes the names from
+ * its own select list, which is all a client can know without asking the server.
+ */
+export function visibleAliases(
+  tokens: Token[],
+  caret: number,
+  columnsByTable: Map<string, { column: string; dataType: string }[]>,
+): Map<string, { column: string; dataType: string }[]> {
+  // Plain runs are split into single characters so punctuation can be matched
+  // without caring how the tokenizer glued it together (`u) a, (` is one run).
+  const flat: Token[] = [];
+  for (const token of tokens) {
+    if (token.type === "plain" && token.text.length > 1) {
+      let offset = token.start;
+      for (const char of token.text) {
+        flat.push({ text: char, type: "plain", start: offset });
+        offset += char.length;
+      }
+    } else {
+      flat.push(token);
+    }
+  }
+
+  // A stack of scopes: `(` pushes, `)` pops. Index juggling would break as soon
+  // as scopes nest.
+  const scopes: Map<string, { column: string; dataType: string }[]>[] = [new Map()];
+  const current = () => scopes[scopes.length - 1];
+
+  const skip = (from: number): number => {
+    let index = from;
+    while (flat[index] && flat[index].type === "plain" && flat[index].text.trim() === "") {
+      index += 1;
+    }
+    return index;
+  };
+
+  /** An identifier, which may be schema-qualified. */
+  const identifier = (index: number): { name: string; next: number } | null => {
+    const token = flat[index];
+    if (!token || (token.type !== "identifier" && token.type !== "keyword")) return null;
+    const match = token.text.match(
+      /^[A-Za-z_$\u4e00-\u9fff][A-Za-z0-9_$.\u4e00-\u9fff]*/,
+    );
+    if (!match) return null;
+    return { name: match[0].replace(/\.$/, ""), next: index + 1 };
+  };
+
+  /** Columns a source exposes, and the alias it is known by. */
+  const parseSource = (
+    from: number,
+  ): {
+    names: string[];
+    columns: { column: string; dataType: string }[];
+    next: number;
+  } | null => {
+    let cursor = skip(from);
+    if (flat[cursor]?.text === "(") {
+      // A derived table: read its select list, then its alias.
+      let depth = 0;
+      let end = cursor;
+      for (; end < flat.length; end += 1) {
+        if (flat[end].text === "(") depth += 1;
+        else if (flat[end].text === ")") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+      const projection: { column: string; dataType: string }[] = [];
+      let inList = false;
+      for (let index = cursor + 1; index < end; index += 1) {
+        const token = flat[index];
+        if (token.type === "comment" || token.type === "string") continue;
+        const upper = token.text.toUpperCase();
+        if (upper === "SELECT") {
+          inList = true;
+          continue;
+        }
+        if (inList && (upper === "FROM" || upper === "WHERE")) break;
+        if (!inList) continue;
+        // Only names become columns; punctuation separates them.
+        if (token.type === "identifier" && !KEYWORDS.includes(upper)) {
+          // `u.id` in the subquery is the column `id` of the derived table.
+          const bare = token.text.split(".").pop() ?? token.text;
+          projection.push({ column: bare, dataType: "" });
+        }
+      }
+      cursor = skip(end + 1);
+      if (flat[cursor]?.text.toUpperCase() === "AS") cursor = skip(cursor + 1);
+      const alias = identifier(cursor);
+      if (!alias) return null;
+      return { names: [alias.name], columns: projection, next: alias.next };
+    }
+
+    const first = identifier(cursor);
+    if (!first) return null;
+    // A schema-qualified name is tried whole, then by its last segment: the
+    // catalog is keyed by table name alone.
+    const table = first.name.split(".").pop() ?? first.name;
+    const columns =
+      columnsByTable.get(first.name.toLowerCase()) ??
+      columnsByTable.get(table.toLowerCase()) ??
+      [];
+    cursor = skip(first.next);
+    if (flat[cursor]?.text.toUpperCase() === "AS") cursor = skip(cursor + 1);
+    const alias = identifier(cursor);
+    // A bare keyword after the table is not an alias.
+    if (alias && !KEYWORDS.includes(alias.name.toUpperCase())) {
+      // Both work as a qualifier, so both are registered.
+      return { names: [alias.name, table], columns, next: alias.next };
+    }
+    return { names: [first.name, table], columns, next: first.next };
+  };
+
+  for (let index = 0; index < flat.length; index += 1) {
+    const token = flat[index];
+    if (token.start >= caret) break;
+    if (token.type === "comment" || token.type === "string") continue;
+
+    if (token.type === "plain") {
+      if (token.text === "(") scopes.push(new Map());
+      else if (token.text === ")" && scopes.length > 1) scopes.pop();
+      continue;
+    }
+
+    const upper = token.text.toUpperCase();
+    if (upper !== "FROM" && upper !== "JOIN") continue;
+
+    // A FROM clause lists sources separated by commas, each with its own alias.
+    let cursor = index + 1;
+    while (true) {
+      const source = parseSource(cursor);
+      if (!source) break;
+      // A later source overrides an earlier one with the same name, which is
+      // what SQL scoping does too.
+      for (const name of new Set(source.names)) {
+        if (name) current().set(name.toLowerCase(), source.columns);
+      }
+      cursor = source.next;
+      const next = skip(cursor);
+      if (flat[next]?.text !== ",") break;
+      cursor = next + 1;
+    }
+    // Skip what this clause consumed; walking it again would count its
+    // parentheses twice.
+    index = cursor - 1;
+  }
+
+  const merged = new Map<string, { column: string; dataType: string }[]>();
+  for (const scope of scopes) {
+    for (const [alias, columns] of scope) merged.set(alias, columns);
+  }
+  return merged;
 }
 
 type Kind = "keyword" | "table" | "view" | "column" | "database";
@@ -267,6 +439,18 @@ export function SqlEditor({
 
   const { tokens, issues } = useMemo(() => scan(value, keywords), [value, keywords]);
 
+  /** Column lookup by table name, used to resolve an alias to its columns. */
+  const columnsByTable = useMemo(() => {
+    const map = new Map<string, { column: string; dataType: string }[]>();
+    for (const entry of catalog?.columns ?? []) {
+      const key = entry.table.toLowerCase();
+      const list = map.get(key) ?? [];
+      list.push({ column: entry.column, dataType: entry.dataType });
+      map.set(key, list);
+    }
+    return map;
+  }, [catalog]);
+
   const all = useMemo<Suggestion[]>(() => {
     const list: Suggestion[] = [...keywords].map((word) => ({
       insert: word,
@@ -319,9 +503,28 @@ export function SqlEditor({
       }
       const scope = dot >= 0 ? word.slice(0, dot) : null;
       const lowered = needle.toLowerCase();
-      const pool = scope
-        ? all.filter((item) => item.insert.toLowerCase().startsWith(`${scope.toLowerCase()}.`))
-        : all;
+      let pool = all;
+      if (scope) {
+        // A qualifier resolves through the aliases in scope at the caret, so
+        // `u.` works inside a subquery where `u` is the outer table's alias.
+        const aliases = visibleAliases(tokens, caret, columnsByTable);
+        const resolved =
+          aliases.get(scope.toLowerCase()) ??
+          columnsByTable.get(scope.toLowerCase()) ??
+          null;
+        if (resolved) {
+          pool = resolved.map((entry) => ({
+            insert: `${scope}.${entry.column}`,
+            label: entry.column,
+            kind: "column" as Kind,
+            detail: entry.dataType,
+          }));
+        } else {
+          pool = all.filter((item) =>
+            item.insert.toLowerCase().startsWith(`${scope.toLowerCase()}.`),
+          );
+        }
+      }
       const matches = pool
         .filter((item) => item.label.toLowerCase().startsWith(lowered))
         .sort((left, right) => left.label.length - right.label.length)
@@ -335,7 +538,7 @@ export function SqlEditor({
       setPrefix({ word, start });
       setAnchor(caretPosition(element, start, {}));
     },
-    [all, close],
+    [all, close, columnsByTable, tokens],
   );
 
   const accept = useCallback(

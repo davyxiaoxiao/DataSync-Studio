@@ -377,6 +377,21 @@ export interface SqlCheckResult {
   elapsedMs: number;
 }
 
+export interface SqlExplainEntry {
+  sql: string;
+  ok: boolean;
+  error?: string | null;
+  /** False for statement types the engine cannot explain. */
+  supported: boolean;
+  columns: SqlColumn[];
+  rows: Cell[][];
+}
+
+export interface SqlExplainResult {
+  entries: SqlExplainEntry[];
+  elapsedMs: number;
+}
+
 export interface SqlRunResult {
   results: SqlStatementResult[];
   elapsedMs: number;

@@ -27,6 +27,7 @@ import type {
   SavedQuery,
   SortSpec,
   SqlCheckResult,
+  SqlExplainResult,
   SqlRunResult,
   SyncRunResult,
   SyncSelection,
@@ -249,6 +250,10 @@ export const api = {
   /** Validate a script with the server without running it. */
   checkSql: (request: { connectionId: string; namespace: string; sql: string }) =>
     invoke<SqlCheckResult>("check_sql", { request }),
+
+  /** Execution plan for each statement, produced without running it. */
+  explainSql: (request: { connectionId: string; namespace: string; sql: string }) =>
+    invoke<SqlExplainResult>("explain_sql", { request }),
 
   /** Table / view / column / database names for editor completion. */
   completionCatalog: (connectionId: string, namespace: string) =>

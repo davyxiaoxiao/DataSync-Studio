@@ -411,23 +411,38 @@ pub async fn run_console(
     }
 }
 
-/// Whether a statement is expected to produce rows.
+fn leading_keyword(statement: &str) -> String {
+    statement
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '(')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+/// Whether a statement can be used as a subquery.
+///
+/// Only these may be wrapped to bound the row count; `EXPLAIN` and `SHOW`
+/// return rows but are not valid inside `FROM (...)`.
+fn is_query(statement: &str) -> bool {
+    matches!(
+        leading_keyword(statement).as_str(),
+        "SELECT" | "WITH" | "VALUES" | "TABLE"
+    )
+}
+
+/// Whether a statement produces rows at all, wrap-able or not.
 ///
 /// `describe` would answer this authoritatively, but it goes through sqlx's
 /// `Executor` trait, whose higher-ranked bounds the compiler cannot satisfy for
 /// a connection held across a loop. Classification by leading keyword is what
 /// SQL clients have always done and is predictable enough here.
 fn returns_rows(statement: &str) -> bool {
-    let first = statement
-        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '(')
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    matches!(
-        first.as_str(),
-        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "TABLE" | "VALUES"
-    )
+    is_query(statement)
+        || matches!(
+            leading_keyword(statement).as_str(),
+            "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+        )
 }
 
 /// Read a row-returning statement through a subquery, which bounds the row count
@@ -443,8 +458,14 @@ async fn run_one_mysql(
     limit: usize,
 ) -> ConsoleOutcome {
     if returns_rows(statement) {
-        let wrapped = wrap_for_reading(statement, limit);
-        let rows = match tx.fetch_all(sqlx::query(&wrapped)).await {
+        // A plain query is wrapped so its row count is bounded; a statement that
+        // merely returns rows is fetched as written.
+        let sql = if is_query(statement) {
+            wrap_for_reading(statement, limit)
+        } else {
+            statement.to_string()
+        };
+        let rows = match tx.fetch_all(sqlx::query(&sql)).await {
             Ok(rows) => rows,
             Err(error) => return ConsoleOutcome::Failed(error.to_string()),
         };
@@ -483,8 +504,12 @@ async fn run_one_postgres(
     limit: usize,
 ) -> ConsoleOutcome {
     if returns_rows(statement) {
-        let wrapped = wrap_for_reading(statement, limit);
-        let rows = match tx.fetch_all(sqlx::query(&wrapped)).await {
+        let sql = if is_query(statement) {
+            wrap_for_reading(statement, limit)
+        } else {
+            statement.to_string()
+        };
+        let rows = match tx.fetch_all(sqlx::query(&sql)).await {
             Ok(rows) => rows,
             Err(error) => return ConsoleOutcome::Failed(error.to_string()),
         };

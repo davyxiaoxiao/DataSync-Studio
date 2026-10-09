@@ -2556,6 +2556,134 @@ pub(crate) async fn check_sql_on(
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlExplainEntry {
+    pub sql: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    /// False for statement types the engine cannot explain.
+    pub supported: bool,
+    pub columns: Vec<SqlColumn>,
+    pub rows: Vec<Vec<crate::db::value::Cell>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlExplainResult {
+    pub entries: Vec<SqlExplainEntry>,
+    pub elapsed_ms: u64,
+}
+
+/// Whether the engine can produce a plan for this statement type.
+///
+/// Plain `EXPLAIN` is used, never `EXPLAIN ANALYZE`: the latter actually runs
+/// the statement, which for an `UPDATE` or `DELETE` would change data. A plan
+/// without execution still shows the indexes and join order, which is what the
+/// button is for.
+fn explainable(dialect: crate::dialect::Dialect, statement: &str) -> bool {
+    let first = statement
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '(')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    match dialect {
+        crate::dialect::Dialect::Postgres => matches!(
+            first.as_str(),
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "VALUES" | "TABLE" | "WITH" | "MERGE"
+        ),
+        crate::dialect::Dialect::Mysql => matches!(
+            first.as_str(),
+            "SELECT" | "DELETE" | "INSERT" | "REPLACE" | "UPDATE" | "TABLE"
+        ),
+    }
+}
+
+/// Produce the execution plan for each statement, without running it.
+#[tauri::command]
+pub async fn explain_sql(
+    state: State<'_, AppState>,
+    request: RunSqlRequest,
+) -> AppResult<SqlExplainResult> {
+    let pool = pool_for(&state, &request.connection_id).await?;
+    explain_sql_on(&pool, &request.namespace, &request.sql).await
+}
+
+/// Produce the plan for each statement, without executing any of them.
+pub(crate) async fn explain_sql_on(
+    pool: &Pool,
+    namespace: &str,
+    sql: &str,
+) -> AppResult<SqlExplainResult> {
+    let statements = split_statements(sql);
+    if statements.is_empty() {
+        return Err(AppError::msg("没有可分析的语句"));
+    }
+    let dialect = pool.dialect();
+    let started = Instant::now();
+
+    // Only the explainable statements go to the server; the others keep their
+    // position in the result so the mapping stays obvious.
+    let mut entries: Vec<SqlExplainEntry> = statements
+        .iter()
+        .map(|statement| SqlExplainEntry {
+            sql: statement.clone(),
+            ok: true,
+            error: None,
+            supported: explainable(dialect, statement),
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+        .collect();
+    let script: Vec<String> = statements
+        .iter()
+        .filter(|statement| explainable(dialect, statement))
+        .map(|statement| format!("EXPLAIN {}", statement.trim().trim_end_matches(';')))
+        .collect();
+
+    if !script.is_empty() {
+        let outcome = run_sql_with(
+            pool,
+            namespace,
+            &script.join(";\n"),
+            &ProgressReporter::inert(),
+        )
+        .await?;
+        let mut planned = outcome.results.into_iter();
+        for entry in entries.iter_mut() {
+            if !entry.supported {
+                continue;
+            }
+            match planned.next() {
+                Some(result) => {
+                    entry.ok = result.ok;
+                    entry.error = result.error;
+                    entry.columns = result
+                        .columns
+                        .iter()
+                        .map(|column| SqlColumn {
+                            name: column.name.clone(),
+                            data_type: column.data_type.clone(),
+                            kind: column.kind,
+                        })
+                        .collect();
+                    entry.rows = result.rows;
+                }
+                None => {
+                    entry.ok = false;
+                    entry.error = Some("没有取到执行计划".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(SqlExplainResult {
+        entries,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 /// Rows shown per statement before the console stops collecting.
 const SQL_CONSOLE_ROW_LIMIT: usize = 5_000;
 
@@ -2890,6 +3018,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         queries_directory,
         run_sql,
         check_sql,
+        explain_sql,
         completion_catalog,
     ]
 }
