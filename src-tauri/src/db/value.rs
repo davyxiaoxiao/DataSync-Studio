@@ -339,6 +339,18 @@ fn mysql_text(row: &MySqlRow, idx: usize) -> Result<Value, sqlx::Error> {
     if let Ok(value) = row.try_get::<String, _>(idx) {
         return Ok(Value::Str(value));
     }
+    // A numeric type that slipped past the mapping should render as its digits
+    // rather than as a placeholder: the value is right there, only the type was
+    // unexpected.
+    if let Ok(value) = row.try_get::<i64, _>(idx) {
+        return Ok(Value::Str(value.to_string()));
+    }
+    if let Ok(value) = row.try_get::<u64, _>(idx) {
+        return Ok(Value::Str(value.to_string()));
+    }
+    if let Ok(value) = row.try_get::<f64, _>(idx) {
+        return Ok(Value::Str(format!("{value}")));
+    }
     let bytes = row.try_get::<Vec<u8>, _>(idx)?;
     Ok(match String::from_utf8(bytes) {
         Ok(text) => Value::Str(text),

@@ -28,6 +28,7 @@ import type {
   SortSpec,
   SqlCheckResult,
   SqlExplainResult,
+  SqlPageResult,
   SqlRunResult,
   SyncRunResult,
   SyncSelection,
@@ -212,6 +213,15 @@ export const api = {
   countTableRows: (connectionId: string, namespace: string, table: string) =>
     invoke<number | null>("count_table_rows", { connectionId, namespace, table }),
 
+  /** Export an in-memory result set, e.g. the output of a query. */
+  exportRows: (request: {
+    path: string;
+    sheetName?: string | null;
+    columns: { name: string; header?: string | null; kind: string }[];
+    rows: (string | null)[][];
+    includeHeader?: boolean;
+  }) => invoke<ExportOutcome>("export_rows", { request }),
+
   exportExcel: (request: {
     connectionId: string;
     namespace: string;
@@ -246,6 +256,26 @@ export const api = {
   /** The folder the .sql files live in, for revealing it in the file manager. */
   queriesDirectory: (connectionId: string) =>
     invoke<string>("queries_directory", { connectionId }),
+
+  /** One page of a query's result set. */
+  runSqlPage: (request: {
+    connectionId: string;
+    namespace: string;
+    sql: string;
+    offset: number;
+    limit?: number;
+  }) => invoke<SqlPageResult>("run_sql_page", { request }),
+
+  /** Export a query's complete result, re-running it server-side in pages. */
+  exportQuery: (request: {
+    connectionId: string;
+    namespace: string;
+    sql: string;
+    path: string;
+    columns: { column: string; header?: string | null }[];
+    options?: { sheetName?: string | null; maxRows?: number | null; includeHeader?: boolean };
+    jobId?: string;
+  }) => invoke<ExportOutcome>("export_query", { request }),
 
   /** Validate a script with the server without running it. */
   checkSql: (request: { connectionId: string; namespace: string; sql: string }) =>

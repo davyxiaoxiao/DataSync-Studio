@@ -26,7 +26,9 @@ use crate::db::{open_pool, Pool, StatementOutcome, StatementRun};
 use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::excel::{self, ExcelSheetPreview};
-use crate::excel_export::{self, ExportColumn, ExportOptions, ExportOutcome};
+use crate::excel_export::{
+    self, ExportColumn, ExportOptions, ExportOutcome, ExportRowsRequest,
+};
 use crate::queries::{self, SavedQuery};
 use crate::jobs::ProgressReporter;
 use crate::schema::model::foreign_key_covered_by;
@@ -2155,6 +2157,59 @@ pub async fn count_table_rows(
         .and_then(|text| text.parse::<u64>().ok()))
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportQueryRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub sql: String,
+    pub path: String,
+    #[serde(default)]
+    pub columns: Vec<ExportColumn>,
+    #[serde(default)]
+    pub options: Option<ExportOptions>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+/// Export a query's complete result.
+///
+/// The query is re-run server-side and paged straight into the workbook, so the
+/// file is not limited to what the console had loaded.
+#[tauri::command]
+pub async fn export_query(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: ExportQueryRequest,
+) -> AppResult<ExportOutcome> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let default_options = ExportOptions {
+        sheet_name: None,
+        max_rows: None,
+        include_header: true,
+    };
+    let outcome = excel_export::export_query(
+        &pool,
+        &request.namespace,
+        &request.sql,
+        &request.columns,
+        request.options.as_ref().unwrap_or(&default_options),
+        &request.path,
+        &reporter,
+    )
+    .await;
+    end_job(&state, job);
+    reporter.finish("done", "导出完成", "导出结束");
+    outcome
+}
+
+/// Export an in-memory result set, such as the output of a query.
+#[tauri::command]
+pub async fn export_rows(request: ExportRowsRequest) -> AppResult<ExportOutcome> {
+    excel_export::export_rows(&request).await
+}
+
 #[tauri::command]
 pub async fn export_excel(
     app: tauri::AppHandle,
@@ -2396,6 +2451,8 @@ pub struct SqlStatementResult {
     pub rows: Vec<Vec<crate::db::value::Cell>>,
     /// True when the console stopped before finishing the script.
     pub truncated: bool,
+    /// True when the statement has more rows than this page holds.
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2558,6 +2615,68 @@ pub(crate) async fn check_sql_on(
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SqlPageResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub columns: Vec<SqlColumn>,
+    pub rows: Vec<Vec<crate::db::value::Cell>>,
+    pub has_more: bool,
+    pub elapsed_ms: u64,
+}
+
+/// Read one page of a query's result set.
+#[tauri::command]
+pub async fn run_sql_page(
+    state: State<'_, AppState>,
+    request: SqlPageRequest,
+) -> AppResult<SqlPageResult> {
+    let started = Instant::now();
+    let pool = pool_for(&state, &request.connection_id).await?;
+    let limit = request.limit.unwrap_or(SQL_CONSOLE_PAGE_SIZE as u64);
+    let limit = limit.clamp(1, SQL_CONSOLE_PAGE_SIZE as u64) as usize;
+    let page = crate::db::run_query_page(
+        &pool,
+        &request.namespace,
+        &request.sql,
+        request.offset,
+        limit,
+    )
+    .await?;
+    Ok(SqlPageResult {
+        ok: true,
+        error: None,
+        columns: page
+            .columns
+            .iter()
+            .map(|column| SqlColumn {
+                name: column.name.clone(),
+                data_type: column.type_name.clone(),
+                kind: column.kind,
+            })
+            .collect(),
+        rows: page
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|value| value.to_cell()).collect())
+            .collect(),
+        has_more: page.has_more,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlPageRequest {
+    pub connection_id: String,
+    pub namespace: String,
+    pub sql: String,
+    pub offset: u64,
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SqlExplainEntry {
     pub sql: String,
     pub ok: bool,
@@ -2685,7 +2804,11 @@ pub(crate) async fn explain_sql_on(
 }
 
 /// Rows shown per statement before the console stops collecting.
-const SQL_CONSOLE_ROW_LIMIT: usize = 5_000;
+/// Rows the console puts on one page of a result set.
+///
+/// The export does not use this: it pages on its own and writes the complete
+/// result, however large.
+pub const SQL_CONSOLE_PAGE_SIZE: usize = 1_000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2758,7 +2881,7 @@ pub(crate) async fn run_sql_with(
         pool,
         namespace,
         &statements,
-        SQL_CONSOLE_ROW_LIMIT + 1,
+        SQL_CONSOLE_PAGE_SIZE + 1,
         reporter,
     )
     .await?;
@@ -2774,6 +2897,7 @@ pub(crate) async fn run_sql_with(
             columns: Vec::new(),
             rows: Vec::new(),
             truncated: false,
+            has_more: false,
         };
         match outcome {
             crate::db::ConsoleOutcome::Rows(result) => {
@@ -2787,9 +2911,10 @@ pub(crate) async fn run_sql_with(
                     })
                     .collect();
                 let mut rows = result.rows;
-                if rows.len() > SQL_CONSOLE_ROW_LIMIT {
-                    rows.truncate(SQL_CONSOLE_ROW_LIMIT);
-                    entry.truncated = true;
+                // One row past the page size only signals that more exist.
+                if rows.len() > SQL_CONSOLE_PAGE_SIZE {
+                    rows.truncate(SQL_CONSOLE_PAGE_SIZE);
+                    entry.has_more = true;
                 }
                 entry.rows = rows
                     .into_iter()
@@ -3008,6 +3133,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         update_table_cell,
         count_table_rows,
         export_excel,
+        export_rows,
+        export_query,
         list_queries,
         create_query,
         read_query,
@@ -3018,6 +3145,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         queries_directory,
         run_sql,
         check_sql,
+        run_sql_page,
         explain_sql,
         completion_catalog,
     ]

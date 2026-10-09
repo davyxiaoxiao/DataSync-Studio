@@ -8,6 +8,7 @@
 use std::time::Instant;
 
 use rust_xlsxwriter::Workbook;
+use sqlx::{Executor, Row};
 use serde::{Deserialize, Serialize};
 
 use crate::data::stream::{StreamPlan, TableStream};
@@ -181,6 +182,362 @@ fn format_decimal_round_trips(text: &str, parsed: f64) -> bool {
         trimmed.trim_end_matches('0').trim_end_matches('.').to_string()
     };
     normalize(&rendered) == normalize(text)
+}
+
+/// One column of an in-memory result set being exported.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRowColumn {
+    pub name: String,
+    #[serde(default)]
+    pub header: Option<String>,
+    /// The kind the console decoded the column as, so numbers stay numeric.
+    pub kind: ColumnKind,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRowsRequest {
+    pub path: String,
+    #[serde(default)]
+    pub sheet_name: Option<String>,
+    pub columns: Vec<ExportRowColumn>,
+    /// Cell text per row; `None` is NULL.
+    pub rows: Vec<Vec<Option<String>>>,
+    #[serde(default = "default_true")]
+    pub include_header: bool,
+}
+
+/// Write an in-memory result set to a workbook.
+///
+/// Used for query results, which exist only in the console and cannot be read
+/// back from a table. The values arrive as text with the column's kind, so a
+/// number is still written as a numeric cell.
+pub async fn export_rows(request: &ExportRowsRequest) -> AppResult<ExportOutcome> {
+    let started = Instant::now();
+    if request.columns.is_empty() {
+        return Err(AppError::msg("请至少选择一列"));
+    }
+    let name = sheet_name(request.sheet_name.as_deref(), "查询结果");
+
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet
+        .set_name(&name)
+        .map_err(|error| AppError::msg(format!("工作表名 {name} 不可用：{error}")))?;
+
+    let mut row: u32 = 0;
+    if request.include_header {
+        for (position, column) in request.columns.iter().enumerate() {
+            let header = column
+                .header
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .unwrap_or(&column.name);
+            sheet
+                .write_string(row, position as u16, header)
+                .map_err(|error| AppError::msg(format!("写入表头失败：{error}")))?;
+        }
+        row += 1;
+    }
+
+    for values in &request.rows {
+        for (position, column) in request.columns.iter().enumerate() {
+            let cell = match values.get(position).and_then(|value| value.as_deref()) {
+                None => Cell::Empty,
+                Some(text) => cell_from_text(text, column.kind),
+            };
+            let column_index = position as u16;
+            let result = match cell {
+                Cell::Empty => Ok(()),
+                Cell::Text(text) => sheet.write_string(row, column_index, &text).map(|_| ()),
+                Cell::Number(number) => sheet.write_number(row, column_index, number).map(|_| ()),
+                Cell::Boolean(flag) => sheet.write_boolean(row, column_index, flag).map(|_| ()),
+            };
+            result.map_err(|error| {
+                AppError::msg(format!("写入第 {} 行失败：{error}", row + 1))
+            })?;
+        }
+        row += 1;
+    }
+
+    let path = request.path.clone();
+    let save_path = path.clone();
+    tokio::task::spawn_blocking(move || workbook.save(&save_path))
+        .await
+        .map_err(|error| AppError::msg(format!("保存失败：{error}")))?
+        .map_err(|error| AppError::msg(format!("保存 {path} 失败：{error}")))?;
+
+    Ok(ExportOutcome {
+        rows: request.rows.len() as u64,
+        columns: request.columns.len(),
+        path,
+        sheet: name,
+        truncated: false,
+        cancelled: false,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        warnings: Vec::new(),
+    })
+}
+
+/// Rebuild a cell from the console's text plus the column's kind.
+///
+/// A value that does not parse as its declared kind is written as text rather
+/// than dropped: showing it is always better than showing nothing.
+fn cell_from_text(text: &str, kind: ColumnKind) -> Cell {
+    match kind {
+        ColumnKind::Int | ColumnKind::Uint => match text.parse::<i64>() {
+            Ok(number) => Cell::Number(number as f64),
+            Err(_) => match text.parse::<u64>() {
+                Ok(number) => Cell::Number(number as f64),
+                Err(_) => Cell::Text(text.to_string()),
+            },
+        },
+        ColumnKind::Float | ColumnKind::Decimal => match text.parse::<f64>() {
+            Ok(number) if number.is_finite() => Cell::Number(number),
+            _ => Cell::Text(text.to_string()),
+        },
+        ColumnKind::Bool => match text {
+            "1" | "true" | "TRUE" | "t" => Cell::Boolean(true),
+            "0" | "false" | "FALSE" | "f" => Cell::Boolean(false),
+            _ => Cell::Text(text.to_string()),
+        },
+        _ => Cell::Text(text.to_string()),
+    }
+}
+
+/// Map the requested column names onto positions in the result set.
+fn resolve_query_columns(
+    metas: &[crate::db::DescribedColumn],
+    columns: &[ExportColumn],
+) -> AppResult<Vec<(usize, String)>> {
+    if columns.is_empty() {
+        return Ok(metas
+            .iter()
+            .enumerate()
+            .map(|(index, meta)| (index, meta.name.clone()))
+            .collect());
+    }
+    let mut resolved = Vec::with_capacity(columns.len());
+    for column in columns {
+        // The caller usually passes the result metadata's own spelling, but
+        // tolerating quotes and case differences costs nothing and avoids an
+        // export failing over how a name was written.
+        let wanted = column.column.trim().trim_matches(['"', '`', '[', ']']);
+        let index = metas
+            .iter()
+            .position(|meta| meta.name.eq_ignore_ascii_case(wanted))
+            .or_else(|| metas.iter().position(|meta| meta.name == column.column))
+            .ok_or_else(|| AppError::msg(format!("查询结果里没有 {} 这一列", column.column)))?;
+        let header = column
+            .header
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or(&column.column)
+            .to_string();
+        resolved.push((index, header));
+    }
+    Ok(resolved)
+}
+
+/// Export the result of a query, streaming straight into the workbook.
+///
+/// The console only keeps the first few thousand rows, so the export does not
+/// use what is on screen: it re-runs the query in pages and writes each page as
+/// it arrives. That is the only way an export can be larger than the console's
+/// own limit, and it is also why the file reflects the data as of the export
+/// rather than as of the last run.
+pub async fn export_query(
+    pool: &Pool,
+    namespace: &str,
+    sql: &str,
+    columns: &[ExportColumn],
+    options: &ExportOptions,
+    path: &str,
+    reporter: &ProgressReporter,
+) -> AppResult<ExportOutcome> {
+    use crate::db::{decode_mysql_row_lenient, decode_pg_row_lenient, describe_mysql, describe_pg};
+
+    let started = Instant::now();
+    let inner = sql.trim().trim_end_matches(';');
+    if inner.is_empty() {
+        return Err(AppError::msg("没有可导出的语句"));
+    }
+    let cap = options.max_rows.unwrap_or(MAX_ROWS).min(MAX_ROWS);
+    if cap == 0 {
+        return Err(AppError::msg("导出行数上限为 0"));
+    }
+    let requested = sheet_name(options.sheet_name.as_deref(), "查询结果");
+    let page_size: usize = 1_000;
+
+    let mut workbook = Workbook::new();
+    let sheet = workbook.add_worksheet();
+    sheet
+        .set_name(&requested)
+        .map_err(|error| AppError::msg(format!("工作表名 {requested} 不可用：{error}")))?;
+
+    let mut written: u64 = 0;
+    let mut row_index: u32 = 0;
+    let mut truncated = false;
+    let mut cancelled = false;
+    let mut warnings: Vec<String> = Vec::new();
+
+    // The two engines need their own decode path, and a reborrowed connection
+    // cannot satisfy sqlx's `Executor` bounds across an await, so the paging
+    // loop is written once and instantiated per engine — the same shape the
+    // console uses.
+    macro_rules! pump {
+        ($tx:expr, $describe:ident, $decode:ident) => {{
+            let mut offset: u64 = 0;
+            let mut kinds: Vec<ColumnKind> = Vec::new();
+            let mut resolved: Vec<(usize, String)> = Vec::new();
+            let mut head_written = false;
+            loop {
+                if reporter.is_cancelled() {
+                    cancelled = true;
+                    break;
+                }
+                let remaining = cap.saturating_sub(written);
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let limit = (remaining as usize).min(page_size).max(1);
+                let mut wrapped =
+                    format!("SELECT * FROM ({inner}) AS datasync_export LIMIT {limit}");
+                if offset > 0 {
+                    wrapped.push_str(&format!(" OFFSET {offset}"));
+                }
+                let rows = match $tx.fetch_all(sqlx::query(&wrapped)).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        return Err(AppError::msg(format!("读取查询结果失败：{error}")))
+                    }
+                };
+                if rows.is_empty() {
+                    break;
+                }
+                if !head_written {
+                    // Column types come from the result metadata, never from the
+                    // values themselves.
+                    let metas = $describe(rows[0].columns());
+                    kinds = metas.iter().map(|meta| meta.kind).collect();
+                    resolved = resolve_query_columns(&metas, columns)?;
+                    if options.include_header {
+                        for (position, (_, header)) in resolved.iter().enumerate() {
+                            sheet
+                                .write_string(0, position as u16, header)
+                                .map_err(|error| {
+                                    AppError::msg(format!("写入表头失败：{error}"))
+                                })?;
+                        }
+                        row_index = 1;
+                    }
+                    head_written = true;
+                }
+                let fetched = rows.len();
+                for row in rows.iter() {
+                    let values = $decode(row, &kinds);
+                    for (position, (index, _)) in resolved.iter().enumerate() {
+                        let cell = values.get(*index).map(cell_of).unwrap_or(Cell::Empty);
+                        let result = match cell {
+                            Cell::Empty => Ok(()),
+                            Cell::Text(text) => {
+                                sheet.write_string(row_index, position as u16, &text).map(|_| ())
+                            }
+                            Cell::Number(number) => sheet
+                                .write_number(row_index, position as u16, number)
+                                .map(|_| ()),
+                            Cell::Boolean(flag) => sheet
+                                .write_boolean(row_index, position as u16, flag)
+                                .map(|_| ()),
+                        };
+                        result.map_err(|error| {
+                            AppError::msg(format!("写入第 {} 行失败：{error}", row_index + 1))
+                        })?;
+                    }
+                    row_index += 1;
+                    written += 1;
+                    if written >= cap {
+                        truncated = true;
+                        break;
+                    }
+                }
+                if truncated {
+                    break;
+                }
+                offset += fetched as u64;
+                reporter.tick(
+                    "export",
+                    "导出查询结果",
+                    written,
+                    None,
+                    format!("已写入 {written} 行"),
+                );
+                if fetched < limit {
+                    break;
+                }
+            }
+        }};
+    }
+
+    match pool {
+        Pool::MySql(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let use_db = format!("USE {}", Dialect::Mysql.quote(namespace));
+                tx.execute(sqlx::raw_sql(&use_db))
+                    .await
+                    .map_err(|error| format!("切换到 {namespace} 失败: {error}"))
+                    .map_err(AppError::msg)?;
+            }
+            pump!(tx, describe_mysql, decode_mysql_row_lenient);
+            // Read-only: nothing here should be committed.
+            let _ = tx.rollback().await;
+        }
+        Pool::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let path_sql = format!(
+                    "SET LOCAL search_path TO {}",
+                    Dialect::Postgres.quote(namespace)
+                );
+                tx.execute(sqlx::raw_sql(&path_sql))
+                    .await
+                    .map_err(|error| format!("切换到 {namespace} 失败: {error}"))
+                    .map_err(AppError::msg)?;
+            }
+            pump!(tx, describe_pg, decode_pg_row_lenient);
+            let _ = tx.rollback().await;
+        }
+    }
+
+    if written == 0 {
+        warnings.push("查询没有返回任何行".to_string());
+    }
+    if truncated {
+        warnings.push(format!("已达到 {cap} 行的上限，其余行未导出"));
+    }
+
+    let save_path = path.to_string();
+    let path_text = path.to_string();
+    tokio::task::spawn_blocking(move || workbook.save(&save_path))
+        .await
+        .map_err(|error| AppError::msg(format!("保存失败：{error}")))?
+        .map_err(|error| AppError::msg(format!("保存 {path_text} 失败：{error}")))?;
+
+    Ok(ExportOutcome {
+        rows: written,
+        columns: columns.len(),
+        path: path.to_string(),
+        sheet: requested,
+        truncated,
+        cancelled,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        warnings,
+    })
 }
 
 /// Where pages of rows come from.

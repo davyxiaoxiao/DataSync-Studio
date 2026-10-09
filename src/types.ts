@@ -362,6 +362,17 @@ export interface SqlStatementResult {
   rows: Cell[][];
   /** True when the console stopped collecting rows. */
   truncated: boolean;
+  /** True when the statement returned more rows than this page holds. */
+  hasMore: boolean;
+}
+
+export interface SqlPageResult {
+  ok: boolean;
+  error?: string | null;
+  columns: SqlColumn[];
+  rows: Cell[][];
+  hasMore: boolean;
+  elapsedMs: number;
 }
 
 export interface SqlCheckEntry {

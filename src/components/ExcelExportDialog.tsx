@@ -2,12 +2,36 @@ import { useEffect, useMemo, useState } from "react";
 import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { api, errorMessage } from "../api";
 import { useJobProgress } from "../jobs";
-import type { ColumnInfo, ExportOutcome } from "../types";
+import type { Cell, ColumnInfo, ExportOutcome } from "../types";
 import type { TableRef } from "./Sidebar";
 import { IconWarn } from "./Icons";
 
+/**
+ * What is being exported.
+ *
+ * A query result is exported by re-running the query server-side, because the
+ * console only holds one page of it; the rest of the flow is identical.
+ */
+export type ExportSource =
+  | { kind: "table"; target: TableRef }
+  | {
+      kind: "query";
+      title: string;
+      connectionId: string;
+      namespace: string;
+      sql: string;
+      columns: { name: string; dataType: string }[];
+    }
+  | {
+      kind: "rows";
+      title: string;
+      namespace: string;
+      columns: { name: string; dataType: string }[];
+      rows: Cell[][];
+    };
+
 interface Props {
-  target: TableRef;
+  source: ExportSource;
   onClose: () => void;
   onLog: (level: "info" | "ok" | "warn" | "err", message: string) => void;
 }
@@ -31,13 +55,18 @@ const MAX_ROWS = 1_048_576;
  * The order of the rows in this dialog is the order of the columns in the sheet,
  * which is why they can be moved rather than only ticked.
  */
-export function ExcelExportDialog({ target, onClose, onLog }: Props) {
+export function ExcelExportDialog({ source, onClose, onLog }: Props) {
+  // The three sources agree on the fields that matter, so the form only has to
+  // know how to load the column list and how to export.
+  const title = source.kind === "table" ? source.target.table : source.title;
+  const namespace =
+    source.kind === "table" ? source.target.namespace : source.namespace;
   const job = useJobProgress();
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [total, setTotal] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [sheetName, setSheetName] = useState(target.table);
+  const [sheetName, setSheetName] = useState(title);
   const [maxRows, setMaxRows] = useState("");
   const [includeHeader, setIncludeHeader] = useState(true);
   const [path, setPath] = useState<string | null>(null);
@@ -48,10 +77,26 @@ export function ExcelExportDialog({ target, onClose, onLog }: Props) {
     let cancelled = false;
     void (async () => {
       try {
+        if (source.kind !== "table") {
+          // The column list is already known: from the result set itself.
+          setRows(
+            source.columns.map((column) => ({
+              key: `col-${++seq}`,
+              column: column.name,
+              dataType: column.dataType,
+              selected: true,
+              header: column.name,
+            })),
+          );
+          // A query's row count is unknown without running it, and running it
+          // just to count would cost as much as the export.
+          setTotal(source.kind === "rows" ? source.rows.length : null);
+          return;
+        }
         const structure = await api.getTableStructure(
-          target.connectionId,
-          target.namespace,
-          target.table,
+          source.target.connectionId,
+          source.target.namespace,
+          source.target.table,
         );
         if (cancelled) return;
         setRows(
@@ -66,9 +111,9 @@ export function ExcelExportDialog({ target, onClose, onLog }: Props) {
         // The count is advisory: knowing there are two million rows before
         // starting is the difference between patience and a surprise.
         const count = await api.countTableRows(
-          target.connectionId,
-          target.namespace,
-          target.table,
+          source.target.connectionId,
+          source.target.namespace,
+          source.target.table,
         );
         if (!cancelled) setTotal(count);
       } catch (err) {
@@ -80,7 +125,8 @@ export function ExcelExportDialog({ target, onClose, onLog }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [target.connectionId, target.namespace, target.table]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const selected = useMemo(() => rows.filter((row) => row.selected), [rows]);
 
@@ -113,7 +159,7 @@ export function ExcelExportDialog({ target, onClose, onLog }: Props) {
   const pickPath = async () => {
     try {
       const chosen = await saveFileDialog({
-        defaultPath: `${target.table}.xlsx`,
+        defaultPath: `${title}.xlsx`,
         filters: [{ name: "Excel 工作簿", extensions: ["xlsx"] }],
       });
       if (typeof chosen === "string") setPath(chosen);
@@ -134,28 +180,61 @@ export function ExcelExportDialog({ target, onClose, onLog }: Props) {
     setOutcome(null);
     const jobId = job.begin();
     try {
-      const result = await api.exportExcel({
-        connectionId: target.connectionId,
-        namespace: target.namespace,
-        table: target.table,
-        path: destination,
-        columns: selected.map((row) => ({
-          column: row.column,
-          header: row.header.trim() === "" ? null : row.header.trim(),
-        })),
-        options: {
-          sheetName: sheetName.trim() === "" ? null : sheetName.trim(),
-          maxRows: parsedMax && parsedMax > 0 ? parsedMax : null,
-          includeHeader,
-        },
-        jobId,
-      });
+      const headers = selected.map((row) => ({
+        column: row.column,
+        header: row.header.trim() === "" ? null : row.header.trim(),
+      }));
+      const options = {
+        sheetName: sheetName.trim() === "" ? null : sheetName.trim(),
+        maxRows: parsedMax && parsedMax > 0 ? parsedMax : null,
+        includeHeader,
+      };
+      const result =
+        source.kind === "table"
+          ? await api.exportExcel({
+              connectionId: source.target.connectionId,
+              namespace: source.target.namespace,
+              table: source.target.table,
+              path: destination,
+              columns: headers,
+              options,
+              jobId,
+            })
+          : source.kind === "query"
+            ? await api.exportQuery({
+                connectionId: source.connectionId,
+                namespace: source.namespace,
+                sql: source.sql,
+                path: destination,
+                columns: headers,
+                options,
+                jobId,
+              })
+            : await api.exportRows({
+                path: destination,
+                sheetName: options.sheetName,
+                columns: selected.map((row) => ({
+                  name: row.column,
+                  kind:
+                    source.columns.find((column) => column.name === row.column)?.dataType ?? "",
+                  header: row.header.trim() === "" ? null : row.header.trim(),
+                })),
+                rows: (parsedMax && parsedMax > 0
+                  ? source.rows.slice(0, parsedMax)
+                  : source.rows
+                ).map((row) =>
+                  selected.map((chosen) => {
+                    const index = source.columns.findIndex(
+                      (column) => column.name === chosen.column,
+                    );
+                    return index >= 0 ? (row[index]?.text ?? null) : null;
+                  }),
+                ),
+                includeHeader,
+              });
       setOutcome(result);
       for (const warning of result.warnings ?? []) onLog("warn", warning);
-      onLog(
-        "ok",
-        `已导出 ${target.namespace}.${target.table} 共 ${result.rows} 行到 ${result.path}`,
-      );
+      onLog("ok", `已导出 ${namespace}.${title} 共 ${result.rows} 行到 ${result.path}`);
     } catch (err) {
       setError(errorMessage(err));
       onLog("err", `导出失败: ${errorMessage(err)}`);
@@ -173,8 +252,8 @@ export function ExcelExportDialog({ target, onClose, onLog }: Props) {
       <div className="modal" style={{ width: 880, height: "80vh" }}>
         <div className="modal-head">
           <span>
-            导出 Excel · <span className="mono">{target.table}</span>{" "}
-            <span className="badge accent">{target.namespace}</span>
+            导出 Excel · <span className="mono">{title}</span>{" "}
+            <span className="badge accent">{namespace}</span>
           </span>
           <button className="icon-btn" onClick={onClose} title="关闭">
             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6">

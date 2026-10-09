@@ -13,10 +13,8 @@ use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::jobs::ProgressReporter;
 use crate::store::ConnectionConfig;
-use value::{
-    decode_mysql_row, decode_mysql_row_lenient, decode_pg_row, decode_pg_row_lenient,
-    ColumnKind, Value,
-};
+pub use value::{decode_mysql_row_lenient, decode_pg_row_lenient};
+use value::{decode_mysql_row, decode_pg_row, ColumnKind, Value};
 
 #[derive(Clone)]
 pub enum Pool {
@@ -351,6 +349,97 @@ pub enum ConsoleOutcome {
     Failed(String),
 }
 
+/// One page of a query's result.
+pub struct QueryPage {
+    pub columns: Vec<DescribedColumn>,
+    pub rows: Vec<Vec<Value>>,
+    /// True when another page follows.
+    pub has_more: bool,
+}
+
+/// Read one page of a query.
+///
+/// The console shows results a page at a time rather than holding the whole
+/// result set, so a query that returns a million rows stays responsive and the
+/// export — which pages on its own — is what produces the complete file.
+pub async fn run_query_page(
+    pool: &Pool,
+    namespace: &str,
+    statement: &str,
+    offset: u64,
+    limit: usize,
+) -> AppResult<QueryPage> {
+    let inner = statement.trim().trim_end_matches(';');
+    if inner.is_empty() {
+        return Err(AppError::msg("没有可执行的语句"));
+    }
+    if !is_query(inner) {
+        return Err(AppError::msg("只有查询语句可以分页读取"));
+    }
+    // One extra row tells us whether a further page exists without a count.
+    let mut wrapped = format!(
+        "SELECT * FROM ({inner}) AS datasync_page LIMIT {}",
+        limit + 1
+    );
+    if offset > 0 {
+        wrapped.push_str(&format!(" OFFSET {offset}"));
+    }
+
+    macro_rules! read {
+        ($tx:expr, $describe:ident, $decode:ident) => {{
+            let rows = $tx
+                .fetch_all(sqlx::query(&wrapped))
+                .await
+                .map_err(|error| AppError::msg(format!("读取结果集失败: {error}")))?;
+            let metas = match rows.first() {
+                Some(row) => $describe(row.columns()),
+                None => Vec::new(),
+            };
+            let kinds: Vec<ColumnKind> = metas.iter().map(|meta| meta.kind).collect();
+            let has_more = rows.len() > limit;
+            QueryPage {
+                columns: metas,
+                rows: rows
+                    .iter()
+                    .take(limit)
+                    .map(|row| $decode(row, &kinds))
+                    .collect(),
+                has_more,
+            }
+        }};
+    }
+
+    match pool {
+        Pool::MySql(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let use_db = format!("USE {}", Dialect::Mysql.quote(namespace));
+                tx.execute(sqlx::raw_sql(&use_db))
+                    .await
+                    .map_err(|error| AppError::msg(format!("切换到 {namespace} 失败: {error}")))?;
+            }
+            let page = read!(tx, describe_mysql, decode_mysql_row_lenient);
+            let _ = tx.rollback().await;
+            Ok(page)
+        }
+        Pool::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let path = format!(
+                    "SET LOCAL search_path TO {}",
+                    Dialect::Postgres.quote(namespace)
+                );
+                tx.execute(sqlx::raw_sql(&path))
+                    .await
+                    .map_err(|error| AppError::msg(format!("切换到 {namespace} 失败: {error}")))?;
+            }
+            let page = read!(tx, describe_pg, decode_pg_row_lenient);
+            let _ = tx.rollback().await;
+            Ok(page)
+        }
+    }
+}
+
 /// Run a user script.
 ///
 /// Everything runs inside one transaction on one connection. That is what makes
@@ -539,11 +628,27 @@ async fn run_one_postgres(
 /// differ from the spellings `information_schema` uses, so this cannot reuse the
 /// introspected-type mapping.
 fn mysql_column_kind(type_name: &str) -> ColumnKind {
-    match type_name.to_ascii_uppercase().as_str() {
-        // The signedness flag sqlx carries is crate-private, but the integer
-        // decoder already falls back from i64 to u64 to f64, so `Int` covers
-        // both.
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" => ColumnKind::Int,
+    // The driver reports modifiers as part of the name (`BIGINT UNSIGNED`), and
+    // the signedness flag it carries is crate-private, so the suffix is what
+    // tells the two apart.
+    let upper = type_name.to_ascii_uppercase();
+    let unsigned = upper.contains("UNSIGNED");
+    let base = upper
+        .replace("UNSIGNED", "")
+        .replace("ZEROFILL", "")
+        .trim()
+        .to_string();
+
+    match base.as_str() {
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" => {
+            if unsigned {
+                ColumnKind::Uint
+            } else {
+                // The decoder also falls back from i64 to u64 to f64, so this is
+                // safe even when the server disagrees about signedness.
+                ColumnKind::Int
+            }
+        }
         "FLOAT" | "DOUBLE" => ColumnKind::Float,
         "DECIMAL" | "NEWDECIMAL" => ColumnKind::Decimal,
         "DATE" => ColumnKind::Date,
@@ -561,7 +666,7 @@ fn mysql_column_kind(type_name: &str) -> ColumnKind {
     }
 }
 
-fn describe_mysql(columns: &[sqlx::mysql::MySqlColumn]) -> Vec<DescribedColumn> {
+pub(crate) fn describe_mysql(columns: &[sqlx::mysql::MySqlColumn]) -> Vec<DescribedColumn> {
     use sqlx::{Column, TypeInfo};
     columns
         .iter()
@@ -599,7 +704,7 @@ fn pg_column_kind(type_name: &str) -> ColumnKind {
     }
 }
 
-fn describe_pg(columns: &[sqlx::postgres::PgColumn]) -> Vec<DescribedColumn> {
+pub(crate) fn describe_pg(columns: &[sqlx::postgres::PgColumn]) -> Vec<DescribedColumn> {
     use sqlx::{Column, TypeInfo};
     columns
         .iter()
@@ -755,4 +860,57 @@ impl Registry {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mysql_type_names_with_modifiers_map_to_their_family() {
+        // The driver reports modifiers inside the type name, which is the only
+        // way to see them: the flags it carries are crate-private.
+        assert_eq!(mysql_column_kind("BIGINT UNSIGNED"), ColumnKind::Uint);
+        assert_eq!(mysql_column_kind("INT UNSIGNED"), ColumnKind::Uint);
+        assert_eq!(mysql_column_kind("BIGINT"), ColumnKind::Int);
+        assert_eq!(mysql_column_kind("INT ZEROFILL"), ColumnKind::Int);
+        assert_eq!(mysql_column_kind("BIGINT UNSIGNED ZEROFILL"), ColumnKind::Uint);
+
+        // The rest of the families still map as before.
+        assert_eq!(mysql_column_kind("VARCHAR"), ColumnKind::Str);
+        assert_eq!(mysql_column_kind("LONGTEXT"), ColumnKind::Str);
+        assert_eq!(mysql_column_kind("NEWDECIMAL"), ColumnKind::Decimal);
+        assert_eq!(mysql_column_kind("DATETIME"), ColumnKind::DateTime);
+        assert_eq!(mysql_column_kind("JSON"), ColumnKind::Json);
+        // TEXT and BLOB share a protocol type, so both read as text and the
+        // decoder falls back to bytes for genuinely binary content.
+        assert_eq!(mysql_column_kind("BLOB"), ColumnKind::Text);
+    }
+
+    #[test]
+    fn postgres_type_names_map_to_their_family() {
+        assert_eq!(pg_column_kind("INT8"), ColumnKind::Int);
+        assert_eq!(pg_column_kind("NUMERIC"), ColumnKind::Decimal);
+        assert_eq!(pg_column_kind("BOOL"), ColumnKind::Bool);
+        assert_eq!(pg_column_kind("TIMESTAMPTZ"), ColumnKind::DateTime);
+        assert_eq!(pg_column_kind("JSONB"), ColumnKind::Json);
+        // Unknown types decode leniently, so they must not be mapped to
+        // something that would fail the whole row.
+        assert_eq!(pg_column_kind("INET"), ColumnKind::Text);
+        assert_eq!(pg_column_kind("_TEXT"), ColumnKind::Text);
+    }
+
+    #[test]
+    fn statements_are_split_into_query_and_row_returning_kinds() {
+        // Only these may be wrapped in `SELECT * FROM (...)`, which is what
+        // bounds the row count.
+        assert!(is_query("SELECT 1"));
+        assert!(is_query("  with x as (select 1) select * from x"));
+        assert!(!is_query("EXPLAIN SELECT 1"));
+        assert!(!is_query("SHOW TABLES"));
+        // These return rows but are not valid as subqueries.
+        assert!(returns_rows("EXPLAIN SELECT 1"));
+        assert!(returns_rows("SHOW TABLES"));
+        assert!(!returns_rows("INSERT INTO t VALUES (1)"));
+    }
 }

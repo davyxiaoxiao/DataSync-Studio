@@ -11,6 +11,10 @@ import type {
 } from "../types";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { SqlEditor } from "../components/SqlEditor";
+import {
+  ExcelExportDialog,
+  type ExportSource,
+} from "../components/ExcelExportDialog";
 
 interface Props {
   connectionId: string;
@@ -60,6 +64,7 @@ export function QueryView({
   const [check, setCheck] = useState<SqlCheckResult | null>(null);
   const [explaining, setExplaining] = useState(false);
   const [explain, setExplain] = useState<SqlExplainResult | null>(null);
+  const [exportSource, setExportSource] = useState<ExportSource | null>(null);
   const [checkFailed, setCheckFailed] = useState(false);
   // Guards against an older check landing after a newer one.
   const checkSeq = useRef(0);
@@ -342,6 +347,14 @@ export function QueryView({
       )}
 
       {/* Only problems are shown; a correct query stays quiet. */}
+      {exportSource && (
+        <ExcelExportDialog
+          source={exportSource}
+          onClose={() => setExportSource(null)}
+          onLog={onLog}
+        />
+      )}
+
       {check && check.entries.some((entry) => !entry.ok) && (
         <div className="section" style={{ paddingTop: 0 }}>
           <div className="errbox">
@@ -385,12 +398,50 @@ export function QueryView({
           </div>
         )}
         {result?.results.map((entry, index) => (
-          <StatementResult key={index} index={index} entry={entry} />
+          <StatementResult
+            key={index}
+            index={index}
+            entry={entry}
+            connectionId={connectionId}
+            namespace={namespace}
+            onLog={onLog}
+            onExport={(columns) =>
+              setExportSource(
+                // A query is re-run for the export, so the whole result is
+                // written rather than the page that happens to be on screen.
+                isQueryText(entry.sql)
+                  ? {
+                      kind: "query",
+                      title: `查询结果 ${index + 1}`,
+                      connectionId,
+                      namespace,
+                      sql: entry.sql,
+                      columns,
+                    }
+                  : {
+                      kind: "rows",
+                      title: `查询结果 ${index + 1}`,
+                      namespace,
+                      columns,
+                      rows: entry.rows,
+                    },
+              )
+            }
+          />
         ))}
         </div>
       )}
     </div>
   );
+}
+
+/** Only these can be re-run for a complete export. */
+function isQueryText(sql: string): boolean {
+  const first = sql
+    .trimStart()
+    .split(/\s+/)[0]
+    ?.toUpperCase();
+  return first === "SELECT" || first === "WITH" || first === "TABLE" || first === "VALUES";
 }
 
 function ExplainPlan({ index, entry }: { index: number; entry: SqlExplainEntry }) {
@@ -478,7 +529,104 @@ function ExplainPlan({ index, entry }: { index: number; entry: SqlExplainEntry }
   );
 }
 
-function StatementResult({ index, entry }: { index: number; entry: SqlStatementResult }) {
+function StatementResult({
+  index,
+  entry,
+  connectionId,
+  namespace,
+  onLog,
+  onExport,
+}: {
+  index: number;
+  entry: SqlStatementResult;
+  connectionId: string;
+  namespace: string;
+  onLog: (level: "info" | "ok" | "warn" | "err" | "sql", message: string) => void;
+  onExport: (columns: { name: string; dataType: string }[]) => void;
+}) {
+  const pageSize = 1000;
+  const [offset, setOffset] = useState(0);
+  const [page, setPage] = useState<{
+    columns: { name: string; dataType: string }[];
+    rows: SqlStatementResult["rows"];
+    hasMore: boolean;
+  }>(() => ({
+    columns: entry.columns.map((column) => ({
+      name: column.name,
+      dataType: column.dataType,
+    })),
+    rows: entry.rows,
+    hasMore: entry.hasMore,
+  }));
+  const [paging, setPaging] = useState(false);
+
+  // Later pages are read from the server on demand; only one page is ever held.
+  const load = async (next: number) => {
+    setPaging(true);
+    try {
+      const result = await api.runSqlPage({
+        connectionId,
+        namespace,
+        sql: entry.sql,
+        offset: next,
+        limit: pageSize,
+      });
+      setOffset(next);
+      setPage({
+        columns: result.columns.map((column) => ({
+          name: column.name,
+          dataType: column.dataType,
+        })),
+        rows: result.rows,
+        hasMore: result.hasMore,
+      });
+    } catch (error) {
+      onLog("err", `读取结果集失败: ${errorMessage(error)}`);
+    } finally {
+      setPaging(false);
+    }
+  };
+
+  const paged = entry.columns.length > 0;
+  const from = page.rows.length === 0 ? 0 : offset + 1;
+  const to = offset + page.rows.length;
+
+  return (
+    <div>
+      {paged && (
+        <div className="row" style={{ marginBottom: 6, gap: 8 }}>
+          <span className="faint">
+            第 {from}–{to} 行{page.hasMore ? "（还有更多）" : ""}
+          </span>
+          <button
+            className="btn small"
+            disabled={offset === 0 || paging}
+            onClick={() => void load(Math.max(0, offset - pageSize))}
+          >
+            上一页
+          </button>
+          <button
+            className="btn small"
+            disabled={!page.hasMore || paging}
+            onClick={() => void load(offset + pageSize)}
+          >
+            {paging ? "读取中…" : "下一页"}
+          </button>
+          <button
+            className="btn small"
+            onClick={() => onExport(page.columns)}
+            title="导出全部行，不只是当前页"
+          >
+            导出 Excel
+          </button>
+        </div>
+      )}
+      <ResultTable index={index} entry={{ ...entry, rows: page.rows }} />
+    </div>
+  );
+}
+
+function ResultTable({ index, entry }: { index: number; entry: SqlStatementResult }) {
   const [open, setOpen] = useState(entry.columns.length > 0);
 
   return (

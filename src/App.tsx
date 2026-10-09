@@ -448,7 +448,7 @@ function Shell() {
 
       {tableAction?.kind === "exportExcel" && (
         <ExcelExportDialog
-          target={tableAction.ref}
+          source={{ kind: "table", target: tableAction.ref }}
           onClose={() => setTableAction(null)}
           onLog={log}
         />

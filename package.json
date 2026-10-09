@@ -12,7 +12,8 @@
     "tauri:build": "tauri build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:rust": "cd src-tauri && cargo test --lib"
+    "test:rust": "cd src-tauri && cargo test --lib",
+    "test:all": "pnpm test && pnpm test:rust"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

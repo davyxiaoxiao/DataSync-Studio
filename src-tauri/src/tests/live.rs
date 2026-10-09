@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    apply_data_plan, check_sql_on, explain_sql_on, plan_create_table, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
+    apply_data_plan, check_sql_on, explain_sql_on, plan_create_table, run_sql_with,
+    SQL_CONSOLE_PAGE_SIZE, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
@@ -3639,6 +3640,21 @@ async fn sql_console_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str
     assert!(plan.ok, "{tag}: {:?}", plan.error);
     assert!(!plan.columns.is_empty(), "{tag}: 执行计划应有列");
     assert!(!plan.rows.is_empty(), "{tag}: 执行计划应有内容");
+    // MySQL's plan reports row counts as `bigint unsigned`, and the driver puts
+    // that modifier in the type name; it must decode rather than degrade to a
+    // placeholder.
+    for row in &plan.rows {
+        for cell in row {
+            assert!(
+                !cell
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with('‹')),
+                "{tag}: 执行计划里不应出现无法解码的占位符: {:?}",
+                row.iter().map(|c| &c.text).collect::<Vec<_>>()
+            );
+        }
+    }
 
     // Analysing must not modify anything, which is why plain EXPLAIN is used.
     let before = scalar_count(pool, ns, "console", dialect).await;
@@ -3681,6 +3697,142 @@ async fn sql_console_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str
         "{tag}: DDL 应被标为不支持分析"
     );
     assert!(explained.entries[0].ok, "{tag}: 不支持分析不应报成错误");
+
+    // ---- paginated results and a complete export ---------------------------
+    // A result larger than one page is where "export what is on screen" would
+    // silently lose data, so the export is checked against the real row count.
+    let bulk: usize = 2 * SQL_CONSOLE_PAGE_SIZE + 250;
+    exec(
+        pool,
+        &format!("DROP TABLE IF EXISTS {}", q("bulk")),
+    )
+    .await;
+    exec(
+        pool,
+        &format!(
+            "CREATE TABLE {} ({} integer, {} varchar(16))",
+            q("bulk"),
+            c("id"),
+            c("name")
+        ),
+    )
+    .await;
+    for chunk in (1..=bulk).collect::<Vec<_>>().chunks(500) {
+        let values = chunk
+            .iter()
+            .map(|value| format!("({value}, 'r{value}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        exec(
+            pool,
+            &format!(
+                "INSERT INTO {} ({}, {}) VALUES {values}",
+                q("bulk"),
+                c("id"),
+                c("name")
+            ),
+        )
+        .await;
+    }
+    assert_eq!(
+        scalar_count(pool, ns, "bulk", dialect).await,
+        bulk as i64,
+        "{tag}: 造数失败"
+    );
+
+    let query = format!(
+        "SELECT {id}, {name} FROM {table} ORDER BY {id}",
+        id = c("id"),
+        name = c("name"),
+        table = q("bulk")
+    );
+
+    // The console hands back one page and says whether more exist.
+    let outcome = run_sql_with(pool, ns, &query, &ProgressReporter::inert())
+        .await
+        .expect("run the bulk query");
+    let entry = &outcome.results[0];
+    assert!(entry.ok, "{tag}: {:?}", entry.error);
+    assert_eq!(
+        entry.rows.len(),
+        SQL_CONSOLE_PAGE_SIZE,
+        "{tag}: 结果集首页应为一页大小"
+    );
+    assert!(entry.has_more, "{tag}: 首页之后应提示还有更多");
+
+    // Walking the pages must cover every row exactly once.
+    let mut seen = 0usize;
+    let mut offset = 0u64;
+    let mut pages = 0;
+    loop {
+        let page = crate::db::run_query_page(pool, ns, &query, offset, SQL_CONSOLE_PAGE_SIZE)
+            .await
+            .expect("read a result page");
+        seen += page.rows.len();
+        pages += 1;
+        if !page.has_more {
+            break;
+        }
+        offset += page.rows.len() as u64;
+        assert!(pages < 10, "{tag}: 分页没有终止");
+    }
+    assert_eq!(seen, bulk, "{tag}: 分页应覆盖全部行且不重复");
+    assert_eq!(pages, 3, "{tag}: 应有 3 页");
+
+    // A single statement can be read at an arbitrary offset.
+    let page = crate::db::run_query_page(pool, ns, &query, (bulk - 3) as u64, SQL_CONSOLE_PAGE_SIZE)
+        .await
+        .expect("read the last page");
+    assert_eq!(page.rows.len(), 3, "{tag}: 末页应只剩 3 行");
+    assert!(!page.has_more, "{tag}: 末页之后不应还有更多");
+
+    // The export re-runs the query, so the file holds every row rather than the
+    // page the console happens to be showing.
+    let export_path = std::env::temp_dir().join(format!("datasync-query-{tag}.xlsx"));
+    let export_path_text = export_path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&export_path);
+    let exported = crate::excel_export::export_query(
+        pool,
+        ns,
+        &query,
+        &[
+            // The names as the result metadata reports them, which is what the
+            // dialog sends.
+            ExportColumn {
+                column: "id".into(),
+                header: None,
+            },
+            ExportColumn {
+                column: "name".into(),
+                header: None,
+            },
+        ],
+        &ExportOptions {
+            sheet_name: Some("全部".into()),
+            max_rows: None,
+            include_header: true,
+        },
+        &export_path_text,
+        &ProgressReporter::inert(),
+    )
+    .await
+    .expect("export the query");
+    assert_eq!(
+        exported.rows, bulk as u64,
+        "{tag}: 导出应写入全部行，而不是首页"
+    );
+    assert!(!exported.truncated, "{tag}: 没有上限时不应标记为截断");
+
+    let (sheet, _, _) = crate::excel::read_sheet(&export_path_text, Some("全部"), Some(0), None)
+        .expect("read the exported file back");
+    assert_eq!(
+        sheet.rows.len(),
+        bulk,
+        "{tag}: 文件里的行数应等于真实行数（表头另计）"
+    );
+    let _ = std::fs::remove_file(&export_path);
+
+    exec(pool, &format!("DROP TABLE {}", q("bulk"))).await;
 
     // The probe must not have been created either way.
     let tables = crate::schema::introspect::list_tables(pool, ns)
