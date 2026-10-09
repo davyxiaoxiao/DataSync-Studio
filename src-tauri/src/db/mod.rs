@@ -13,7 +13,10 @@ use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::jobs::ProgressReporter;
 use crate::store::ConnectionConfig;
-use value::{decode_mysql_row, decode_pg_row, ColumnKind, Value};
+use value::{
+    decode_mysql_row, decode_mysql_row_lenient, decode_pg_row, decode_pg_row_lenient,
+    ColumnKind, Value,
+};
 
 #[derive(Clone)]
 pub enum Pool {
@@ -326,6 +329,282 @@ impl Pool {
     }
 }
 
+/// Whether MySQL refused a statement because it cannot be prepared.
+///
+/// Error 1295 is the server saying exactly that; only then is it safe to retry
+/// through the simple protocol, since nothing was executed.
+fn not_preparable(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database) => database
+            .code()
+            .map(|code| code == "1295")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// What one statement of a user script produced.
+#[derive(Debug, Clone)]
+pub enum ConsoleOutcome {
+    Rows(DescribedResult),
+    Affected(u64),
+    Failed(String),
+}
+
+/// Run a user script.
+///
+/// Everything runs inside one transaction on one connection. That is what makes
+/// `USE` / `search_path` apply to every statement, and an owned `Transaction`
+/// also avoids the higher-ranked `Executor` bound that a reborrowed connection
+/// cannot satisfy. The transaction is committed at the end: the console is for
+/// real work, not for previewing.
+pub async fn run_console(
+    pool: &Pool,
+    namespace: &str,
+    statements: &[String],
+    row_limit: usize,
+    reporter: &ProgressReporter,
+) -> AppResult<Vec<ConsoleOutcome>> {
+    match pool {
+        Pool::MySql(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                // `USE` cannot go through the prepared-statement protocol.
+                let sql = format!("USE {}", Dialect::Mysql.quote(namespace));
+                tx.execute(sqlx::raw_sql(&sql))
+                    .await
+                    .map_err(|error| AppError::msg(format!("切换到 {namespace} 失败: {error}")))?;
+            }
+            let mut outcomes = Vec::with_capacity(statements.len());
+            for statement in statements {
+                if reporter.is_cancelled() {
+                    break;
+                }
+                outcomes.push(run_one_mysql(&mut tx, statement, row_limit).await);
+            }
+            tx.commit().await?;
+            Ok(outcomes)
+        }
+        Pool::Postgres(pool) => {
+            let mut tx = pool.begin().await?;
+            if !namespace.trim().is_empty() {
+                let sql = format!("SET LOCAL search_path TO {}", Dialect::Postgres.quote(namespace));
+                tx.execute(sqlx::raw_sql(&sql))
+                    .await
+                    .map_err(|error| AppError::msg(format!("切换到 {namespace} 失败: {error}")))?;
+            }
+            let mut outcomes = Vec::with_capacity(statements.len());
+            for statement in statements {
+                if reporter.is_cancelled() {
+                    break;
+                }
+                outcomes.push(run_one_postgres(&mut tx, statement, row_limit).await);
+            }
+            match tx.commit().await {
+                Ok(()) => {}
+                // A failed statement leaves the transaction aborted; the results
+                // already carry the error, so a rollback here is expected.
+                Err(_) => {}
+            }
+            Ok(outcomes)
+        }
+    }
+}
+
+/// Whether a statement is expected to produce rows.
+///
+/// `describe` would answer this authoritatively, but it goes through sqlx's
+/// `Executor` trait, whose higher-ranked bounds the compiler cannot satisfy for
+/// a connection held across a loop. Classification by leading keyword is what
+/// SQL clients have always done and is predictable enough here.
+fn returns_rows(statement: &str) -> bool {
+    let first = statement
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '(')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        first.as_str(),
+        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" | "TABLE" | "VALUES"
+    )
+}
+
+/// Read a row-returning statement through a subquery, which bounds the row count
+/// without needing to know the column list first.
+fn wrap_for_reading(sql: &str, limit: usize) -> String {
+    let inner = sql.trim().trim_end_matches(';');
+    format!("SELECT * FROM ({inner}) AS datasync_query LIMIT {limit}")
+}
+
+async fn run_one_mysql(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    statement: &str,
+    limit: usize,
+) -> ConsoleOutcome {
+    if returns_rows(statement) {
+        let wrapped = wrap_for_reading(statement, limit);
+        let rows = match tx.fetch_all(sqlx::query(&wrapped)).await {
+            Ok(rows) => rows,
+            Err(error) => return ConsoleOutcome::Failed(error.to_string()),
+        };
+        // The column types come from the result metadata, never from the values.
+        let metas = match rows.first() {
+            Some(row) => describe_mysql(row.columns()),
+            None => Vec::new(),
+        };
+        let kinds: Vec<ColumnKind> = metas.iter().map(|meta| meta.kind).collect();
+        return ConsoleOutcome::Rows(DescribedResult {
+            columns: metas,
+            rows: rows
+                .iter()
+                .map(|row| decode_mysql_row_lenient(row, &kinds))
+                .collect(),
+        });
+    }
+
+    match tx.execute(sqlx::query(statement)).await {
+        Ok(result) => ConsoleOutcome::Affected(result.rows_affected()),
+        // Session statements (`SET`, `USE`) and some DDL cannot be prepared at
+        // all; the simple protocol accepts them.
+        Err(error) if not_preparable(&error) => {
+            match tx.execute(sqlx::raw_sql(statement)).await {
+                Ok(result) => ConsoleOutcome::Affected(result.rows_affected()),
+                Err(error) => ConsoleOutcome::Failed(error.to_string()),
+            }
+        }
+        Err(error) => ConsoleOutcome::Failed(error.to_string()),
+    }
+}
+
+async fn run_one_postgres(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    statement: &str,
+    limit: usize,
+) -> ConsoleOutcome {
+    if returns_rows(statement) {
+        let wrapped = wrap_for_reading(statement, limit);
+        let rows = match tx.fetch_all(sqlx::query(&wrapped)).await {
+            Ok(rows) => rows,
+            Err(error) => return ConsoleOutcome::Failed(error.to_string()),
+        };
+        let metas = match rows.first() {
+            Some(row) => describe_pg(row.columns()),
+            None => Vec::new(),
+        };
+        let kinds: Vec<ColumnKind> = metas.iter().map(|meta| meta.kind).collect();
+        return ConsoleOutcome::Rows(DescribedResult {
+            columns: metas,
+            rows: rows
+                .iter()
+                .map(|row| decode_pg_row_lenient(row, &kinds))
+                .collect(),
+        });
+    }
+
+    match tx.execute(sqlx::query(statement)).await {
+        Ok(result) => ConsoleOutcome::Affected(result.rows_affected()),
+        Err(error) => ConsoleOutcome::Failed(error.to_string()),
+    }
+}
+
+/// Map a driver-reported MySQL type onto the kind used for decoding.
+///
+/// The names here are the driver's own ("VARCHAR", "LONGTEXT", "TINYINT"), which
+/// differ from the spellings `information_schema` uses, so this cannot reuse the
+/// introspected-type mapping.
+fn mysql_column_kind(type_name: &str) -> ColumnKind {
+    match type_name.to_ascii_uppercase().as_str() {
+        // The signedness flag sqlx carries is crate-private, but the integer
+        // decoder already falls back from i64 to u64 to f64, so `Int` covers
+        // both.
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" => ColumnKind::Int,
+        "FLOAT" | "DOUBLE" => ColumnKind::Float,
+        "DECIMAL" | "NEWDECIMAL" => ColumnKind::Decimal,
+        "DATE" => ColumnKind::Date,
+        "TIME" => ColumnKind::Time,
+        "DATETIME" | "TIMESTAMP" => ColumnKind::DateTime,
+        "JSON" => ColumnKind::Json,
+        "BIT" => ColumnKind::Bytes,
+        // MySQL reports TEXT and BLOB under the same protocol type. Reading them
+        // as text is correct for both: the decoder validates UTF-8 and falls
+        // back to bytes when it is not text, so a real BLOB still comes through.
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "GEOMETRY" | "BINARY"
+        | "VARBINARY" => ColumnKind::Text,
+        // VARCHAR, TEXT, ENUM, SET, CHAR and NULL all read as text.
+        _ => ColumnKind::Str,
+    }
+}
+
+fn describe_mysql(columns: &[sqlx::mysql::MySqlColumn]) -> Vec<DescribedColumn> {
+    use sqlx::{Column, TypeInfo};
+    columns
+        .iter()
+        .map(|column| {
+            let name = column.type_info().name().to_string();
+            DescribedColumn {
+                name: column.name().to_string(),
+                kind: mysql_column_kind(&name),
+                type_name: name,
+            }
+        })
+        .collect()
+}
+
+/// Map a driver-reported PostgreSQL type onto the kind used for decoding.
+///
+/// Types the driver cannot decode natively are marked for a text cast rather
+/// than being guessed at.
+fn pg_column_kind(type_name: &str) -> ColumnKind {
+    match type_name.to_ascii_uppercase().as_str() {
+        "INT2" | "INT4" | "INT8" => ColumnKind::Int,
+        "FLOAT4" | "FLOAT8" => ColumnKind::Float,
+        "NUMERIC" => ColumnKind::Decimal,
+        "BOOL" => ColumnKind::Bool,
+        "DATE" => ColumnKind::Date,
+        "TIME" => ColumnKind::Time,
+        "TIMESTAMP" | "TIMESTAMPTZ" => ColumnKind::DateTime,
+        "JSON" | "JSONB" => ColumnKind::Json,
+        "BYTEA" => ColumnKind::Bytes,
+        "VARCHAR" | "BPCHAR" | "TEXT" | "NAME" | "CHAR" | "UNKNOWN" | "UUID" => ColumnKind::Str,
+        // Arrays, inet/cidr, ranges, enums and domains have no decoder here.
+        // They are decoded leniently, so the cell shows a placeholder naming the
+        // type instead of failing the whole statement.
+        _ => ColumnKind::Text,
+    }
+}
+
+fn describe_pg(columns: &[sqlx::postgres::PgColumn]) -> Vec<DescribedColumn> {
+    use sqlx::{Column, TypeInfo};
+    columns
+        .iter()
+        .map(|column| {
+            let name = column.type_info().name().to_string();
+            DescribedColumn {
+                name: column.name().to_string(),
+                kind: pg_column_kind(&name),
+                type_name: name,
+            }
+        })
+        .collect()
+}
+
+/// One result set from a user-written statement.
+#[derive(Debug, Clone, Default)]
+pub struct DescribedResult {
+    pub columns: Vec<DescribedColumn>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// A column of an ad-hoc result set.
+#[derive(Debug, Clone)]
+pub struct DescribedColumn {
+    pub name: String,
+    /// The type as the driver names it, shown to the user.
+    pub type_name: String,
+    pub kind: ColumnKind,
+}
+
 /// Outcome of executing a statement script.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptRun {
@@ -362,23 +641,7 @@ pub async fn open_pool(config: &ConnectionConfig, password: Option<&str>) -> App
     let timeout = Duration::from_secs(20);
     match config.dialect {
         Dialect::Mysql => {
-            let mut opts = MySqlConnectOptions::new()
-                .host(config.host.trim())
-                .port(config.port)
-                .username(config.username.trim());
-            if let Some(pw) = password {
-                if !pw.is_empty() {
-                    opts = opts.password(pw);
-                }
-            }
-            if let Some(db) = config.trimmed_database() {
-                opts = opts.database(db);
-            }
-            opts = opts.ssl_mode(match config.ssl_mode.as_str() {
-                "disable" => MySqlSslMode::Disabled,
-                "require" | "verify" => MySqlSslMode::Required,
-                _ => MySqlSslMode::Preferred,
-            });
+            let opts = mysql_options(config, password);
             let pool = MySqlPoolOptions::new()
                 .max_connections(4)
                 .acquire_timeout(timeout)
@@ -390,23 +653,7 @@ pub async fn open_pool(config: &ConnectionConfig, password: Option<&str>) -> App
             Ok(Pool::MySql(pool))
         }
         Dialect::Postgres => {
-            let mut opts = PgConnectOptions::new()
-                .host(config.host.trim())
-                .port(config.port)
-                .username(config.username.trim());
-            if let Some(pw) = password {
-                if !pw.is_empty() {
-                    opts = opts.password(pw);
-                }
-            }
-            if let Some(db) = config.trimmed_database() {
-                opts = opts.database(db);
-            }
-            opts = opts.ssl_mode(match config.ssl_mode.as_str() {
-                "disable" => PgSslMode::Disable,
-                "require" | "verify" => PgSslMode::Require,
-                _ => PgSslMode::Prefer,
-            });
+            let opts = pg_options(config, password);
             let pool = PgPoolOptions::new()
                 .max_connections(4)
                 .acquire_timeout(timeout)
@@ -418,6 +665,46 @@ pub async fn open_pool(config: &ConnectionConfig, password: Option<&str>) -> App
             Ok(Pool::Postgres(pool))
         }
     }
+}
+
+fn mysql_options(config: &ConnectionConfig, password: Option<&str>) -> MySqlConnectOptions {
+    let mut opts = MySqlConnectOptions::new()
+        .host(config.host.trim())
+        .port(config.port)
+        .username(config.username.trim());
+    if let Some(pw) = password {
+        if !pw.is_empty() {
+            opts = opts.password(pw);
+        }
+    }
+    if let Some(db) = config.trimmed_database() {
+        opts = opts.database(db);
+    }
+    opts.ssl_mode(match config.ssl_mode.as_str() {
+        "disable" => MySqlSslMode::Disabled,
+        "require" | "verify" => MySqlSslMode::Required,
+        _ => MySqlSslMode::Preferred,
+    })
+}
+
+fn pg_options(config: &ConnectionConfig, password: Option<&str>) -> PgConnectOptions {
+    let mut opts = PgConnectOptions::new()
+        .host(config.host.trim())
+        .port(config.port)
+        .username(config.username.trim());
+    if let Some(pw) = password {
+        if !pw.is_empty() {
+            opts = opts.password(pw);
+        }
+    }
+    if let Some(db) = config.trimmed_database() {
+        opts = opts.database(db);
+    }
+    opts.ssl_mode(match config.ssl_mode.as_str() {
+        "disable" => PgSslMode::Disable,
+        "require" | "verify" => PgSslMode::Require,
+        _ => PgSslMode::Prefer,
+    })
 }
 
 /// Cache of live pools keyed by connection id.

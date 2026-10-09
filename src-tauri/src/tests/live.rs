@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use crate::commands::{
-    apply_data_plan, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
+    apply_data_plan, run_sql_with, compare_data_core, compare_schema_core, plan_alter_table, plan_drop_scope,
     preview_table_data_core, ColumnRename,
 };
 use crate::data::import::{run_import, suggest_mapping, ImportOptions, ImportStrategy};
@@ -3268,6 +3268,221 @@ async fn live_postgres_excel_export() {
     };
     let pool = connect(&target, Dialect::Postgres).await;
     excel_export_scenario(&pool, Dialect::Postgres, "datasync_live_export", "pg").await;
+}
+
+/// The SQL console: arbitrary statements, result sets, affected counts and
+/// errors, against a real server.
+async fn sql_console_scenario(pool: &Pool, dialect: Dialect, ns: &str, tag: &str) {
+    drop_namespace(pool, dialect, ns).await;
+    create_namespace(pool, dialect, ns).await;
+
+    let q = |name: &str| dialect.qualified(Some(ns), name);
+    let c = |name: &str| dialect.quote(name);
+    let engine = match dialect {
+        Dialect::Mysql => " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        Dialect::Postgres => "",
+    };
+    let (int_type, text_type, decimal_type, bool_type) = match dialect {
+        Dialect::Mysql => ("INT", "VARCHAR(64)", "DECIMAL(10,2)", "TINYINT(1)"),
+        Dialect::Postgres => ("integer", "character varying(64)", "numeric(10,2)", "boolean"),
+    };
+    exec_all(
+        pool,
+        &[format!(
+            "CREATE TABLE {} (
+                {id} {int_type} NOT NULL,
+                {name} {text_type},
+                {amount} {decimal_type},
+                {active} {bool_type},
+                PRIMARY KEY ({id})
+             ){engine}",
+            q("console"),
+            id = c("id"),
+            name = c("name"),
+            amount = c("amount"),
+            active = c("active"),
+        )],
+    )
+    .await;
+
+    let run = |sql: &str| {
+        let ns = ns.to_string();
+        let sql = sql.to_string();
+        async move {
+            run_sql_with(pool, &ns, &sql, &ProgressReporter::inert())
+                .await
+                .expect("run sql")
+        }
+    };
+
+    // ---- a SELECT returns a real result set -------------------------------
+    let outcome = run(&format!(
+        "INSERT INTO {} ({id}, {name}, {amount}) VALUES (1, '苹果', 10.50), (2, 'bob', 20.00)",
+        q("console"),
+        id = c("id"),
+        name = c("name"),
+        amount = c("amount"),
+    ))
+    .await;
+    assert_eq!(outcome.results.len(), 1, "{tag}: 一条 INSERT");
+    assert!(outcome.results[0].ok, "{tag}: {:?}", outcome.results[0].error);
+    assert_eq!(
+        outcome.results[0].rows_affected, 2,
+        "{tag}: INSERT 应报告受影响行数"
+    );
+    assert!(
+        outcome.results[0].columns.is_empty(),
+        "{tag}: DML 不应返回结果集"
+    );
+
+    let outcome = run(&format!(
+        "SELECT {id}, {name}, {amount} FROM {} ORDER BY {id}",
+        q("console"),
+        id = c("id"),
+        name = c("name"),
+        amount = c("amount"),
+    ))
+    .await;
+    let first = &outcome.results[0];
+    assert!(first.ok, "{tag}: {:?}", first.error);
+    assert_eq!(first.columns.len(), 3, "{tag}: 三列");
+    assert_eq!(first.columns[0].name, "id");
+    assert_eq!(first.rows.len(), 2, "{tag}: 两行");
+    // Values keep their types rather than arriving as strings.
+    assert_eq!(first.rows[0][0].text.as_deref(), Some("1"));
+    assert_eq!(first.rows[0][1].text.as_deref(), Some("苹果"));
+    // Decimals are normalised, matching what the data grid shows.
+    assert_eq!(first.rows[0][2].text.as_deref(), Some("10.5"));
+    assert_eq!(
+        first.columns[0].kind,
+        crate::db::value::ColumnKind::Int,
+        "{tag}: 列类型应由驱动信息推导"
+    );
+
+    // ---- multiple statements run in order, on one connection --------------
+    let outcome = run(&format!(
+        "SELECT COUNT(*) AS n FROM {};\
+         UPDATE {} SET {name} = 'changed' WHERE {id} = 1;\
+         SELECT {name} FROM {} WHERE {id} = 1;",
+        q("console"),
+        q("console"),
+        q("console"),
+        name = c("name"),
+        id = c("id"),
+    ))
+    .await;
+    assert_eq!(outcome.results.len(), 3, "{tag}: 三条语句都应执行");
+    assert!(outcome.results.iter().all(|entry| entry.ok), "{tag}: 都不应失败");
+    assert_eq!(outcome.results[1].rows_affected, 1, "{tag}: UPDATE 影响 1 行");
+    assert_eq!(
+        outcome.results[2].rows[0][0].text.as_deref(),
+        Some("changed"),
+        "{tag}: 后续语句应看到前一条的结果"
+    );
+
+    // ---- an error is reported against its own statement -------------------
+    let outcome = run(&format!(
+        "SELECT 1;\
+         SELECT * FROM {};\
+         SELECT 2;",
+        dialect.qualified(Some(ns), "definitely_missing"),
+    ))
+    .await;
+    assert_eq!(
+        outcome.results.len(),
+        2,
+        "{tag}: 出错后应停止，不再执行第三条"
+    );
+    assert!(outcome.results[0].ok);
+    assert!(!outcome.results[1].ok, "{tag}: 第二条应报错");
+    assert!(
+        outcome.results[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.to_lowercase().contains("exist")
+                || error.contains("不存在")),
+        "{tag}: 错误信息应说明表不存在: {:?}",
+        outcome.results[1].error
+    );
+
+    // ---- the console selects the database it was given --------------------
+    // Unqualified names must resolve against `ns`, not whatever the pooled
+    // connection happened to default to.
+    let outcome = run("SELECT COUNT(*) AS n FROM console").await;
+    assert!(
+        outcome.results[0].ok,
+        "{tag}: 未限定表名应能在指定库中解析: {:?}",
+        outcome.results[0].error
+    );
+
+    // ---- types PostgreSQL cannot decode natively --------------------------
+    if dialect == Dialect::Postgres {
+        let outcome = run(&format!(
+            "SELECT '{id}'::inet AS addr, ARRAY['a','b']::text[] AS tags, \
+             gen_random_uuid() AS uid, '{{\"k\": 1}}'::jsonb AS payload",
+            id = "10.0.0.1"
+        ))
+        .await;
+        let entry = &outcome.results[0];
+        // The important property: an exotic type must not fail the whole
+        // statement, and must not be silently shown as NULL either. It becomes a
+        // placeholder that names the type.
+        assert!(entry.ok, "{tag}: 特殊类型不应让整条查询失败: {:?}", entry.error);
+        assert_eq!(entry.rows.len(), 1);
+        assert_eq!(
+            entry.rows[0][0].text.as_deref(),
+            Some("‹无法解码：INET›"),
+            "{tag}: 无法原生解码的类型应显示占位符并注明类型"
+        );
+        assert_eq!(
+            entry.rows[0][1].text.as_deref(),
+            Some("‹无法解码：TEXT[]›"),
+            "{tag}: 数组同理"
+        );
+        // Types the driver can decode are unaffected by the limitation.
+        assert!(
+            entry.rows[0][2]
+                .text
+                .as_deref()
+                .is_some_and(|text| !text.is_empty() && !text.starts_with('‹')),
+            "{tag}: uuid 应有值且不是占位符: {:?}",
+            entry.rows[0][2].text
+        );
+        assert!(
+            entry.rows[0][3]
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains('k')),
+            "{tag}: json 应正常返回: {:?}",
+            entry.rows[0][3].text
+        );
+    }
+
+    // ---- a statement with no result set still reports --------------------
+    let outcome = run("SELECT 1 WHERE 1 = 0").await;
+    assert!(outcome.results[0].ok, "{tag}: {:?}", outcome.results[0].error);
+
+    drop_namespace(pool, dialect, ns).await;
+}
+
+#[tokio::test]
+async fn live_mysql_sql_console() {
+    let Some(target) = env_target("DATASYNC_MYSQL", Dialect::Mysql) else {
+        eprintln!("跳过：未设置 DATASYNC_MYSQL_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Mysql).await;
+    sql_console_scenario(&pool, Dialect::Mysql, "datasync_live_sql", "mysql 控制台").await;
+}
+
+#[tokio::test]
+async fn live_postgres_sql_console() {
+    let Some(target) = env_target("DATASYNC_PG", Dialect::Postgres) else {
+        eprintln!("跳过：未设置 DATASYNC_PG_* 环境变量");
+        return;
+    };
+    let pool = connect(&target, Dialect::Postgres).await;
+    sql_console_scenario(&pool, Dialect::Postgres, "datasync_live_sql", "pg 控制台").await;
 }
 
 /// Cross-engine synchronisation is deliberately refused, and the refusal must

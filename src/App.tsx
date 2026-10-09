@@ -14,6 +14,7 @@ import { StoreProvider, useStore } from "./store";
 import type { ConnectionConfig } from "./types";
 import { DataSyncView } from "./views/DataSyncView";
 import { StructureSyncView } from "./views/StructureSyncView";
+import { QueryView } from "./views/QueryView";
 import { TableDataView } from "./views/TableDataView";
 import { WelcomeView } from "./views/WelcomeView";
 
@@ -28,8 +29,77 @@ type TableAction =
   | { kind: "rename"; ref: TableRef }
   | { kind: "drop"; refs: TableRef[] }
   | { kind: "importExcel"; ref: TableRef }
+  | {
+      kind: "renameQuery";
+      query: { connectionId: string; namespace: string; name: string; path: string };
+    }
   | { kind: "exportExcel"; ref: TableRef }
   | { kind: "deleteConnection"; config: ConnectionConfig };
+
+function RenameQueryDialog({
+  query,
+  onClose,
+  onDone,
+  onLog,
+}: {
+  query: { name: string; path: string };
+  onClose: () => void;
+  onDone: (renamed: { name: string; path: string }) => void;
+  onLog: (level: "info" | "ok" | "warn" | "err", message: string) => void;
+}) {
+  const [name, setName] = useState(query.name);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const renamed = await api.renameQuery(query.path, name.trim());
+      onLog("ok", `已重命名为 ${renamed.name}`);
+      onDone({ name: renamed.name, path: renamed.path });
+    } catch (err) {
+      setError(errorMessage(err));
+      onLog("err", `重命名失败: ${errorMessage(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ConfirmDialog
+      title="重命名查询"
+      busy={busy}
+      error={error}
+      confirmLabel="重命名"
+      onClose={onClose}
+      onConfirm={() => {
+        if (name.trim() && name.trim() !== query.name) void submit();
+      }}
+      message={
+        <div className="field">
+          <label>
+            将 <span className="mono">{query.name}</span> 重命名为
+          </label>
+          <input
+            type="text"
+            value={name}
+            autoFocus
+            onChange={(event) => setName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && name.trim() && name.trim() !== query.name) {
+                void submit();
+              }
+            }}
+          />
+          <div className="faint" style={{ marginTop: 6 }}>
+            会同时重命名磁盘上的 .sql 文件
+          </div>
+        </div>
+      }
+    />
+  );
+}
 
 function RenameTableDialog({
   target,
@@ -107,6 +177,7 @@ function Shell() {
   const {
     connections,
     tabs,
+    updateTabTitle,
     activeTabId,
     selectedConnectionId,
     log,
@@ -114,6 +185,8 @@ function Shell() {
     connect,
     closeTabsForConnection,
     closeTab,
+    openTab,
+    loadQueries,
   } = useStore();
 
   const [dialog, setDialog] = useState<DialogState>({ open: false, config: null });
@@ -158,6 +231,7 @@ function Shell() {
           onDropTables={(refs) => setTableAction({ kind: "drop", refs })}
           onImportExcel={(ref) => setTableAction({ kind: "importExcel", ref })}
           onExportExcel={(ref) => setTableAction({ kind: "exportExcel", ref })}
+          onRenameQuery={(query) => setTableAction({ kind: "renameQuery", query })}
         />
 
         <div className="main-area">
@@ -191,6 +265,18 @@ function Shell() {
                     namespace={tab.namespace}
                     table={tab.table}
                     onLog={log}
+                  />
+                )}
+                {tab.kind === "query" && tab.connectionId && tab.namespace && tab.path && (
+                  <QueryView
+                    connectionId={tab.connectionId}
+                    namespace={tab.namespace}
+                    path={tab.path}
+                    onLog={log}
+                    onTitleChange={(title, dirty) => {
+                      // The unsaved marker lives in the tab title.
+                      updateTabTitle(tab.id, dirty ? `${title} •` : title);
+                    }}
                   />
                 )}
               </div>
@@ -284,6 +370,28 @@ function Shell() {
           onImported={() => {
             // The table's contents changed, so an open grid should reload.
             window.dispatchEvent(new CustomEvent("datasync:refresh-data"));
+          }}
+          onLog={log}
+        />
+      )}
+
+      {tableAction?.kind === "renameQuery" && (
+        <RenameQueryDialog
+          query={tableAction.query}
+          onClose={() => setTableAction(null)}
+          onDone={(renamed) => {
+            setTableAction(null);
+            // Reopen under the new name so the tab is not left pointing at a
+            // file that no longer exists.
+            closeTab(`query:${tableAction.query.path}`);
+            openTab({
+              kind: "query",
+              title: renamed.name,
+              connectionId: tableAction.query.connectionId,
+              namespace: tableAction.query.namespace,
+              path: renamed.path,
+            });
+            void loadQueries(tableAction.query.connectionId, tableAction.query.namespace);
           }}
           onLog={log}
         />

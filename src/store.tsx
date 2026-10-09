@@ -9,7 +9,8 @@ import {
   type ReactNode,
 } from "react";
 import { api, errorMessage } from "./api";
-import type { ConnectionConfig, Dialect, NamespaceInfo } from "./types";
+import type {
+  SavedQuery, ConnectionConfig, Dialect, NamespaceInfo } from "./types";
 
 export type LogLevel = "info" | "ok" | "warn" | "err" | "sql";
 
@@ -33,6 +34,12 @@ export interface NamespaceNode {
   loading: boolean;
   tables: TableNode[];
   expanded: boolean;
+  /** Whether the 表 / 视图 / 查询 group folders are open. */
+  tablesExpanded: boolean;
+  viewsExpanded: boolean;
+  queriesExpanded: boolean;
+  queriesLoaded: boolean;
+  queries: SavedQuery[];
 }
 
 export interface Session {
@@ -44,7 +51,7 @@ export interface Session {
   namespaces: NamespaceNode[];
 }
 
-export type TabKind = "welcome" | "table" | "structure" | "data";
+export type TabKind = "welcome" | "table" | "structure" | "data" | "query";
 
 export interface Tab {
   id: string;
@@ -53,6 +60,8 @@ export interface Tab {
   connectionId?: string;
   namespace?: string;
   table?: string;
+  /** For `kind: "query"`: the `.sql` file the tab edits. */
+  path?: string;
 }
 
 interface StoreValue {
@@ -74,11 +83,21 @@ interface StoreValue {
   toggleConnection: (connectionId: string) => void;
   toggleNamespace: (connectionId: string, namespace: string) => void;
   refreshTables: (connectionId: string, namespace: string) => Promise<void>;
+  /** Open or close one of the 表 / 视图 / 查询 folders inside a database. */
+  toggleNamespaceGroup: (
+    connectionId: string,
+    namespace: string,
+    group: "tables" | "views" | "queries",
+  ) => void;
+  /** Re-read the .sql files belonging to a connection. */
+  loadQueries: (connectionId: string, namespace: string) => Promise<void>;
 
   selectConnection: (id: string | null) => void;
   closeTabsForConnection: (connectionId: string) => void;
   openTab: (tab: Omit<Tab, "id"> & { id?: string }) => string;
   closeTab: (id: string) => void;
+  /** Rename a tab in place, e.g. to show an unsaved marker. */
+  updateTabTitle: (id: string, title: string) => void;
   /** Keep only this tab. */
   closeOtherTabs: (id: string) => void;
   /** Close everything, leaving a welcome tab so the window is never blank. */
@@ -242,6 +261,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                     loading: false,
                     tables: [],
                     expanded: false,
+                    tablesExpanded: true,
+                    viewsExpanded: true,
+                    queriesExpanded: false,
+                    queriesLoaded: false,
+                    queries: [],
                   }
                 );
               }),
@@ -315,17 +339,80 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [loadTables],
   );
 
+  const loadQueries = useCallback(
+    async (connectionId: string, namespace: string) => {
+      try {
+        const all = await api.listQueries(connectionId);
+        // A query with an empty namespace is not tied to one database, so it
+        // shows up under every database of that connection.
+        const mine = all.filter(
+          (query) => query.namespace === "" || query.namespace === namespace,
+        );
+        setSessions((prev) => {
+          const session = prev[connectionId];
+          if (!session) return prev;
+          return {
+            ...prev,
+            [connectionId]: {
+              ...session,
+              namespaces: session.namespaces.map((ns) =>
+                ns.name === namespace
+                  ? { ...ns, queries: mine, queriesLoaded: true, queriesExpanded: true }
+                  : ns,
+              ),
+            },
+          };
+        });
+      } catch (error) {
+        log("err", `读取查询列表失败: ${errorMessage(error)}`);
+      }
+    },
+    [log],
+  );
+
+  const toggleNamespaceGroup = useCallback(
+    (connectionId: string, namespace: string, group: "tables" | "views" | "queries") => {
+      const session = sessions[connectionId];
+      const node = session?.namespaces.find((n) => n.name === namespace);
+      if (!node) return;
+      // Opening 查询 for the first time has to read the folder.
+      if (group === "queries" && !node.queriesLoaded && !node.queriesExpanded) {
+        void loadQueries(connectionId, namespace);
+        return;
+      }
+      const key =
+        group === "tables"
+          ? "tablesExpanded"
+          : group === "views"
+            ? "viewsExpanded"
+            : "queriesExpanded";
+      setSessions((prev) => ({
+        ...prev,
+        [connectionId]: {
+          ...prev[connectionId],
+          namespaces: prev[connectionId].namespaces.map((ns) =>
+            ns.name === namespace ? { ...ns, [key]: !ns[key] } : ns,
+          ),
+        },
+      }));
+    },
+    [loadQueries, sessions],
+  );
+
   const openTab = useCallback((tab: Omit<Tab, "id"> & { id?: string }) => {
     // The sync wizards are singletons: reopening one focuses (and re-seeds) the
     // existing tab instead of stacking duplicates. Table tabs are keyed by their
     // target so the same table always focuses the same tab.
     const singleton =
       tab.kind === "welcome" || tab.kind === "structure" || tab.kind === "data";
+    // A query tab is keyed by its file so the same snippet focuses one tab.
     const id =
       tab.id ??
       (singleton
         ? tab.kind
-        : `${tab.kind}:${tab.connectionId ?? ""}:${tab.namespace ?? ""}:${tab.table ?? ""}`);
+        : tab.kind === "query"
+          ? `query:${tab.path ?? ""}`
+          : `${tab.kind}:${tab.connectionId ?? ""}:${tab.namespace ?? ""}:${tab.table ?? ""}`);
     setTabs((prev) => {
       const index = prev.findIndex((t) => t.id === id);
       if (index >= 0) {
@@ -380,6 +467,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const updateTabTitle = useCallback((id: string, title: string) => {
+    setTabs((prev) =>
+      prev.map((tab) => (tab.id === id && tab.title !== title ? { ...tab, title } : tab)),
+    );
+  }, []);
+
   const closeOtherTabs = useCallback((id: string) => {
     const target = tabsRef.current.find((tab) => tab.id === id);
     if (!target) return;
@@ -416,8 +509,11 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       closeTabsForConnection,
       openTab,
       closeTab,
+      updateTabTitle,
       closeOtherTabs,
       closeAllTabs,
+      toggleNamespaceGroup,
+      loadQueries,
       setActiveTab: setActiveTabId,
     }),
     [
@@ -437,9 +533,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       refreshTables,
       openTab,
       closeTab,
+      updateTabTitle,
       closeOtherTabs,
       closeAllTabs,
       closeTabsForConnection,
+      toggleNamespaceGroup,
+      loadQueries,
     ],
   );
 

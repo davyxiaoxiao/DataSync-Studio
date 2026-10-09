@@ -6,6 +6,7 @@ mod error;
 mod excel;
 mod excel_export;
 mod jobs;
+mod queries;
 mod schema;
 mod state;
 mod store;

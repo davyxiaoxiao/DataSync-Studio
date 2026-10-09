@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { useStore, dialectLabel } from "../store";
+import { useStore, dialectLabel, type NamespaceNode } from "../store";
+import { api, errorMessage } from "../api";
 import { ContextMenu, menuAt, type MenuState } from "./ContextMenu";
 import type { ConnectionConfig } from "../types";
 import {
@@ -7,6 +8,7 @@ import {
   IconChevronRight,
   IconDatabase,
   IconEdit,
+  IconFile,
   IconFolder,
   IconPlus,
   IconPlug,
@@ -31,6 +33,12 @@ interface Props {
   onDropTables: (refs: TableRef[]) => void;
   onImportExcel: (ref: TableRef) => void;
   onExportExcel: (ref: TableRef) => void;
+  onRenameQuery: (query: {
+    connectionId: string;
+    namespace: string;
+    name: string;
+    path: string;
+  }) => void;
 }
 
 const refKey = (ref: TableRef) => `${ref.connectionId}::${ref.namespace}::${ref.table}`;
@@ -46,6 +54,7 @@ export function Sidebar({
   onDropTables,
   onImportExcel,
   onExportExcel,
+  onRenameQuery,
 }: Props) {
   const {
     connections,
@@ -53,9 +62,12 @@ export function Sidebar({
     log,
     toggleConnection,
     toggleNamespace,
+    toggleNamespaceGroup,
+    loadQueries,
     refreshTables,
     disconnect,
     openTab,
+    closeTab,
     reloadConnections,
     selectedConnectionId,
     selectConnection,
@@ -67,8 +79,9 @@ export function Sidebar({
   const [selectedTables, setSelectedTables] = useState<TableRef[]>([]);
   const lastClicked = useRef<string | null>(null);
 
+  const keyword = filter.trim().toLowerCase();
+
   const visible = useMemo(() => {
-    const keyword = filter.trim().toLowerCase();
     if (!keyword) return connections;
     return connections.filter((config) => {
       if (config.name.toLowerCase().includes(keyword)) return true;
@@ -78,7 +91,7 @@ export function Sidebar({
         ns.tables.some((table) => table.name.toLowerCase().includes(keyword)),
       );
     });
-  }, [connections, filter, sessions]);
+  }, [connections, keyword, sessions]);
 
   // A rename or drop elsewhere in the app invalidates the cached table list, so
   // every namespace that is already loaded is refreshed.
@@ -98,6 +111,131 @@ export function Sidebar({
 
   const openMenu = (event: MouseEvent, items: MenuState["items"]) =>
     setMenu(menuAt(event, items));
+
+  /** Non-view tables of a namespace, honouring the search box. */
+  const tablesOf = (ns: NamespaceNode) =>
+    ns.tables
+      .filter((table) => !table.tableType.toUpperCase().includes("VIEW"))
+      .filter((table) => !keyword || table.name.toLowerCase().includes(keyword));
+
+  const viewsOf = (ns: NamespaceNode) =>
+    ns.tables
+      .filter((table) => table.tableType.toUpperCase().includes("VIEW"))
+      .filter((table) => !keyword || table.name.toLowerCase().includes(keyword));
+
+  /** One of the 表 / 视图 / 查询 folder rows. */
+  const groupRow = (options: {
+    label: string;
+    count: number;
+    expanded: boolean;
+    indent: number;
+    onToggle: () => void;
+    menu: MenuState["items"];
+  }) => (
+    <div
+      className="tnode"
+      style={{ paddingLeft: options.indent }}
+      onClick={options.onToggle}
+      onContextMenu={(event) => openMenu(event, options.menu)}
+    >
+      <span className="twisty">
+        {options.expanded ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
+      </span>
+      <span style={{ color: "#c99700", display: "inline-flex" }}>
+        <IconFolder size={13} />
+      </span>
+      <span className="label">{options.label}</span>
+      <span className="meta">{options.count}</span>
+    </div>
+  );
+
+  const createQueryIn = async (connectionId: string, namespace: string) => {
+    // A file name has to be chosen up front; the tab renames it afterwards if
+    // the user wants something else.
+    const name = `新建查询 ${new Date().toLocaleString("zh-CN", { hour12: false })}`
+      .replace(/[/:]/g, "-");
+    try {
+      const created = await api.createQuery({ connectionId, namespace, name });
+      await loadQueries(connectionId, namespace);
+      openTab({
+        kind: "query",
+        title: created.name,
+        connectionId,
+        namespace,
+        path: created.path,
+      });
+      log("ok", `已新建查询 ${created.name}`);
+    } catch (error) {
+      log("err", `新建查询失败: ${errorMessage(error)}`);
+    }
+  };
+
+  const revealQueries = async (connectionId: string) => {
+    try {
+      const dir = await api.queriesDirectory(connectionId);
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(dir);
+    } catch (error) {
+      log("err", `打开查询目录失败: ${errorMessage(error)}`);
+    }
+  };
+
+  const queryMenu = (
+    connectionId: string,
+    namespace: string,
+    query: { name: string; path: string },
+  ): MenuState["items"] => [
+    {
+      label: "打开",
+      run: () =>
+        openTab({
+          kind: "query",
+          title: query.name,
+          connectionId,
+          namespace,
+          path: query.path,
+        }),
+    },
+    {
+      label: "重命名…",
+      // The rename dialog lives in App; `window.prompt` is not dependable inside
+      // a webview.
+      run: () =>
+        onRenameQuery({ connectionId, namespace, name: query.name, path: query.path }),
+    },
+    {
+      label: "复制一份",
+      run: () =>
+        void (async () => {
+          try {
+            const copy = await api.duplicateQuery({ path: query.path });
+            await loadQueries(connectionId, namespace);
+            log("ok", `已复制为 ${copy.name}`);
+          } catch (error) {
+            log("err", `复制失败: ${errorMessage(error)}`);
+          }
+        })(),
+    },
+    {
+      label: "在访达中显示",
+      run: () => void revealQueries(connectionId),
+    },
+    {
+      label: "删除",
+      danger: true,
+      run: () =>
+        void (async () => {
+          try {
+            await api.deleteQuery({ path: query.path });
+            closeTab(`query:${query.path}`);
+            await loadQueries(connectionId, namespace);
+            log("ok", `已删除查询 ${query.name}`);
+          } catch (error) {
+            log("err", `删除失败: ${errorMessage(error)}`);
+          }
+        })(),
+    },
+  ];
 
   /** Visible tables of a namespace, in tree order — the basis for range select. */
   const visibleTablesOf = (connectionId: string, namespace: string): TableRef[] => {
@@ -398,19 +536,31 @@ export function Sidebar({
                         {ns.loaded && <span className="meta">{ns.tables.length}</span>}
                       </div>
 
-                      {ns.expanded &&
-                        ns.tables
-                          .filter(
-                            (table) =>
-                              !keyword || table.name.toLowerCase().includes(keyword),
-                          )
-                          .map((table) => {
-                            const isView = table.tableType.toUpperCase().includes("VIEW");
-                            return (
+                      {ns.expanded && (
+                        <>
+                          {groupRow({
+                            label: "表",
+                            count: tablesOf(ns).length,
+                            expanded: ns.tablesExpanded,
+                            indent: 42,
+                            onToggle: () =>
+                              toggleNamespaceGroup(config.id, ns.name, "tables"),
+                            menu: [
+                              {
+                                label: "新建查询…",
+                                run: () => void createQueryIn(config.id, ns.name),
+                              },
+                              {
+                                label: "刷新表列表",
+                                run: () => void refreshTables(config.id, ns.name),
+                              },
+                            ],
+                          })}
+                          {ns.tablesExpanded &&
+                            tablesOf(ns).map((table) => (
                               <div
                                 key={table.name}
                                 className={`tnode ${
-                                  !isView &&
                                   selectedTables.some(
                                     (entry) =>
                                       entry.connectionId === config.id &&
@@ -420,20 +570,9 @@ export function Sidebar({
                                     ? "selected"
                                     : ""
                                 }`}
-                                style={{ paddingLeft: 42 }}
-                                title={
-                                  isView
-                                    ? (table.comment ?? table.name)
-                                    : `${table.comment ?? table.name}\n单击=浏览数据，⌘/Ctrl+单击=多选，Shift+单击=范围选择，右键=更多操作`
-                                }
-                                onClick={(event) => {
-                                  if (isView) {
-                                    log(
-                                      "info",
-                                      `视图 ${ns.name}.${table.name} 暂不支持数据浏览`,
-                                    );
-                                    return;
-                                  }
+                                style={{ paddingLeft: 58 }}
+                                title={`${table.comment ?? table.name}\n单击=浏览数据，⌘/Ctrl+单击=多选，Shift+单击=范围选择，右键=更多操作`}
+                                onClick={(event) =>
                                   handleTableClick(
                                     {
                                       connectionId: config.id,
@@ -441,43 +580,137 @@ export function Sidebar({
                                       table: table.name,
                                     },
                                     event,
-                                  );
-                                }}
+                                  )
+                                }
                                 onContextMenu={(event) =>
-                                  isView
-                                    ? openMenu(event, [
-                                        {
-                                          label: "视图暂不支持编辑",
-                                          disabled: true,
-                                          run: () => undefined,
-                                        },
-                                      ])
-                                    : openMenu(
-                                        event,
-                                        tableMenu({
-                                          connectionId: config.id,
-                                          namespace: ns.name,
-                                          table: table.name,
-                                        }),
-                                      )
+                                  openMenu(
+                                    event,
+                                    tableMenu({
+                                      connectionId: config.id,
+                                      namespace: ns.name,
+                                      table: table.name,
+                                    }),
+                                  )
                                 }
                               >
                                 <span className="twisty leaf" />
-                                <span
-                                  style={{
-                                    color: isView ? "var(--purple)" : "#4a7ebb",
-                                    display: "inline-flex",
-                                  }}
-                                >
-                                  {isView ? <IconView size={13} /> : <IconTable size={13} />}
+                                <span style={{ color: "#4a7ebb", display: "inline-flex" }}>
+                                  <IconTable size={13} />
                                 </span>
                                 <span className="label">{table.name}</span>
                                 {table.rows != null && table.rows >= 0 && (
                                   <span className="meta">≈{table.rows}</span>
                                 )}
                               </div>
-                            );
+                            ))}
+
+                          {groupRow({
+                            label: "视图",
+                            count: viewsOf(ns).length,
+                            expanded: ns.viewsExpanded,
+                            indent: 42,
+                            onToggle: () =>
+                              toggleNamespaceGroup(config.id, ns.name, "views"),
+                            menu: [
+                              {
+                                label: "刷新表列表",
+                                run: () => void refreshTables(config.id, ns.name),
+                              },
+                            ],
                           })}
+                          {ns.viewsExpanded &&
+                            viewsOf(ns).map((view) => (
+                              <div
+                                key={view.name}
+                                className="tnode"
+                                style={{ paddingLeft: 58 }}
+                                title={view.comment ?? view.name}
+                                onClick={() =>
+                                  log(
+                                    "info",
+                                    `视图 ${ns.name}.${view.name} 暂不支持数据浏览，可用结构同步处理`,
+                                  )
+                                }
+                                onContextMenu={(event) =>
+                                  openMenu(event, [
+                                    {
+                                      label: "视图暂不支持编辑",
+                                      disabled: true,
+                                      run: () => undefined,
+                                    },
+                                  ])
+                                }
+                              >
+                                <span className="twisty leaf" />
+                                <span style={{ color: "var(--purple)", display: "inline-flex" }}>
+                                  <IconView size={13} />
+                                </span>
+                                <span className="label">{view.name}</span>
+                              </div>
+                            ))}
+
+                          {groupRow({
+                            label: "查询",
+                            count: ns.queries.length,
+                            expanded: ns.queriesExpanded,
+                            indent: 42,
+                            onToggle: () =>
+                              toggleNamespaceGroup(config.id, ns.name, "queries"),
+                            menu: [
+                              {
+                                label: "新建查询…",
+                                run: () => void createQueryIn(config.id, ns.name),
+                              },
+                              {
+                                label: "刷新查询列表",
+                                run: () => void loadQueries(config.id, ns.name),
+                              },
+                              {
+                                label: "在访达中打开查询目录",
+                                run: () => void revealQueries(config.id),
+                              },
+                            ],
+                          })}
+                          {ns.queriesExpanded &&
+                            (ns.queries.length === 0 ? (
+                              <div
+                                className="tnode"
+                                style={{ paddingLeft: 58 }}
+                                onClick={() => void createQueryIn(config.id, ns.name)}
+                                title="点击新建一个 .sql 文件"
+                              >
+                                <span className="faint">还没有查询，点击新建</span>
+                              </div>
+                            ) : (
+                              ns.queries.map((query) => (
+                                <div
+                                  key={query.id}
+                                  className="tnode"
+                                  style={{ paddingLeft: 58 }}
+                                  title={`${query.path}\n双击打开编辑`}
+                                  onClick={() =>
+                                    openTab({
+                                      kind: "query",
+                                      title: query.name,
+                                      connectionId: config.id,
+                                      namespace: ns.name,
+                                      path: query.path,
+                                    })
+                                  }
+                                  onContextMenu={(event) =>
+                                    openMenu(event, queryMenu(config.id, ns.name, query))
+                                  }
+                                >
+                                  <span className="twisty leaf" />
+                                  <span style={{ color: "#c99700", display: "inline-flex" }}>
+                                    <IconFile size={13} />
+                                  </span>
+                                  <span className="label">{query.name}</span>
+                                </div>
+                              ))
+                            ))}
+                        </>
+                      )}
                     </div>
                   ))}
             </div>

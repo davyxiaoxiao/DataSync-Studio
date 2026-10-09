@@ -279,6 +279,62 @@ pub fn decode_mysql_row(row: &MySqlRow, kinds: &[ColumnKind]) -> AppResult<Vec<V
 /// sqlx refuses a `String` decode for those (`str::compatible` rejects the
 /// binary flag). Since the caller has already declared the column textual, the
 /// bytes are validated as UTF-8 here instead of trusting the charset flag.
+/// Decode a row without letting one cell fail the whole result.
+///
+/// The SQL console runs whatever the user typed, so a single column of an exotic
+/// type must not blank out the entire result set. The offending cell becomes a
+/// visible placeholder — never a silent NULL, which would read as missing data.
+pub fn decode_mysql_row_lenient(row: &MySqlRow, kinds: &[ColumnKind]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(row.len());
+    for idx in 0..row.len() {
+        let kind = kinds.get(idx).copied().unwrap_or(ColumnKind::Text);
+        match row.try_get_raw(idx) {
+            Ok(raw) if raw.is_null() => {
+                out.push(Value::Null);
+                continue;
+            }
+            Err(_) => {
+                out.push(Value::Null);
+                continue;
+            }
+            _ => {}
+        }
+        out.push(decode_mysql_cell(row, idx, kind).unwrap_or_else(|_| {
+            Value::Str(format!(
+                "‹无法解码：{}›",
+                row.column(idx).type_info().name()
+            ))
+        }));
+    }
+    out
+}
+
+/// PostgreSQL counterpart of `decode_mysql_row_lenient`.
+pub fn decode_pg_row_lenient(row: &PgRow, kinds: &[ColumnKind]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(row.len());
+    for idx in 0..row.len() {
+        let kind = kinds.get(idx).copied().unwrap_or(ColumnKind::Text);
+        match row.try_get_raw(idx) {
+            Ok(raw) if raw.is_null() => {
+                out.push(Value::Null);
+                continue;
+            }
+            Err(_) => {
+                out.push(Value::Null);
+                continue;
+            }
+            _ => {}
+        }
+        out.push(decode_pg_cell(row, idx, kind).unwrap_or_else(|_| {
+            Value::Str(format!(
+                "‹无法解码：{}›",
+                row.column(idx).type_info().name()
+            ))
+        }));
+    }
+    out
+}
+
 fn mysql_text(row: &MySqlRow, idx: usize) -> Result<Value, sqlx::Error> {
     if let Ok(value) = row.try_get::<String, _>(idx) {
         return Ok(Value::Str(value));
@@ -293,6 +349,11 @@ fn mysql_text(row: &MySqlRow, idx: usize) -> Result<Value, sqlx::Error> {
 fn pg_text(row: &PgRow, idx: usize) -> Result<Value, sqlx::Error> {
     if let Ok(value) = row.try_get::<String, _>(idx) {
         return Ok(Value::Str(value));
+    }
+    // A UUID has no `String` decode in sqlx even though it renders as text, and
+    // it is common enough in PostgreSQL to be worth handling here.
+    if let Ok(value) = row.try_get::<uuid::Uuid, _>(idx) {
+        return Ok(Value::Str(value.to_string()));
     }
     let bytes = row.try_get::<Vec<u8>, _>(idx)?;
     Ok(match String::from_utf8(bytes) {

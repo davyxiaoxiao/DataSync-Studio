@@ -23,7 +23,9 @@ import type {
   DropTablesPreview,
   SchemaSqlPreview,
   RowKeyValue,
+  SavedQuery,
   SortSpec,
+  SqlRunResult,
   SyncRunResult,
   SyncSelection,
   TableData,
@@ -216,6 +218,38 @@ export const api = {
     options?: ExportOptions;
     jobId?: string;
   }) => invoke<ExportOutcome>("export_excel", { request }),
+
+  listQueries: (connectionId: string) =>
+    invoke<SavedQuery[]>("list_queries", { connectionId }),
+
+  createQuery: (request: { connectionId: string; namespace: string; name: string }) =>
+    invoke<SavedQuery>("create_query", { request }),
+
+  readQuery: (request: { path: string }) =>
+    invoke<SavedQuery>("read_query", { request }),
+
+  saveQuery: (request: { path: string; sql: string }) =>
+    invoke<SavedQuery>("save_query", { request }),
+
+  renameQuery: (path: string, name: string) =>
+    invoke<SavedQuery>("rename_query", { path, name }),
+
+  duplicateQuery: (request: { path: string }) =>
+    invoke<SavedQuery>("duplicate_query", { request }),
+
+  deleteQuery: (request: { path: string }) =>
+    invoke<void>("delete_query", { request }),
+
+  /** The folder the .sql files live in, for revealing it in the file manager. */
+  queriesDirectory: (connectionId: string) =>
+    invoke<string>("queries_directory", { connectionId }),
+
+  runSql: (request: {
+    connectionId: string;
+    namespace: string;
+    sql: string;
+    jobId?: string;
+  }) => invoke<SqlRunResult>("run_sql", { request }),
 
   previewDropTables: (connectionId: string, namespace: string, tables: string[]) =>
     invoke<DropTablesPreview>("preview_drop_tables", { connectionId, namespace, tables }),

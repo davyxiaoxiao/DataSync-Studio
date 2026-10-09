@@ -312,6 +312,50 @@ export interface CellUpdateResult {
   message: string;
 }
 
+/**
+ * A SQL snippet saved as a `.sql` file on disk.
+ *
+ * Files rather than app-internal storage, so they can be opened in any editor,
+ * kept in version control and copied between machines.
+ */
+export interface SavedQuery {
+  /** Stable id: the path relative to the queries folder. */
+  id: string;
+  connectionId: string;
+  /** The database folder the file sits in; empty at the top level. */
+  namespace: string;
+  name: string;
+  /** Absolute path, for revealing the file. */
+  path: string;
+  sql: string;
+  updatedAt: number;
+}
+
+export interface SqlColumn {
+  name: string;
+  dataType: string;
+  kind: string;
+}
+
+export interface SqlStatementResult {
+  sql: string;
+  ok: boolean;
+  error?: string | null;
+  rowsAffected: number;
+  elapsedMs: number;
+  /** Present when the statement produced rows. */
+  columns: SqlColumn[];
+  rows: Cell[][];
+  /** True when the console stopped collecting rows. */
+  truncated: boolean;
+}
+
+export interface SqlRunResult {
+  results: SqlStatementResult[];
+  elapsedMs: number;
+  cancelled: boolean;
+}
+
 /** A worksheet read for the import flow. */
 export interface ExcelSheetPreview {
   sheets: string[];

@@ -26,6 +26,7 @@ use crate::dialect::Dialect;
 use crate::error::{AppError, AppResult};
 use crate::excel::{self, ExcelSheetPreview};
 use crate::excel_export::{self, ExportColumn, ExportOptions, ExportOutcome};
+use crate::queries::{self, SavedQuery};
 use crate::jobs::ProgressReporter;
 use crate::schema::model::foreign_key_covered_by;
 use crate::schema::ddl::{
@@ -2028,6 +2029,276 @@ pub async fn export_excel(
 }
 
 // ---------------------------------------------------------------------------
+// Saved queries and the SQL console
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateQueryRequest {
+    pub connection_id: String,
+    #[serde(default)]
+    pub namespace: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveQueryRequest {
+    pub path: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPathRequest {
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn list_queries(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> AppResult<Vec<SavedQuery>> {
+    queries::list(&state.store, &connection_id)
+}
+
+#[tauri::command]
+pub async fn create_query(
+    state: State<'_, AppState>,
+    request: CreateQueryRequest,
+) -> AppResult<SavedQuery> {
+    queries::create(
+        &state.store,
+        &request.connection_id,
+        &request.namespace,
+        &request.name,
+    )
+}
+
+#[tauri::command]
+pub async fn read_query(
+    state: State<'_, AppState>,
+    request: QueryPathRequest,
+) -> AppResult<SavedQuery> {
+    queries::read(&state.store, &request.path)
+}
+
+#[tauri::command]
+pub async fn save_query(
+    state: State<'_, AppState>,
+    request: SaveQueryRequest,
+) -> AppResult<SavedQuery> {
+    queries::save(&state.store, &request.path, &request.sql)
+}
+
+#[tauri::command]
+pub async fn rename_query(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+) -> AppResult<SavedQuery> {
+    queries::rename(&state.store, &path, &name)
+}
+
+#[tauri::command]
+pub async fn duplicate_query(
+    state: State<'_, AppState>,
+    request: QueryPathRequest,
+) -> AppResult<SavedQuery> {
+    queries::duplicate(&state.store, &request.path)
+}
+
+#[tauri::command]
+pub async fn delete_query(
+    state: State<'_, AppState>,
+    request: QueryPathRequest,
+) -> AppResult<()> {
+    queries::remove(&state.store, &request.path)
+}
+
+#[tauri::command]
+pub async fn queries_directory(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> AppResult<String> {
+    queries::directory(&state.store, &connection_id)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlColumn {
+    pub name: String,
+    pub data_type: String,
+    pub kind: crate::db::value::ColumnKind,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlStatementResult {
+    pub sql: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub rows_affected: u64,
+    pub elapsed_ms: u64,
+    /// Present when the statement produced rows.
+    pub columns: Vec<SqlColumn>,
+    pub rows: Vec<Vec<crate::db::value::Cell>>,
+    /// True when the console stopped before finishing the script.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SqlRunResult {
+    pub results: Vec<SqlStatementResult>,
+    pub elapsed_ms: u64,
+    pub cancelled: bool,
+}
+
+/// Rows shown per statement before the console stops collecting.
+const SQL_CONSOLE_ROW_LIMIT: usize = 5_000;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSqlRequest {
+    pub connection_id: String,
+    /// The database to run against; also the `search_path` on PostgreSQL.
+    pub namespace: String,
+    pub sql: String,
+    #[serde(default)]
+    pub job_id: Option<String>,
+}
+
+/// Run a script the user wrote and report each statement's outcome.
+#[tauri::command]
+pub async fn run_sql(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: RunSqlRequest,
+) -> AppResult<SqlRunResult> {
+    let (reporter, job) = begin_job(&app, &state, request.job_id.as_deref());
+    let outcome = run_sql_for(
+        &state,
+        &request.connection_id,
+        &request.namespace,
+        &request.sql,
+        &reporter,
+    )
+    .await;
+    end_job(&state, job);
+    outcome
+}
+
+pub(crate) async fn run_sql_for(
+    state: &AppState,
+    connection_id: &str,
+    namespace: &str,
+    sql: &str,
+    reporter: &ProgressReporter,
+) -> AppResult<SqlRunResult> {
+    let pool = pool_for(state, connection_id).await?;
+    run_sql_with(&pool, namespace, sql, reporter).await
+}
+
+/// Run a script against a pool. Shared by the command and the live tests so both
+/// exercise the same path.
+pub(crate) async fn run_sql_with(
+    pool: &Pool,
+    namespace: &str,
+    sql: &str,
+    reporter: &ProgressReporter,
+) -> AppResult<SqlRunResult> {
+    let statements = split_statements(sql);
+    if statements.is_empty() {
+        return Err(AppError::msg("没有可执行的语句"));
+    }
+
+    let started = Instant::now();
+    let total = statements.len();
+    reporter.force(
+        "sql",
+        "执行 SQL",
+        0,
+        Some(total as u64),
+        format!("共 {total} 条语句"),
+    );
+
+    // One dedicated connection for the whole script, so the database selected
+    // here applies to every statement.
+    let outcomes = crate::db::run_console(
+        pool,
+        namespace,
+        &statements,
+        SQL_CONSOLE_ROW_LIMIT + 1,
+        reporter,
+    )
+    .await?;
+
+    let mut results = Vec::with_capacity(outcomes.len());
+    for (index, (statement, outcome)) in statements.iter().zip(outcomes).enumerate() {
+        let mut entry = SqlStatementResult {
+            sql: statement.clone(),
+            ok: true,
+            error: None,
+            rows_affected: 0,
+            elapsed_ms: 0,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+        };
+        match outcome {
+            crate::db::ConsoleOutcome::Rows(result) => {
+                entry.columns = result
+                    .columns
+                    .iter()
+                    .map(|column| SqlColumn {
+                        name: column.name.clone(),
+                        data_type: column.type_name.clone(),
+                        kind: column.kind,
+                    })
+                    .collect();
+                let mut rows = result.rows;
+                if rows.len() > SQL_CONSOLE_ROW_LIMIT {
+                    rows.truncate(SQL_CONSOLE_ROW_LIMIT);
+                    entry.truncated = true;
+                }
+                entry.rows = rows
+                    .into_iter()
+                    .map(|row| row.iter().map(|value| value.to_cell()).collect())
+                    .collect();
+            }
+            crate::db::ConsoleOutcome::Affected(count) => entry.rows_affected = count,
+            crate::db::ConsoleOutcome::Failed(error) => {
+                entry.ok = false;
+                entry.error = Some(error);
+            }
+        }
+        let failed = !entry.ok;
+        results.push(entry);
+        reporter.tick(
+            "sql",
+            "执行 SQL",
+            index as u64 + 1,
+            Some(total as u64),
+            format!("已执行 {}/{}", index + 1, total),
+        );
+        // Stopping at the first failure is what a client tool does, and it keeps
+        // a broken script from doing further damage.
+        if failed {
+            break;
+        }
+    }
+
+    let cancelled = reporter.is_cancelled() && results.len() < statements.len();
+    reporter.finish("done", "SQL 执行完成", "执行结束");
+    Ok(SqlRunResult {
+        results,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        cancelled,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
 
@@ -2206,6 +2477,15 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         update_table_cell,
         count_table_rows,
         export_excel,
+        list_queries,
+        create_query,
+        read_query,
+        save_query,
+        rename_query,
+        duplicate_query,
+        delete_query,
+        queries_directory,
+        run_sql,
     ]
 }
 
