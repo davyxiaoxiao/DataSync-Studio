@@ -267,15 +267,48 @@ function Shell() {
                     onLog={log}
                   />
                 )}
-                {tab.kind === "query" && tab.connectionId && tab.namespace && tab.path && (
+                {tab.kind === "query" && tab.connectionId && tab.namespace && (
                   <QueryView
                     connectionId={tab.connectionId}
                     namespace={tab.namespace}
+                    // Absent means a temporary query, which is not backed by a
+                    // file until it is saved.
                     path={tab.path}
+                    dialect={
+                      connections.find((config) => config.id === tab.connectionId)
+                        ?.dialect ?? "mysql"
+                    }
                     onLog={log}
                     onTitleChange={(title, dirty) => {
                       // The unsaved marker lives in the tab title.
                       updateTabTitle(tab.id, dirty ? `${title} •` : title);
+                    }}
+                    onSaveAs={async (name, sql) => {
+                      try {
+                        const created = await api.createQuery({
+                          connectionId: tab.connectionId as string,
+                          namespace: tab.namespace as string,
+                          name,
+                        });
+                        const saved = await api.saveQuery({ path: created.path, sql });
+                        log("ok", `已保存查询 ${saved.name}`);
+                        // The temporary tab is replaced by the file-backed one,
+                        // so further saves overwrite instead of asking again.
+                        closeTab(tab.id);
+                        openTab({
+                          kind: "query",
+                          title: saved.name,
+                          connectionId: tab.connectionId,
+                          namespace: tab.namespace,
+                          path: saved.path,
+                        });
+                        void loadQueries(
+                          tab.connectionId as string,
+                          tab.namespace as string,
+                        );
+                      } catch (err) {
+                        log("err", `保存失败: ${errorMessage(err)}`);
+                      }
                     }}
                   />
                 )}

@@ -331,6 +331,20 @@ export interface SavedQuery {
   updatedAt: number;
 }
 
+export interface CompletionColumn {
+  table: string;
+  column: string;
+  dataType: string;
+}
+
+/** Names the SQL editor offers as completions. */
+export interface CompletionCatalog {
+  databases: string[];
+  tables: string[];
+  views: string[];
+  columns: CompletionColumn[];
+}
+
 export interface SqlColumn {
   name: string;
   dataType: string;

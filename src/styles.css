@@ -1469,3 +1469,72 @@ table.grid.resizing .col-resizer {
   font-size: 11px;
   line-height: 1.5;
 }
+
+/* --------------------------------------------------- SQL editor completion */
+
+.completion {
+  position: fixed;
+  z-index: 320;
+  min-width: 300px;
+  max-width: 460px;
+  background: #fff;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  box-shadow: 0 10px 26px rgba(15, 20, 28, 0.18);
+  padding: 4px;
+  font-size: 12px;
+}
+
+.completion-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  cursor: default;
+}
+
+.completion-item.active {
+  background: var(--accent-soft, var(--bg-hover));
+}
+
+.completion-item .faint {
+  margin-left: auto;
+  font-size: 10.5px;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.completion-hint {
+  border-top: 1px solid var(--border);
+  margin-top: 3px;
+  padding: 3px 7px 1px;
+  font-size: 10.5px;
+}
+
+.badge.kind-keyword {
+  background: var(--bg-subtle);
+  color: var(--text-muted);
+}
+
+.badge.kind-table {
+  background: #e8f0fb;
+  color: #2f5f9e;
+}
+
+.badge.kind-view {
+  background: #f1e9fb;
+  color: #6b3fa0;
+}
+
+.badge.kind-column {
+  background: #e9f7ee;
+  color: #2c7a4b;
+}
+
+.badge.kind-database {
+  background: #fdf3e0;
+  color: #9a6b12;
+}

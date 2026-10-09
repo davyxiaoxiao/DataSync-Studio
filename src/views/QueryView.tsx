@@ -1,18 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api, errorMessage } from "../api";
 import { useJobProgress } from "../jobs";
-import type { SqlRunResult, SqlStatementResult } from "../types";
+import type { CompletionCatalog, SqlRunResult, SqlStatementResult } from "../types";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { SqlEditor } from "../components/SqlEditor";
 
 interface Props {
   connectionId: string;
   namespace: string;
-  /** Absolute path of the `.sql` file this tab edits. */
-  path: string;
+  /**
+   * Absolute path of the `.sql` file this tab edits. Absent for a temporary
+   * query, which lives only in the editor until it is saved.
+   */
+  path?: string;
   onLog: (level: "info" | "ok" | "warn" | "err" | "sql", message: string) => void;
   onTitleChange: (title: string, dirty: boolean) => void;
+  /** Save a temporary query under a name; the shell turns it into a file tab. */
+  onSaveAs: (name: string, sql: string) => Promise<void>;
+  /** The connection's dialect, which decides the extra keywords. */
+  dialect: string;
 }
-
-const DEFAULT_SQL = "-- 在这里写 SQL，⌘/Ctrl + Enter 执行，⌘/Ctrl + S 保存\nSELECT 1;\n";
 
 /**
  * A SQL console backed by a `.sql` file on disk.
@@ -27,7 +34,10 @@ export function QueryView({
   path,
   onLog,
   onTitleChange,
+  onSaveAs,
+  dialect,
 }: Props) {
+  const scratch = path === undefined;
   const job = useJobProgress();
   const [sql, setSql] = useState("");
   const [saved, setSaved] = useState("");
@@ -35,20 +45,45 @@ export function QueryView({
   const [running, setRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [catalog, setCatalog] = useState<CompletionCatalog | null>(null);
+  const [askingName, setAskingName] = useState(false);
+  const [newName, setNewName] = useState("");
   const [result, setResult] = useState<SqlRunResult | null>(null);
-  const textarea = useRef<HTMLTextAreaElement | null>(null);
 
   const dirty = sql !== saved;
+
+  // Names for the editor's completion; a failure here only means fewer
+  // suggestions, so it is not surfaced as an error.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const names = await api.completionCatalog(connectionId, namespace);
+        if (!cancelled) setCatalog(names);
+      } catch {
+        if (!cancelled) setCatalog(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionId, namespace]);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
+        if (!path) {
+          // A temporary query starts empty rather than reading anything: it is
+          // not backed by a file until the user saves it.
+          setSql("");
+          setSaved("");
+          return;
+        }
         const query = await api.readQuery({ path });
         if (cancelled) return;
-        // An empty file would look broken, so it starts with a hint.
-        setSql(query.sql.trim() === "" ? DEFAULT_SQL : query.sql);
-        setSaved(query.sql.trim() === "" ? DEFAULT_SQL : query.sql);
+        setSql(query.sql);
+        setSaved(query.sql);
         onTitleChange(query.name, false);
       } catch (err) {
         if (!cancelled) setError(errorMessage(err));
@@ -64,10 +99,16 @@ export function QueryView({
   }, [path]);
 
   const save = useCallback(async () => {
+    if (scratch) {
+      // Saving a temporary query is what makes it appear in the tree, so the
+      // name has to be chosen here.
+      setAskingName(true);
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
-      const query = await api.saveQuery({ path, sql });
+      const query = await api.saveQuery({ path: path as string, sql });
       setSaved(sql);
       onTitleChange(query.name, false);
       onLog("ok", `已保存 ${query.name}`);
@@ -77,7 +118,7 @@ export function QueryView({
     } finally {
       setSaving(false);
     }
-  }, [path, sql, onLog, onTitleChange]);
+  }, [path, scratch, sql, onLog, onTitleChange]);
 
   const run = useCallback(async () => {
     setRunning(true);
@@ -109,38 +150,36 @@ export function QueryView({
     }
   }, [connectionId, namespace, sql, job, onLog]);
 
-  // Editor shortcuts: run and save are the two things done constantly.
-  const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-      event.preventDefault();
-      void run();
-    }
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
-      event.preventDefault();
-      void save();
-    }
-  };
-
   useEffect(() => {
-    onTitleChange(
-      path.split("/").pop()?.replace(/\.sql$/, "") ?? "查询",
-      dirty,
-    );
+    const name = path
+      ? (path.split("/").pop()?.replace(/\.sql$/, "") ?? "查询")
+      : "临时查询";
+    onTitleChange(name, dirty || scratch);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirty]);
+  }, [dirty, scratch]);
 
   return (
     <div className="panel">
       <div className="section" style={{ padding: "8px 12px" }}>
         <div className="row">
           <span className="badge accent">{namespace}</span>
-          <span className="mono faint" style={{ fontSize: 11 }}>
-            {path}
-          </span>
+          {scratch ? (
+            <span className="faint" title="保存后才会出现在左侧的「查询」里">
+              临时查询（未保存到文件）
+            </span>
+          ) : (
+            <span className="mono faint" style={{ fontSize: 11 }}>
+              {path}
+            </span>
+          )}
           {dirty && <span className="badge purple">未保存</span>}
           <div className="grow" />
-          <button className="btn small" onClick={() => void save()} disabled={saving || !dirty}>
-            {saving ? "保存中…" : "保存"}
+          <button
+            className="btn small"
+            onClick={() => void save()}
+            disabled={saving || (!dirty && !scratch)}
+          >
+            {saving ? "保存中…" : scratch ? "保存到文件…" : "保存"}
           </button>
           <button className="btn primary small" onClick={() => void run()} disabled={running}>
             {running ? "执行中…" : "执行 (⌘↵)"}
@@ -155,32 +194,57 @@ export function QueryView({
       )}
 
       <div className="section" style={{ padding: "0 12px 10px" }}>
-        {loading && <div className="faint">正在读取 {path} …</div>}
-        <textarea
-          ref={textarea}
+        {loading && <div className="faint">正在读取…</div>}
+        <SqlEditor
           value={sql}
-          onChange={(event) => setSql(event.target.value)}
-          onKeyDown={onKeyDown}
-          spellCheck={false}
-          placeholder={DEFAULT_SQL}
-          style={{
-            width: "100%",
-            height: 180,
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-            fontSize: 12,
-            lineHeight: 1.7,
-            resize: "vertical",
-          }}
+          onChange={setSql}
+          onRun={() => void run()}
+          onSave={() => void save()}
+          catalog={catalog}
+          dialect={dialect}
         />
       </div>
 
-      <div style={{ overflow: "auto", flex: 1, padding: "0 12px 12px" }}>
+      {askingName && (
+        <ConfirmDialog
+          title="保存查询"
+          confirmLabel="保存"
+          message={
+            <div className="field">
+              <label>查询名称（会写成 .sql 文件）</label>
+              <input
+                type="text"
+                value={newName}
+                autoFocus
+                placeholder="例如：导出数据"
+                onChange={(event) => setNewName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && newName.trim()) {
+                    void (async () => {
+                      setAskingName(false);
+                      await onSaveAs(newName.trim(), sql);
+                    })();
+                  }
+                }}
+              />
+              <div className="faint" style={{ marginTop: 6 }}>
+                保存后才会出现在左侧「查询」分组里
+              </div>
+            </div>
+          }
+          onClose={() => setAskingName(false)}
+          onConfirm={() => {
+            if (!newName.trim()) return;
+            setAskingName(false);
+            void onSaveAs(newName.trim(), sql);
+          }}
+        />
+      )}
+
+      {/* Nothing is shown until something has actually been executed. */}
+      {(running || result) && (
+        <div style={{ overflow: "auto", flex: 1, padding: "0 12px 12px" }}>
         {running && <div className="faint">正在执行…</div>}
-        {!running && !result && (
-          <div className="faint">
-            还没有执行结果。写好后按 ⌘/Ctrl + Enter 运行。
-          </div>
-        )}
         {result?.cancelled && (
           <div className="warnbox" style={{ marginBottom: 8 }}>
             执行已取消，结果可能不完整。
@@ -189,7 +253,8 @@ export function QueryView({
         {result?.results.map((entry, index) => (
           <StatementResult key={index} index={index} entry={entry} />
         ))}
-      </div>
+        </div>
+      )}
     </div>
   );
 }

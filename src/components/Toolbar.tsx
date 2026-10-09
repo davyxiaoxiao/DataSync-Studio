@@ -4,11 +4,14 @@ import {
   IconCompare,
   IconDatabase,
   IconEdit,
+  IconFile,
   IconMinus,
   IconPlus,
   IconRefresh,
   IconSpinner,
 } from "./Icons";
+
+let scratchSeq = 0;
 
 interface Props {
   onNewConnection: () => void;
@@ -24,6 +27,7 @@ export function Toolbar({ onNewConnection, selectedConnection, onEditConnection 
     toggleConnection,
     disconnect,
     reloadConnections,
+    selectedNamespace,
     log,
   } = useStore();
   const connectedCount = Object.values(sessions).filter((s) => s.status === "connected").length;
@@ -86,6 +90,36 @@ export function Toolbar({ onNewConnection, selectedConnection, onEditConnection 
 
       <button
         className="tbtn"
+        disabled={!selectedNamespace}
+        onClick={() => {
+          if (!selectedNamespace) return;
+          // A temporary query: nothing is written to disk until it is saved, so
+          // an ad-hoc statement never litters the queries folder.
+          scratchSeq += 1;
+          openTab({
+            id: `query:scratch:${scratchSeq}`,
+            kind: "query",
+            title: `临时查询 ${scratchSeq}`,
+            connectionId: selectedNamespace.connectionId,
+            namespace: selectedNamespace.namespace,
+          });
+        }}
+        title={
+          selectedNamespace
+            ? `在 ${selectedNamespace.namespace} 中新建查询`
+            : "请先在左侧选择一个数据库"
+        }
+      >
+        <span className="icon">
+          <IconFile size={13} />
+        </span>
+        查询
+      </button>
+
+      <div className="sep" />
+
+      <button
+        className="tbtn"
         onClick={() => openTab({ kind: "structure", title: "结构同步" })}
         title="对比并同步表结构"
       >
@@ -108,6 +142,11 @@ export function Toolbar({ onNewConnection, selectedConnection, onEditConnection 
 
       <div className="spacer" />
 
+      {selectedNamespace && (
+        <span className="muted mono" style={{ fontSize: 11.5 }}>
+          {selectedNamespace.namespace}
+        </span>
+      )}
       <span className="muted" style={{ fontSize: 11.5 }}>
         {connections.length} 个连接 · 已连接 {connectedCount}
       </span>

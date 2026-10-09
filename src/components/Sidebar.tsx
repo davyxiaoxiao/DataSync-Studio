@@ -18,6 +18,8 @@ import {
   IconView,
 } from "./Icons";
 
+let scratchSeq = 0;
+
 export interface TableRef {
   connectionId: string;
   namespace: string;
@@ -64,6 +66,7 @@ export function Sidebar({
     toggleNamespace,
     toggleNamespaceGroup,
     loadQueries,
+    selectNamespace,
     refreshTables,
     disconnect,
     openTab,
@@ -112,6 +115,18 @@ export function Sidebar({
   const openMenu = (event: MouseEvent, items: MenuState["items"]) =>
     setMenu(menuAt(event, items));
 
+  /** A temporary query: nothing is written until the user saves it. */
+  const openScratchQuery = (connectionId: string, namespace: string) => {
+    scratchSeq += 1;
+    openTab({
+      id: `query:scratch:${scratchSeq}`,
+      kind: "query",
+      title: `临时查询 ${scratchSeq}`,
+      connectionId,
+      namespace,
+    });
+  };
+
   /** Non-view tables of a namespace, honouring the search box. */
   const tablesOf = (ns: NamespaceNode) =>
     ns.tables
@@ -148,27 +163,6 @@ export function Sidebar({
       <span className="meta">{options.count}</span>
     </div>
   );
-
-  const createQueryIn = async (connectionId: string, namespace: string) => {
-    // A file name has to be chosen up front; the tab renames it afterwards if
-    // the user wants something else.
-    const name = `新建查询 ${new Date().toLocaleString("zh-CN", { hour12: false })}`
-      .replace(/[/:]/g, "-");
-    try {
-      const created = await api.createQuery({ connectionId, namespace, name });
-      await loadQueries(connectionId, namespace);
-      openTab({
-        kind: "query",
-        title: created.name,
-        connectionId,
-        namespace,
-        path: created.path,
-      });
-      log("ok", `已新建查询 ${created.name}`);
-    } catch (error) {
-      log("err", `新建查询失败: ${errorMessage(error)}`);
-    }
-  };
 
   const revealQueries = async (connectionId: string) => {
     try {
@@ -499,7 +493,11 @@ export function Sidebar({
                       <div
                         className="tnode"
                         style={{ paddingLeft: 22 }}
-                        onClick={() => toggleNamespace(config.id, ns.name)}
+                        onClick={() => {
+                          selectConnection(config.id);
+                          selectNamespace(config.id, ns.name);
+                          toggleNamespace(config.id, ns.name);
+                        }}
                         onContextMenu={(event) =>
                           openMenu(event, [
                             {
@@ -546,10 +544,6 @@ export function Sidebar({
                             onToggle: () =>
                               toggleNamespaceGroup(config.id, ns.name, "tables"),
                             menu: [
-                              {
-                                label: "新建查询…",
-                                run: () => void createQueryIn(config.id, ns.name),
-                              },
                               {
                                 label: "刷新表列表",
                                 run: () => void refreshTables(config.id, ns.name),
@@ -658,8 +652,12 @@ export function Sidebar({
                               toggleNamespaceGroup(config.id, ns.name, "queries"),
                             menu: [
                               {
-                                label: "新建查询…",
-                                run: () => void createQueryIn(config.id, ns.name),
+                                label: "新建查询",
+                                run: () => {
+                                  selectConnection(config.id);
+                                  selectNamespace(config.id, ns.name);
+                                  openScratchQuery(config.id, ns.name);
+                                },
                               },
                               {
                                 label: "刷新查询列表",
@@ -676,10 +674,14 @@ export function Sidebar({
                               <div
                                 className="tnode"
                                 style={{ paddingLeft: 58 }}
-                                onClick={() => void createQueryIn(config.id, ns.name)}
-                                title="点击新建一个 .sql 文件"
+                                onClick={() => {
+                                  selectConnection(config.id);
+                                  selectNamespace(config.id, ns.name);
+                                  openScratchQuery(config.id, ns.name);
+                                }}
+                                title="查询在保存后才会出现在这里；点击打开一个临时查询"
                               >
-                                <span className="faint">还没有查询，点击新建</span>
+                                <span className="faint">还没有保存的查询</span>
                               </div>
                             ) : (
                               ns.queries.map((query) => (

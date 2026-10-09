@@ -3,6 +3,7 @@ import type {
   ColumnInfo,
   CellUpdateResult,
   ColumnMapping,
+  CompletionCatalog,
   ColumnPair,
   FilterGroup,
   ForeignKeyInfo,
@@ -243,6 +244,10 @@ export const api = {
   /** The folder the .sql files live in, for revealing it in the file manager. */
   queriesDirectory: (connectionId: string) =>
     invoke<string>("queries_directory", { connectionId }),
+
+  /** Table / view / column / database names for editor completion. */
+  completionCatalog: (connectionId: string, namespace: string) =>
+    invoke<CompletionCatalog>("completion_catalog", { connectionId, namespace }),
 
   runSql: (request: {
     connectionId: string;

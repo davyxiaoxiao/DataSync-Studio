@@ -24,7 +24,9 @@ interface Props {
   onLog: (level: "info" | "ok" | "warn" | "err" | "sql", message: string) => void;
 }
 
-const PAGE_SIZE = 200;
+/** Page sizes the grid offers; the server refuses anything above 1000. */
+const PAGE_SIZES = [100, 200, 500, 1000];
+const DEFAULT_PAGE_SIZE = 1000;
 
 /** The row-number gutter is not resizable. */
 const ROWNO_WIDTH = 52;
@@ -73,6 +75,7 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [showSql, setShowSql] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
   // Draft rows are only turned into a query when 查询 is pressed, so typing a
@@ -115,7 +118,7 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
           connectionId,
           namespace,
           table,
-          PAGE_SIZE,
+          pageSize,
           nextOffset,
           filters,
           sort,
@@ -135,7 +138,7 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
         if (seq === requestSeq.current) setLoading(false);
       }
     },
-    [connectionId, namespace, table, filters, sort, onLog],
+    [connectionId, namespace, table, pageSize, filters, sort, onLog],
   );
 
   useEffect(() => {
@@ -378,6 +381,20 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
           <button className="btn small" onClick={() => setShowSql((value) => !value)}>
             {showSql ? "隐藏 SQL" : "查看 SQL"}
           </button>
+          <label className="row" style={{ gap: 4 }} title="每页最多 1000 行">
+            <span className="faint">每页</span>
+            <select
+              value={String(pageSize)}
+              disabled={loading}
+              onChange={(event) => setPageSize(Number(event.target.value))}
+            >
+              {PAGE_SIZES.map((size) => (
+                <option key={size} value={String(size)}>
+                  {size}
+                </option>
+              ))}
+            </select>
+          </label>
           <button
             className="btn small"
             title="把列宽恢复为按内容自动测量"
@@ -632,14 +649,14 @@ export function TableDataView({ connectionId, namespace, table, onLog }: Props) 
         <button
           className="btn small"
           disabled={offset === 0 || loading}
-          onClick={() => void load(Math.max(0, offset - PAGE_SIZE))}
+          onClick={() => void load(Math.max(0, offset - pageSize))}
         >
           上一页
         </button>
         <button
           className="btn small"
           disabled={!data?.hasMore || loading}
-          onClick={() => void load(offset + PAGE_SIZE)}
+          onClick={() => void load(offset + pageSize)}
         >
           下一页
         </button>

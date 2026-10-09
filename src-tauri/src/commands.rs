@@ -229,7 +229,9 @@ pub(crate) async fn preview_table_data_core(
 ) -> AppResult<TableData> {
     let structure = introspect::load_table(pool, namespace, table).await?;
     let dialect = pool.dialect();
-    let limit = limit.unwrap_or(200).clamp(1, 5000);
+    // The grid shows at most one thousand rows per page; a larger page is a
+    // request the browser cannot render usefully anyway.
+    let limit = limit.unwrap_or(1000).clamp(1, MAX_PAGE_ROWS);
     let offset = offset.unwrap_or(0);
     // One extra row is fetched so `has_more` is known without a second query.
     let query = build_grid_query(
@@ -2126,6 +2128,104 @@ pub async fn queries_directory(
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CompletionColumn {
+    pub table: String,
+    pub column: String,
+    pub data_type: String,
+}
+
+/// Everything the editor offers as a completion.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionCatalog {
+    /// Databases on the connection.
+    pub databases: Vec<String>,
+    pub tables: Vec<String>,
+    pub columns: Vec<CompletionColumn>,
+    /// Views are suggested alongside tables but flagged, so the UI can show a
+    /// different marker.
+    pub views: Vec<String>,
+}
+
+/// Read the names a query might reference, for editor completion.
+#[tauri::command]
+pub async fn completion_catalog(
+    state: State<'_, AppState>,
+    connection_id: String,
+    namespace: String,
+) -> AppResult<CompletionCatalog> {
+    let pool = pool_for(&state, &connection_id).await?;
+    let databases = introspect::list_namespaces(&pool)
+        .await?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+
+    // One query for every column in the schema: cheaper than a round trip per
+    // table, and the editor needs all of them at once anyway.
+    let (columns_table, columns_column, type_column, schema_column) = match pool.dialect() {
+        crate::dialect::Dialect::Mysql => (
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "DATA_TYPE",
+            "TABLE_SCHEMA",
+        ),
+        crate::dialect::Dialect::Postgres => (
+            "table_name",
+            "column_name",
+            "data_type",
+            "table_schema",
+        ),
+    };
+    let param = match pool.dialect() {
+        crate::dialect::Dialect::Mysql => "?",
+        crate::dialect::Dialect::Postgres => "$1",
+    };
+    let sql = format!(
+        "SELECT {columns_table}, {columns_column}, {type_column} FROM information_schema.columns \
+         WHERE {schema_column} = {param} ORDER BY {columns_table}, ordinal_position"
+    );
+    let rows = pool
+        .fetch(&sql, &[&namespace], &[
+            crate::db::value::ColumnKind::Str,
+            crate::db::value::ColumnKind::Str,
+            crate::db::value::ColumnKind::Str,
+        ])
+        .await?;
+    let columns = rows
+        .into_iter()
+        .filter_map(|row| {
+            // `display()` renders any decoded value as text and returns `None`
+            // for NULL, which is exactly what a name column needs.
+            Some(CompletionColumn {
+                table: row.first()?.display()?,
+                column: row.get(1)?.display()?,
+                data_type: row.get(2).and_then(|value| value.display()).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let summaries = introspect::list_tables(&pool, &namespace).await?;
+    let mut tables = Vec::new();
+    let mut views = Vec::new();
+    for summary in summaries {
+        if summary.table_type.to_uppercase().contains("VIEW") {
+            views.push(summary.name);
+        } else {
+            tables.push(summary.name);
+        }
+    }
+
+    Ok(CompletionCatalog {
+        databases,
+        tables,
+        columns,
+        views,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SqlColumn {
     pub name: String,
     pub data_type: String,
@@ -2154,6 +2254,9 @@ pub struct SqlRunResult {
     pub elapsed_ms: u64,
     pub cancelled: bool,
 }
+
+/// Largest page the data grid will fetch at once.
+pub const MAX_PAGE_ROWS: u64 = 1_000;
 
 /// Rows shown per statement before the console stops collecting.
 const SQL_CONSOLE_ROW_LIMIT: usize = 5_000;
@@ -2486,6 +2589,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         delete_query,
         queries_directory,
         run_sql,
+        completion_catalog,
     ]
 }
 

@@ -93,6 +93,9 @@ interface StoreValue {
   loadQueries: (connectionId: string, namespace: string) => Promise<void>;
 
   selectConnection: (id: string | null) => void;
+  /** The database the toolbar's 查询 button acts on. */
+  selectedNamespace: { connectionId: string; namespace: string } | null;
+  selectNamespace: (connectionId: string, namespace: string) => void;
   closeTabsForConnection: (connectionId: string) => void;
   openTab: (tab: Omit<Tab, "id"> & { id?: string }) => string;
   closeTab: (id: string) => void;
@@ -125,6 +128,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [activeTabId, setActiveTabId] = useState("welcome");
   const [logOpen, setLogOpen] = useState(true);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
+  const [selectedNamespace, setSelectedNamespace] = useState<{
+    connectionId: string;
+    namespace: string;
+  } | null>(null);
 
   const connectionsRef = useRef<ConnectionConfig[]>([]);
   connectionsRef.current = connections;
@@ -506,6 +513,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       toggleNamespace,
       refreshTables,
       selectConnection: setSelectedConnectionId,
+      selectedNamespace,
+      selectNamespace: (connectionId: string, namespace: string) =>
+        setSelectedNamespace({ connectionId, namespace }),
       closeTabsForConnection,
       openTab,
       closeTab,
@@ -524,6 +534,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       activeTabId,
       logOpen,
       selectedConnectionId,
+      selectedNamespace,
       log,
       reloadConnections,
       connect,
