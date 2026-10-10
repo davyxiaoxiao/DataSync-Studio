@@ -32,3 +32,4 @@ dist-ssr
 # build output
 src-tauri/target
 src-tauri/gen
+release
