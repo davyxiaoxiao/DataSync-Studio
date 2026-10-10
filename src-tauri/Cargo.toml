@@ -2,6 +2,7 @@
 name = "datasync-studio"
 version = "0.1.0"
 description = "Database schema & data sync tool"
+license = "MIT"
 authors = ["daiwei"]
 edition = "2021"
 

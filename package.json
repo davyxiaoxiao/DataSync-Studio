@@ -2,6 +2,8 @@
   "name": "datasync-studio",
   "private": true,
   "version": "0.1.0",
+  "description": "Database schema & data sync tool",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -646,3 +646,10 @@ PostgreSQL enum/domain 类型同步、数据新增/更新/删除同步、外键�
 - 未做公证（notarization）：别人首次打开可能被 Gatekeeper 拦截，右键「打开」即可，
   或 `xattr -d com.apple.quarantine "/Applications/DataSync Studio.app"`
 - 应用为 ad-hoc 签名（本机可用，不满足分发要求；正式分发需要开发者证书 + 公证）
+
+## 许可证
+
+[MIT](LICENSE) © 2026 daiwei
+
+简单说：可以任意使用、修改、分发、商用，只需保留版权与许可声明。软件按「原样」提供，
+不含任何担保。
