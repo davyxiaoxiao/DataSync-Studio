@@ -33,3 +33,6 @@ dist-ssr
 src-tauri/target
 src-tauri/gen
 release
+# 图标处理的中间目录与生图工具输出
+/build
+/dsh-image-gen
