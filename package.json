@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Database schema & data sync tool",
   "license": "MIT",
+  "author": "davyxiaoxiao",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -649,7 +649,7 @@ PostgreSQL enum/domain 类型同步、数据新增/更新/删除同步、外键�
 
 ## 许可证
 
-[MIT](LICENSE) © 2026 daiwei
+[MIT](LICENSE) © 2026 davyxiaoxiao
 
 简单说：可以任意使用、修改、分发、商用，只需保留版权与许可声明。软件按「原样」提供，
 不含任何担保。
