@@ -144,7 +144,7 @@ async fn run_plan(pool: &Pool, statements: Vec<String>) {
 /// These tests are pointed at whatever server the environment names, and that
 /// may well be a production box. The guard makes it structurally impossible for
 /// a test to drop or overwrite a real database or schema: a typo in a test can
-/// only ever produce a refusal, never a `DROP DATABASE datasync1`.
+/// only ever produce a refusal, never a `DROP DATABASE production_db`.
 const TEST_NAMESPACE_PREFIX: &str = "datasync_live_";
 
 fn assert_test_namespace(name: &str) {

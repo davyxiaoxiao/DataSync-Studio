@@ -155,11 +155,11 @@ src-tauri/target/release/bundle/dmg/DataSync Studio_0.1.0_arm64.dmg
 
 ```
 ~/Library/Application Support/com.datasync.studio/queries/
-  方塘线上mysql/
+  本地开发库/
     .connection          # 记录连接 id，所以改连接名不会丢失查询
-    datasync1/
-      导出数据.sql
-      预存统计.sql
+    app_db/
+      最近订单.sql
+      每日统计.sql
 ```
 
 > 文件夹按连接名命名（人看着舒服），靠里面的 `.connection` 标记文件与连接绑定——

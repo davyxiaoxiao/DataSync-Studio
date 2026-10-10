@@ -7,11 +7,11 @@
 //!
 //! ```text
 //! <app data>/queries/
-//!   方塘线上mysql/
+//!   本地开发库/
 //!     .connection            # holds the connection id, so renames survive
-//!     datasync1/
-//!       导出数据.sql
-//!       预存统计.sql
+//!     app_db/
+//!       最近订单.sql
+//!       每日统计.sql
 //! ```
 
 use std::path::{Path, PathBuf};

@@ -27,7 +27,10 @@ dist-ssr
 .cache/
 
 # live database test credentials
-.env.live
+# 本地凭据绝不提交；模板 .env.live.example 例外，它只有占位值
+.env
+.env.*
+!.env.live.example
 
 # build output
 src-tauri/target
@@ -36,3 +39,7 @@ release
 # 图标处理的中间目录与生图工具输出
 /build
 /dsh-image-gen
+
+# 用户自己的归档包，不属于仓库内容
+归档.zip
+*.zip
